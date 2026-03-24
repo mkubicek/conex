@@ -1,179 +1,243 @@
-"""Tests for CLI command dispatch and integration."""
+"""CLI tests: verify actual behavior, exit codes, and output content."""
 
 from __future__ import annotations
 
-import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from confluence_export.cli import main
-from confluence_export.client import AuthenticationError
+from confluence_export.cli import main, _resolve_space
 from confluence_export.config import Config
 from confluence_export.types import CachedSpace, Page, Space, Version
 
 
-def _make_space():
-    return Space(id="1", key="TEST", name="Test Space", type="global", status="current")
+def _space(key="TEST", name="Test Space"):
+    return Space(id="1", key=key, name=name, type="global", status="current")
 
 
-def _make_cached_space():
+def _cached_space():
     pages = [
         Page(id="p1", title="Root", space_id="1", parent_type="space",
-             version=Version(number=1), body_storage="<p>Root</p>"),
+             version=Version(number=1), body_storage="<p>Root content</p>"),
+        Page(id="p2", title="Child", space_id="1", parent_id="p1", parent_type="page",
+             version=Version(number=2), body_storage="<p>Child content</p>"),
     ]
-    return CachedSpace(space=_make_space(), pages=pages, attachments={},
+    return CachedSpace(space=_space(), pages=pages, attachments={},
                        updated_at="2025-01-01T00:00:00Z")
 
 
-def _patch_config(base_url="https://x.atlassian.net", api_token="tok"):
-    return patch("confluence_export.cli.load_config",
-                 return_value=Config(base_url=base_url, email="", api_token=api_token))
+def _config(base_url="https://x.atlassian.net", api_token="tok"):
+    return Config(base_url=base_url, email="", api_token=api_token)
 
 
-def _patch_client(spaces=None):
+def _mock_client(spaces=None):
     mock = MagicMock()
-    mock.get_spaces.return_value = spaces or [_make_space()]
+    mock.get_spaces.return_value = spaces if spaces is not None else [_space()]
     mock._get.return_value = {"results": []}
-    return patch("confluence_export.cli.ConfluenceClient", return_value=mock), mock
+    return mock
+
+
+# -- _resolve_space ----------------------------------------------------------
+
+
+class TestResolveSpace:
+    def test_finds_space_case_insensitive(self):
+        client = _mock_client()
+        result = _resolve_space(client, "test")
+        assert result.key == "TEST"
+
+    def test_unknown_space_exits_1(self, capsys):
+        client = _mock_client(spaces=[_space()])
+        with pytest.raises(SystemExit) as exc:
+            _resolve_space(client, "NOPE")
+        assert exc.value.code == 1
+        assert "not found" in capsys.readouterr().err
+
+
+# -- CLI dispatch ------------------------------------------------------------
 
 
 class TestNoCommand:
-    def test_prints_help(self, capsys):
+    def test_exits_with_help(self):
         with patch("sys.argv", ["confluence-export"]):
             with pytest.raises(SystemExit) as exc:
                 main()
             assert exc.value.code == 1
 
 
-class TestSpaces:
-    def test_lists_spaces(self, capsys):
-        client_patch, mock_client = _patch_client()
+class TestSpacesCommand:
+    def test_lists_spaces_with_columns(self, capsys):
+        client = _mock_client()
         with patch("sys.argv", ["confluence-export", "spaces"]), \
-             _patch_config(), client_patch:
+             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client):
             main()
-        output = capsys.readouterr().out
-        assert "TEST" in output
-        assert "Test Space" in output
+        out = capsys.readouterr().out
+        assert "TEST" in out
+        assert "Test Space" in out
+        assert "KEY" in out  # header row
 
-    def test_no_spaces(self, capsys):
-        client_patch, mock_client = _patch_client()
-        mock_client.get_spaces.return_value = []
+    def test_no_spaces_shows_message(self, capsys):
+        client = _mock_client(spaces=[])
         with patch("sys.argv", ["confluence-export", "spaces"]), \
-             _patch_config(), client_patch:
+             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client):
             main()
         assert "No spaces found" in capsys.readouterr().out
 
 
-class TestTree:
-    def test_shows_tree(self, capsys):
-        client_patch, mock_client = _patch_client()
-        mock_cache = MagicMock()
-        mock_cache.ensure_loaded.return_value = _make_cached_space()
+class TestTreeCommand:
+    def test_shows_page_hierarchy(self, capsys):
+        client = _mock_client()
+        cache = MagicMock()
+        cache.ensure_loaded.return_value = _cached_space()
         with patch("sys.argv", ["confluence-export", "tree", "TEST"]), \
-             _patch_config(), client_patch, \
-             patch("confluence_export.cli.CacheStore", return_value=mock_cache):
+             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
             main()
-        output = capsys.readouterr().out
-        assert "Root" in output
+        out = capsys.readouterr().out
+        assert "Root" in out
+        assert "Child" in out
+        assert "2 pages" in out
 
 
-class TestCookieFlag:
-    def test_cookie_sets_credentials(self, capsys):
-        client_patch, mock_client = _patch_client()
-        with patch("sys.argv", ["confluence-export", "--cookie", "session=abc", "spaces"]), \
-             _patch_config():
-            with client_patch:
-                main()
-        mock_client.set_cookies.assert_called_once_with("session=abc")
-
-
-class TestFind:
-    def test_find_pages(self, capsys):
-        client_patch, mock_client = _patch_client()
-        mock_cache = MagicMock()
-        cs = _make_cached_space()
-        mock_cache.ensure_loaded.return_value = cs
-        with patch("sys.argv", ["confluence-export", "find", "TEST", "Root"]), \
-             _patch_config(), client_patch, \
-             patch("confluence_export.cli.CacheStore", return_value=mock_cache):
+class TestFindCommand:
+    def test_finds_matching_pages(self, capsys):
+        client = _mock_client()
+        cache = MagicMock()
+        cache.ensure_loaded.return_value = _cached_space()
+        with patch("sys.argv", ["confluence-export", "find", "TEST", "Child"]), \
+             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
             main()
-        assert "Root" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "Child" in out
+        assert "p2" in out  # page ID shown
 
-    def test_find_no_results(self, capsys):
-        client_patch, mock_client = _patch_client()
-        mock_cache = MagicMock()
-        mock_cache.ensure_loaded.return_value = _make_cached_space()
-        with patch("sys.argv", ["confluence-export", "find", "TEST", "nonexistent"]), \
-             _patch_config(), client_patch, \
-             patch("confluence_export.cli.CacheStore", return_value=mock_cache):
+    def test_no_match_shows_message(self, capsys):
+        client = _mock_client()
+        cache = MagicMock()
+        cache.ensure_loaded.return_value = _cached_space()
+        with patch("sys.argv", ["confluence-export", "find", "TEST", "zzz-nonexistent"]), \
+             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
             main()
         assert "No pages matching" in capsys.readouterr().out
 
 
 class TestExportCommand:
-    def test_export(self, tmp_path, capsys):
-        client_patch, mock_client = _patch_client()
-        mock_cache = MagicMock()
-        mock_cache.ensure_loaded.return_value = _make_cached_space()
+    def test_exports_pages_to_directory(self, tmp_path, capsys):
+        client = _mock_client()
+        cache = MagicMock()
+        cache.ensure_loaded.return_value = _cached_space()
         out = str(tmp_path / "out")
         with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media"]), \
-             _patch_config(), client_patch, \
-             patch("confluence_export.cli.CacheStore", return_value=mock_cache):
+             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
             main()
-        assert "Exported" in capsys.readouterr().out
+
+        stdout = capsys.readouterr().out
+        assert "Exported 2 page(s)" in stdout
+
+        # Verify actual files were written
+        md_files = list(Path(out).rglob("*.md"))
+        assert len(md_files) == 2
 
 
-class TestRefresh:
-    def test_refresh(self, capsys):
-        client_patch, mock_client = _patch_client()
-        mock_cache = MagicMock()
-        cs = _make_cached_space()
-        mock_cache.refresh.return_value = cs
+class TestRefreshCommand:
+    def test_refreshes_and_reports(self, capsys):
+        client = _mock_client()
+        cache = MagicMock()
+        cache.refresh.return_value = _cached_space()
         with patch("sys.argv", ["confluence-export", "refresh", "TEST"]), \
-             _patch_config(), client_patch, \
-             patch("confluence_export.cli.CacheStore", return_value=mock_cache):
+             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
             main()
-        assert "Cache refreshed" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "Cache refreshed" in out
+        assert "2 pages" in out
 
 
-class TestConfigure:
-    def test_configure_basic(self, tmp_path):
-        inputs = iter(["https://x.atlassian.net", "", "my-token"])
+class TestConfigureCommand:
+    def test_saves_config(self):
+        inputs = iter(["https://x.atlassian.net", "a@b.com", "my-token"])
         with patch("sys.argv", ["confluence-export", "configure"]), \
              patch("builtins.input", side_effect=inputs), \
-             patch("confluence_export.cli.config_path", return_value=tmp_path / "nope.json"), \
+             patch("confluence_export.cli.config_path", return_value=Path("/tmp/nope.json")), \
              patch("confluence_export.cli.save_config") as mock_save:
             main()
-        mock_save.assert_called_once()
         cfg = mock_save.call_args[0][0]
         assert cfg.base_url == "https://x.atlassian.net"
+        assert cfg.email == "a@b.com"
         assert cfg.api_token == "my-token"
 
-    def test_configure_missing_base_url(self, tmp_path, capsys):
+    def test_missing_base_url_exits(self, capsys):
         inputs = iter(["", "", "tok"])
         with patch("sys.argv", ["confluence-export", "configure"]), \
              patch("builtins.input", side_effect=inputs), \
-             patch("confluence_export.cli.config_path", return_value=tmp_path / "nope.json"):
+             patch("confluence_export.cli.config_path", return_value=Path("/tmp/nope.json")):
+            with pytest.raises(SystemExit) as exc:
+                main()
+            assert exc.value.code == 1
+        assert "base_url" in capsys.readouterr().err
+
+    def test_bearer_mode_when_no_email(self, capsys):
+        inputs = iter(["https://x.atlassian.net", "", "my-pat"])
+        with patch("sys.argv", ["confluence-export", "configure"]), \
+             patch("builtins.input", side_effect=inputs), \
+             patch("confluence_export.cli.config_path", return_value=Path("/tmp/nope.json")), \
+             patch("confluence_export.cli.save_config"):
+            main()
+        assert "Bearer token" in capsys.readouterr().out
+
+
+# -- Cookie and auth flags ---------------------------------------------------
+
+
+class TestCookieFlag:
+    def test_sets_cookies_and_verifies(self, capsys):
+        client = _mock_client()
+        with patch("sys.argv", ["confluence-export", "--cookie", "session=abc; tok=xyz", "spaces"]), \
+             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client):
+            main()
+        client.set_cookies.assert_called_once_with("session=abc; tok=xyz")
+        assert "Authenticated" in capsys.readouterr().err
+
+    def test_bad_cookie_exits(self, capsys):
+        client = _mock_client()
+        client._get.side_effect = Exception("401")
+        with patch("sys.argv", ["confluence-export", "--cookie", "bad=val", "spaces"]), \
+             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client):
             with pytest.raises(SystemExit):
                 main()
-        assert "base_url" in capsys.readouterr().err
+        assert "failed" in capsys.readouterr().err
 
 
 class TestNeedsToken:
-    def test_prompts_when_no_token(self, capsys):
-        client_patch, mock_client = _patch_client()
+    def test_prompts_when_no_token_configured(self):
+        client = _mock_client()
         with patch("sys.argv", ["confluence-export", "spaces"]), \
-             _patch_config(api_token=""), client_patch, \
+             patch("confluence_export.cli.load_config", return_value=_config(api_token="")), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
              patch("confluence_export.cli._apply_browser_credentials") as mock_apply:
             main()
         mock_apply.assert_called_once()
 
 
 class TestConfigError:
-    def test_missing_config_exits(self, capsys):
+    def test_missing_config_shows_setup_hint(self, capsys):
         with patch("sys.argv", ["confluence-export", "spaces"]), \
              patch("confluence_export.cli.load_config", side_effect=ValueError("base_url is required")):
             with pytest.raises(SystemExit):
                 main()
-        assert "base_url" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "base_url" in err
+        assert "configure" in err  # suggests running configure
