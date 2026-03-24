@@ -1,5 +1,8 @@
 # confluence-export
 
+[![CI](https://github.com/mkubicek/conex/actions/workflows/ci.yml/badge.svg)](https://github.com/mkubicek/conex/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/mkubicek/conex/branch/main/graph/badge.svg)](https://codecov.io/gh/mkubicek/conex)
+
 Export Confluence Cloud spaces as LLM-ready markdown.
 
 ```bash
