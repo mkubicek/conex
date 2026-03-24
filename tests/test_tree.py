@@ -119,3 +119,34 @@ def test_format_tree(sample_pages):
     assert "Child A" in output
     assert "Child B" in output
     assert "Grandchild A1" in output
+
+
+def test_build_tree_archived_grouped():
+    pages = [
+        Page(id="1", title="Active", parent_type="space", position=0),
+        Page(id="2", title="Old Page", parent_type="space", position=0, status="archived"),
+    ]
+    roots = build_tree(pages)
+    titles = [r.page.title for r in roots]
+    assert "Active" in titles
+    assert "_archived" in titles
+    archived = next(r for r in roots if r.page.title == "_archived")
+    assert len(archived.children) == 1
+
+
+def test_build_tree_archived_orphan():
+    pages = [
+        Page(id="1", title="Archived Orphan", parent_id="999",
+             parent_type="page", position=0, status="archived"),
+    ]
+    roots = build_tree(pages)
+    assert any(r.page.title == "_archived" for r in roots)
+
+
+def test_page_path_unknown_id(sample_pages):
+    assert page_path(sample_pages, "999") == "/"
+
+
+def test_find_node_by_path_not_found(sample_pages):
+    roots = build_tree(sample_pages)
+    assert find_node_by_path(roots, "/Root/Nonexistent") is None
