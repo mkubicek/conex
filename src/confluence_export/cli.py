@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import termios
 from pathlib import Path
 
+import requests
+
 from confluence_export.cache import CacheStore
-from confluence_export.client import ConfluenceClient
+from confluence_export.client import AuthenticationError, ConfluenceClient
 from confluence_export.config import Config, config_path, load_config, save_config
 from confluence_export.diff import compute_diff, format_diff, scan_export_dir
 from confluence_export.tree import (
@@ -22,6 +26,127 @@ from confluence_export.exporter import Exporter
 from confluence_export.types import Space
 
 
+def _read_hidden_line(prompt: str) -> str:
+    """Read a line from the terminal with echo disabled, bypassing the TTY line buffer limit."""
+    print(prompt, end="", file=sys.stderr, flush=True)
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        new = termios.tcgetattr(fd)
+        # Disable echo and canonical mode (removes ~1024 byte line buffer limit)
+        new[3] = new[3] & ~(termios.ECHO | termios.ICANON)
+        new[6][termios.VMIN] = 1
+        new[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
+
+        chars = []
+        while True:
+            ch = os.read(fd, 1)
+            if ch in (b"\r", b"\n", b""):
+                break
+            if ch == b"\x03":  # Ctrl+C
+                raise KeyboardInterrupt
+            chars.append(ch)
+        print(file=sys.stderr)  # newline after hidden input
+        return b"".join(chars).decode("utf-8", errors="replace")
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _prompt_browser_credentials(base_url: str, reason: str) -> tuple[str, str]:
+    """Prompt for browser credentials. Returns (type, value) where type is 'bearer' or 'cookie'."""
+    print(f"\n{reason}", file=sys.stderr)
+    print(
+        f"\nTo authenticate via browser session:\n"
+        f"  1. Open {base_url} in your browser and log in\n"
+        f"  2. Open DevTools (F12) -> Network tab\n"
+        f"  3. Reload the page and click any API request to /wiki/\n"
+        f"  4. Copy the 'Cookie' or 'Authorization' header value\n",
+        file=sys.stderr,
+    )
+    try:
+        value = _read_hidden_line("Paste cookie or token (input hidden): ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.", file=sys.stderr)
+        sys.exit(1)
+
+    if not value:
+        print("No credentials provided.", file=sys.stderr)
+        sys.exit(1)
+
+    # Strip accidental "Bearer " prefix
+    if value.lower().startswith("bearer "):
+        return ("bearer", value[len("bearer "):])
+
+    # Cookies: contain "=" (key=value), optionally with ";" separators
+    # Bearer tokens are opaque strings without "="
+    if "=" in value:
+        return ("cookie", value)
+
+    return ("bearer", value)
+
+
+def _apply_browser_credentials(client: ConfluenceClient, base_url: str, reason: str) -> None:
+    """Prompt for browser credentials, verify with a quick API call, apply to client."""
+    cred_type, value = _prompt_browser_credentials(base_url, reason)
+    if cred_type == "cookie":
+        client.set_cookies(value)
+    else:
+        client.set_bearer_token(value)
+
+    # Verify credentials with a minimal request (1 space, fast)
+    print("Verifying credentials...", file=sys.stderr, flush=True)
+    try:
+        client._get("/wiki/api/v2/spaces", {"limit": "1"})
+    except AuthenticationError as exc:
+        print(f"Authentication failed (HTTP {exc.status_code}).", file=sys.stderr)
+        sys.exit(1)
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        print(f"Authentication failed (HTTP {status}).", file=sys.stderr)
+        sys.exit(1)
+    print("Authenticated.", file=sys.stderr, flush=True)
+
+
+def _is_auth_error(exc: Exception) -> int | None:
+    """Return the HTTP status code if exc looks like an auth failure, else None.
+
+    Confluence Cloud v2 API returns 404 (not 401/403) when credentials belong
+    to a different Atlassian instance, so we treat 404 as a potential auth
+    error in this context.
+    """
+    if isinstance(exc, AuthenticationError):
+        return exc.status_code
+    if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
+        if exc.response.status_code == 404:
+            return 404
+    return None
+
+
+def _with_auth_fallback(fn, client: ConfluenceClient, config) -> object:
+    """Call fn(); on auth error, prompt for a browser token and retry once."""
+    try:
+        return fn()
+    except Exception as exc:
+        status = _is_auth_error(exc)
+        if status is None:
+            raise
+        reason = f"Authentication failed (HTTP {status}). Browser credentials are needed."
+        _apply_browser_credentials(client, config.base_url, reason)
+        try:
+            return fn()
+        except Exception as exc2:
+            status2 = _is_auth_error(exc2)
+            if status2 is None:
+                raise
+            print(
+                f"\nBrowser token also rejected (HTTP {status2}). "
+                f"The token may have expired — try again with a fresh one.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="confluence-export",
@@ -30,6 +155,7 @@ def main() -> None:
     parser.add_argument("--base-url", help="Confluence base URL")
     parser.add_argument("--email", help="User email for authentication")
     parser.add_argument("--api-token", "--pat", help="API token or PAT for authentication")
+    parser.add_argument("--cookie", help="Browser cookie string for authentication")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 
     sub = parser.add_subparsers(dest="command")
@@ -95,20 +221,35 @@ def main() -> None:
         sys.exit(1)
 
     client = ConfluenceClient(config, verbose=args.verbose)
+
+    if args.cookie:
+        client.set_cookies(args.cookie)
+        print("Using browser cookies. Verifying credentials...", file=sys.stderr, flush=True)
+        try:
+            client._get("/wiki/api/v2/spaces", {"limit": "1"})
+        except Exception:
+            print("Cookie authentication failed.", file=sys.stderr)
+            sys.exit(1)
+        print("Authenticated.", file=sys.stderr, flush=True)
+    elif config.needs_token:
+        _apply_browser_credentials(
+            client, config.base_url, "No API token configured. Browser credentials are needed."
+        )
+
     cache = CacheStore()
 
     match args.command:
         case "spaces":
-            _cmd_spaces(client)
+            _with_auth_fallback(lambda: _cmd_spaces(client), client, config)
         case "tree":
-            _cmd_tree(client, cache, args.space_key)
+            _cmd_tree(client, cache, config, args.space_key)
         case "find":
-            _cmd_find(client, cache, args.space_key, args.query)
+            _cmd_find(client, cache, config, args.space_key, args.query)
         case "export":
             _cmd_export(
                 client,
                 cache,
-                config.base_url,
+                config,
                 space_key=args.space_key,
                 path_filter=args.path,
                 output_dir=args.output,
@@ -123,13 +264,14 @@ def main() -> None:
             _cmd_diff(
                 client,
                 cache,
+                config,
                 space_key=args.space_key,
                 export_dir=args.export_dir,
                 path_filter=args.path,
                 include_archived=args.include_archived,
             )
         case "refresh":
-            _cmd_refresh(client, cache, args.space_key)
+            _cmd_refresh(client, cache, config, args.space_key)
 
 
 # -- command implementations -------------------------------------------------
@@ -165,8 +307,8 @@ def _cmd_configure() -> None:
     if not token:
         token = existing_token
 
-    if not base_url or not token:
-        print("Error: base_url and api_token/PAT are required.", file=sys.stderr)
+    if not base_url:
+        print("Error: base_url is required.", file=sys.stderr)
         sys.exit(1)
 
     if email:
@@ -196,9 +338,9 @@ def _cmd_spaces(client: ConfluenceClient) -> None:
         print(f"{s.key:<{key_w}}  {s.name:<{name_w}}  {s.type:<8}  {s.status}")
 
 
-def _cmd_tree(client: ConfluenceClient, cache: CacheStore, space_key: str) -> None:
+def _cmd_tree(client: ConfluenceClient, cache: CacheStore, config: Config, space_key: str) -> None:
     """Show page hierarchy."""
-    space = _resolve_space(client, space_key)
+    space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
     cs = cache.ensure_loaded(client, space)
 
     roots = build_tree(cs.pages)
@@ -208,10 +350,10 @@ def _cmd_tree(client: ConfluenceClient, cache: CacheStore, space_key: str) -> No
 
 
 def _cmd_find(
-    client: ConfluenceClient, cache: CacheStore, space_key: str, query: str
+    client: ConfluenceClient, cache: CacheStore, config: Config, space_key: str, query: str
 ) -> None:
     """Search pages by title."""
-    space = _resolve_space(client, space_key)
+    space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
     cs = cache.ensure_loaded(client, space)
 
     results = find_pages(cs.pages, query)
@@ -228,7 +370,7 @@ def _cmd_find(
 def _cmd_export(
     client: ConfluenceClient,
     cache: CacheStore,
-    base_url: str,
+    config: Config,
     *,
     space_key: str,
     path_filter: str | None,
@@ -241,7 +383,7 @@ def _cmd_export(
     include_archived: bool = False,
 ) -> None:
     """Export page tree as LLM-ready markdown."""
-    space = _resolve_space(client, space_key)
+    space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -249,7 +391,7 @@ def _cmd_export(
     exporter = Exporter(
         client,
         cache,
-        base_url,
+        config.base_url,
         download_media=not no_media,
         render_drawio=not no_drawio_render,
         debug=debug,
@@ -270,6 +412,7 @@ def _cmd_export(
 def _cmd_diff(
     client: ConfluenceClient,
     cache: CacheStore,
+    config: Config,
     *,
     space_key: str,
     export_dir: str,
@@ -291,7 +434,7 @@ def _cmd_diff(
     if cs is not None:
         space = cs.space
     else:
-        space = _resolve_space(client, space_key)
+        space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
     cs = cache.refresh(client, space)
 
     # Filter API pages
@@ -321,9 +464,9 @@ def _cmd_diff(
     print(format_diff(result, cs.pages))
 
 
-def _cmd_refresh(client: ConfluenceClient, cache: CacheStore, space_key: str) -> None:
+def _cmd_refresh(client: ConfluenceClient, cache: CacheStore, config: Config, space_key: str) -> None:
     """Force-refresh cache for a space."""
-    space = _resolve_space(client, space_key)
+    space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
     cs = cache.refresh(client, space)
     print(f"Cache refreshed: {len(cs.pages)} pages (updated {cs.updated_at})")
 
@@ -333,6 +476,7 @@ def _cmd_refresh(client: ConfluenceClient, cache: CacheStore, space_key: str) ->
 
 def _resolve_space(client: ConfluenceClient, space_key: str) -> Space:
     """Find a space by key (case-insensitive)."""
+    print(f"Resolving space '{space_key}'...", file=sys.stderr, flush=True)
     spaces = client.get_spaces()
     key_upper = space_key.upper()
     for s in spaces:

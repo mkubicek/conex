@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import sys
 import time
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs
 
 import requests
 from requests.auth import HTTPBasicAuth
 
 from confluence_export.config import Config
 from confluence_export.types import Attachment, Page, Space
+
+
+class AuthenticationError(Exception):
+    """Raised when the server returns 401 or 403."""
+
+    def __init__(self, status_code: int, url: str):
+        self.status_code = status_code
+        self.url = url
+        super().__init__(f"HTTP {status_code} from {url}")
 
 
 class ConfluenceClient:
@@ -28,20 +37,38 @@ class ConfluenceClient:
         self.session.headers.update({"Accept": "application/json"})
         self.session.timeout = 30
 
-        if config.use_bearer:
-            # PAT-only: use Bearer token auth
-            self.session.headers["Authorization"] = f"Bearer {config.api_token}"
-            self._log("Using Bearer token auth (PAT)")
+        if config.api_token:
+            if config.use_bearer:
+                # PAT-only: use Bearer token auth
+                self.session.headers["Authorization"] = f"Bearer {config.api_token}"
+                self._log("Using Bearer token auth (PAT)")
+            else:
+                # Email + API token: use Basic Auth
+                self.session.auth = HTTPBasicAuth(config.email, config.api_token)
+                self._log(f"Using Basic Auth with email: {config.email}")
         else:
-            # Email + API token: use Basic Auth
-            self.session.auth = HTTPBasicAuth(config.email, config.api_token)
-            self._log(f"Using Basic Auth with email: {config.email}")
+            self._log("No credentials configured — browser token required")
 
     # -- low-level helpers ---------------------------------------------------
 
     def _log(self, msg: str) -> None:
         if self.verbose:
             print(f"[debug] {msg}", file=sys.stderr)
+
+    def set_bearer_token(self, token: str) -> None:
+        """Replace current credentials with a Bearer token."""
+        self.session.auth = None
+        self.session.headers["Authorization"] = f"Bearer {token}"
+
+    def set_cookies(self, cookie_string: str) -> None:
+        """Replace current credentials with browser session cookies."""
+        self.session.auth = None
+        self.session.headers.pop("Authorization", None)
+        for pair in cookie_string.split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                name, _, value = pair.partition("=")
+                self.session.cookies.set(name.strip(), value.strip())
 
     def _get(self, path: str, params: dict | None = None, max_retries: int = 3) -> dict:
         """GET with retry + rate-limit handling."""
@@ -54,6 +81,8 @@ class ConfluenceClient:
                 return resp.json()
             except requests.exceptions.HTTPError as exc:
                 status = exc.response.status_code
+                if status in (401, 403):
+                    raise AuthenticationError(status, url) from exc
                 if status == 429:
                     retry_after = int(exc.response.headers.get("Retry-After", 60))
                     self._log(f"Rate limited, waiting {retry_after}s")

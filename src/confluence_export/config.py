@@ -34,11 +34,14 @@ class Config:
         """True when no email is set, meaning api_token is a PAT for Bearer auth."""
         return not self.email
 
+    @property
+    def needs_token(self) -> bool:
+        """True when no api_token is configured."""
+        return not self.api_token
+
     def validate(self) -> None:
         if not self.base_url:
             raise ValueError("base_url is required")
-        if not self.api_token:
-            raise ValueError("api_token is required (API token or PAT)")
 
 
 def load_config(
