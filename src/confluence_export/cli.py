@@ -183,7 +183,7 @@ def main() -> None:
     export_p.add_argument("--no-children", action="store_true", help="Single page only")
     export_p.add_argument("--no-media", action="store_true", help="Skip attachment download")
     export_p.add_argument("--no-drawio-render", action="store_true", help="Skip draw.io to PNG")
-    export_p.add_argument("--refresh", action="store_true", help="Force-refresh cache before export")
+    export_p.add_argument("--cached", action="store_true", help="Use cached data instead of refreshing from Confluence")
     export_p.add_argument("--include-html", action="store_true", help="Save raw HTML alongside markdown")
     export_p.add_argument("--include-archived", action="store_true", help="Include archived pages (skipped by default)")
 
@@ -256,7 +256,7 @@ def main() -> None:
                 no_children=args.no_children,
                 no_media=args.no_media,
                 no_drawio_render=args.no_drawio_render,
-                force_refresh=args.refresh,
+                force_refresh=not args.cached,
                 debug=args.include_html,
                 include_archived=args.include_archived,
             )

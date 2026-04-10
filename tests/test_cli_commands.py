@@ -133,7 +133,7 @@ class TestExportCommand:
     def test_exports_pages_to_directory(self, tmp_path, capsys):
         client = _mock_client()
         cache = MagicMock()
-        cache.ensure_loaded.return_value = _cached_space()
+        cache.refresh.return_value = _cached_space()
         out = str(tmp_path / "out")
         with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media"]), \
              patch("confluence_export.cli.load_config", return_value=_config()), \
