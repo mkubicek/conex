@@ -33,7 +33,16 @@ def _config(base_url="https://x.atlassian.net", api_token="tok"):
 
 def _mock_client(spaces=None):
     mock = MagicMock()
-    mock.get_spaces.return_value = spaces if spaces is not None else [_space()]
+    space_list = spaces if spaces is not None else [_space()]
+    mock.get_spaces.return_value = space_list
+
+    def _by_key(key: str):
+        for s in space_list:
+            if s.key.upper() == key.upper():
+                return s
+        return None
+
+    mock.get_space_by_key.side_effect = _by_key
     mock._get.return_value = {"results": []}
     return mock
 

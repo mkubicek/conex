@@ -498,9 +498,14 @@ def _cmd_refresh(client: ConfluenceClient, cache: CacheStore, config: Config, sp
 def _resolve_space(client: ConfluenceClient, space_key: str) -> Space:
     """Find a space by key (case-insensitive)."""
     print(f"Resolving space '{space_key}'...", file=sys.stderr, flush=True)
-    spaces = client.get_spaces()
+    # Try server-side filter first — O(1) round trip vs. paging every space.
+    space = client.get_space_by_key(space_key)
+    if space is not None:
+        return space
+    # Fall back to a full list so that callers who typed a different case
+    # than the canonical key still resolve.
     key_upper = space_key.upper()
-    for s in spaces:
+    for s in client.get_spaces():
         if s.key.upper() == key_upper:
             return s
     print(f"Error: space '{space_key}' not found.", file=sys.stderr)

@@ -213,6 +213,27 @@ class TestApiMethodsExtra:
             pages = client.get_pages_in_space("space1")
             assert len(pages) == 1
             mock.assert_called_once()
+            _, params = mock.call_args.args
+            assert params["body-format"] == "storage"
+
+    def test_get_space_by_key_found(self):
+        client = _make_client()
+        with patch.object(client, "_get") as mock:
+            mock.return_value = {
+                "results": [{"id": "1", "key": "ENG", "name": "Engineering"}]
+            }
+            space = client.get_space_by_key("ENG")
+            assert space is not None
+            assert space.key == "ENG"
+            mock.assert_called_once_with(
+                "/wiki/api/v2/spaces", {"keys": "ENG", "limit": "1"}
+            )
+
+    def test_get_space_by_key_not_found(self):
+        client = _make_client()
+        with patch.object(client, "_get") as mock:
+            mock.return_value = {"results": []}
+            assert client.get_space_by_key("NOPE") is None
 
     def test_get_attachments(self):
         client = _make_client()
