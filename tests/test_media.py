@@ -33,6 +33,21 @@ class TestDownloadAttachments:
         assert len(result) == 1
         client.download_attachment_to_file.assert_not_called()
 
+    def test_skip_existing_even_if_size_differs(self, tmp_path):
+        """Existing non-empty files are trusted regardless of API-reported size."""
+        media_dir = tmp_path / "media"
+        media_dir.mkdir()
+        existing = media_dir / "img.png"
+        existing.write_bytes(b"x" * 120)  # local size differs from API
+
+        att = Attachment(id="a1", title="img.png", file_size=100,
+                         download_link="/wiki/download/a1")
+        client = MagicMock()
+
+        result = download_attachments(client, [att], media_dir, skip_existing=True)
+        assert len(result) == 1
+        client.download_attachment_to_file.assert_not_called()
+
     def test_downloads_new(self, tmp_path):
         media_dir = tmp_path / "media"
         media_dir.mkdir()

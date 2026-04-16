@@ -32,7 +32,7 @@ def download_attachments(
 
     for att in attachments:
         dest = media_dir / att.title
-        if skip_existing and dest.exists() and dest.stat().st_size == att.file_size:
+        if skip_existing and dest.exists() and dest.stat().st_size > 0:
             downloaded.append(dest)
             continue
         if not att.download_link:
