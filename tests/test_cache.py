@@ -65,6 +65,23 @@ class TestCacheStore:
             assert result.space.key == "TEST"
             client.get_pages_in_space.assert_not_called()
 
+    def test_save_and_load_preserves_body_storage(self, tmp_path):
+        with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
+            store = CacheStore()
+            cs = CachedSpace(
+                space=_make_space(),
+                pages=[Page(id="p1", title="Page", space_id="1",
+                            body_storage="<p>cached body</p>",
+                            version=Version(number=2))],
+                attachments={},
+                updated_at="2025-01-01T00:00:00Z",
+            )
+            store.save(cs)
+
+            loaded = store.load("TEST")
+            assert loaded is not None
+            assert loaded.pages[0].body_storage == "<p>cached body</p>"
+
     def test_ensure_loaded_refresh(self, tmp_path):
         with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
             store = CacheStore()

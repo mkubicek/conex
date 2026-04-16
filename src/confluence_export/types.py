@@ -92,7 +92,7 @@ class Page:
         )
 
     def to_dict(self) -> dict:
-        return {
+        d: dict = {
             "id": self.id,
             "title": self.title,
             "spaceId": self.space_id,
@@ -115,6 +115,9 @@ class Page:
                 "tinyui": self.tinyui,
             },
         }
+        if self.body_storage:
+            d["body"] = {"storage": {"value": self.body_storage}}
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> Page:

@@ -139,9 +139,19 @@ class ConfluenceClient:
         return [Space.from_api(r) for r in results]
 
     def get_pages_in_space(self, space_id: str) -> list[Page]:
+        # body-format=storage returns the body inline with every page, so the
+        # exporter doesn't need an N+1 round trip to fetch each body later.
         path = f"/wiki/api/v2/spaces/{space_id}/pages"
-        results = self._paginate(path, {"limit": "250"})
+        results = self._paginate(path, {"limit": "250", "body-format": "storage"})
         return [Page.from_api(r) for r in results]
+
+    def get_space_by_key(self, key: str) -> Space | None:
+        """Look up a single space by key using the server-side `keys` filter."""
+        data = self._get("/wiki/api/v2/spaces", {"keys": key, "limit": "1"})
+        results = data.get("results", [])
+        if not results:
+            return None
+        return Space.from_api(results[0])
 
     def get_page_by_id(self, page_id: str) -> Page:
         data = self._get(f"/wiki/api/v2/pages/{page_id}", {"body-format": "storage"})
@@ -161,6 +171,11 @@ class ConfluenceClient:
 
     def get_user_info(self, account_id: str) -> dict | None:
         """Resolve an Atlassian account ID to user info (v1 API).
+
+        The v2 API has no GET-by-accountId — the v2 equivalent is
+        POST /wiki/api/v2/users-bulk with an accountIds array, which is
+        awkward for the single-ID + cache pattern we use here. v1 remains
+        supported and is the canonical single-user lookup path.
 
         Returns dict with 'displayName' and optionally 'email', or None on failure.
         """
