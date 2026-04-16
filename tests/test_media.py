@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-from confluence_export.media import download_attachments, ensure_media_dir
-from confluence_export.types import Attachment
+from confluence_export.media import (
+    _VERSIONS_FILE,
+    download_attachments,
+    ensure_media_dir,
+)
+from confluence_export.types import Attachment, Version
+
+
+def _att(title="img.png", version=1, file_size=100, download_link="/wiki/download/a1"):
+    return Attachment(
+        id="a1", title=title, file_size=file_size,
+        download_link=download_link, version=Version(number=version),
+    )
 
 
 class TestEnsureMediaDir:
@@ -19,45 +31,59 @@ class TestEnsureMediaDir:
 
 
 class TestDownloadAttachments:
-    def test_skip_existing(self, tmp_path):
+    def test_skip_when_version_matches(self, tmp_path):
         media_dir = tmp_path / "media"
         media_dir.mkdir()
-        existing = media_dir / "img.png"
-        existing.write_bytes(b"x" * 100)
+        (media_dir / "img.png").write_bytes(b"x" * 100)
+        (media_dir / _VERSIONS_FILE).write_text('{"img.png": 3}')
 
-        att = Attachment(id="a1", title="img.png", file_size=100,
-                         download_link="/wiki/download/a1")
         client = MagicMock()
+        result = download_attachments(client, [_att(version=3)], media_dir)
 
-        result = download_attachments(client, [att], media_dir, skip_existing=True)
         assert len(result) == 1
         client.download_attachment_to_file.assert_not_called()
 
-    def test_skip_existing_even_if_size_differs(self, tmp_path):
-        """Existing non-empty files are trusted regardless of API-reported size."""
+    def test_redownload_when_version_changes(self, tmp_path):
         media_dir = tmp_path / "media"
         media_dir.mkdir()
-        existing = media_dir / "img.png"
-        existing.write_bytes(b"x" * 120)  # local size differs from API
+        (media_dir / "img.png").write_bytes(b"x" * 100)
+        (media_dir / _VERSIONS_FILE).write_text('{"img.png": 2}')
 
-        att = Attachment(id="a1", title="img.png", file_size=100,
-                         download_link="/wiki/download/a1")
         client = MagicMock()
+        result = download_attachments(client, [_att(version=3)], media_dir)
 
-        result = download_attachments(client, [att], media_dir, skip_existing=True)
         assert len(result) == 1
-        client.download_attachment_to_file.assert_not_called()
+        client.download_attachment_to_file.assert_called_once()
+
+    def test_download_when_no_manifest(self, tmp_path):
+        media_dir = tmp_path / "media"
+        media_dir.mkdir()
+        (media_dir / "img.png").write_bytes(b"x" * 100)
+        # No .versions.json — file exists but we don't know its version
+
+        client = MagicMock()
+        result = download_attachments(client, [_att(version=3)], media_dir)
+
+        assert len(result) == 1
+        client.download_attachment_to_file.assert_called_once()
+
+    def test_saves_version_after_download(self, tmp_path):
+        media_dir = tmp_path / "media"
+        media_dir.mkdir()
+
+        client = MagicMock()
+        download_attachments(client, [_att(title="new.png", version=5)], media_dir)
+
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert versions["new.png"] == 5
 
     def test_downloads_new(self, tmp_path):
         media_dir = tmp_path / "media"
         media_dir.mkdir()
 
-        att = Attachment(id="a1", title="new.png", file_size=50,
-                         download_link="/wiki/download/a1")
         client = MagicMock()
-        client.download_attachment_to_file.return_value = 50
+        result = download_attachments(client, [_att()], media_dir)
 
-        result = download_attachments(client, [att], media_dir, skip_existing=True)
         assert len(result) == 1
         client.download_attachment_to_file.assert_called_once()
 
@@ -65,7 +91,7 @@ class TestDownloadAttachments:
         media_dir = tmp_path / "media"
         media_dir.mkdir()
 
-        att = Attachment(id="a1", title="nolink.png", file_size=50, download_link="")
+        att = _att(download_link="")
         client = MagicMock()
 
         result = download_attachments(client, [att], media_dir)
@@ -76,12 +102,10 @@ class TestDownloadAttachments:
         media_dir = tmp_path / "media"
         media_dir.mkdir()
 
-        att = Attachment(id="a1", title="fail.png", file_size=50,
-                         download_link="/wiki/download/a1")
         client = MagicMock()
         client.download_attachment_to_file.side_effect = Exception("network error")
 
-        result = download_attachments(client, [att], media_dir)
+        result = download_attachments(client, [_att()], media_dir)
         assert len(result) == 0
         assert "failed to download" in capsys.readouterr().err
 
@@ -89,10 +113,8 @@ class TestDownloadAttachments:
         media_dir = tmp_path / "media"
         media_dir.mkdir()
 
-        att = Attachment(id="a1", title="x.png", file_size=10,
-                         download_link="/rest/api/content/a1/download")
+        att = _att(download_link="/rest/api/content/a1/download")
         client = MagicMock()
-        client.download_attachment_to_file.return_value = 10
 
         download_attachments(client, [att], media_dir)
         call_args = client.download_attachment_to_file.call_args[0]
