@@ -147,11 +147,48 @@ class TestCommitExport:
         self._init_repo(tmp_path)
         md = tmp_path / "Page.md"
         md.write_text("# Page")
-        subprocess.run(["git", "add", "Page.md"], cwd=tmp_path, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "already committed"], cwd=tmp_path, capture_output=True)
 
-        # Re-export with identical content
+        # First export commits the file
+        commit_export(tmp_path, [md], "TEST")
+
+        # Re-export with identical content — nothing to commit
         assert commit_export(tmp_path, [md], "TEST") is False
+
+    def test_removes_deleted_page(self, tmp_path):
+        """A previously exported page deleted upstream is removed from git."""
+        self._init_repo(tmp_path)
+        old = tmp_path / "OldPage.md"
+        old.write_text("# Old")
+        new = tmp_path / "NewPage.md"
+        new.write_text("# New")
+        subprocess.run(["git", "add", "OldPage.md", "NewPage.md"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        # Second export: OldPage no longer in Confluence, NewPage updated
+        new.write_text("# New v2")
+        commit_export(tmp_path, [new], "TEST")
+
+        # OldPage should be removed from git
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True)
+        assert "OldPage.md" not in ls.stdout
+        assert "NewPage.md" in ls.stdout
+
+    def test_removes_renamed_page(self, tmp_path):
+        """A page renamed upstream: old name removed, new name added."""
+        self._init_repo(tmp_path)
+        old = tmp_path / "Old-Name.md"
+        old.write_text("# Page")
+        subprocess.run(["git", "add", "Old-Name.md"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        # Renamed in Confluence — exporter writes new filename
+        renamed = tmp_path / "New-Name.md"
+        renamed.write_text("# Page")
+        commit_export(tmp_path, [renamed], "TEST")
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True)
+        assert "Old-Name.md" not in ls.stdout
+        assert "New-Name.md" in ls.stdout
 
     def test_commit_message_contains_timestamp(self, tmp_path):
         self._init_repo(tmp_path)

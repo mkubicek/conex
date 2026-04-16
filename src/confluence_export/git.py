@@ -80,14 +80,19 @@ def commit_local_changes(output_dir: Path) -> bool:
 
 
 def commit_export(output_dir: Path, written_files: list[Path], space_key: str) -> bool:
-    """Stage and commit only the exporter-written files.
+    """Stage exporter-written files and remove stale tracked files.
 
+    Stages written_files, then removes any tracked files under output_dir that
+    are not in written_files (handles upstream deletions, renames, and moves).
     Returns True if a commit was made.
     """
     # Stage only the files the exporter wrote
     paths = [str(f) for f in written_files]
     if _run_git(output_dir, "add", "--", *paths) is None:
         return False
+
+    # Remove stale tracked files (deletions/renames/moves upstream)
+    _remove_stale_files(output_dir, written_files)
 
     # Check if anything was staged
     result = _run_git(output_dir, "diff", "--cached", "--quiet", check=False)
@@ -97,3 +102,23 @@ def commit_export(output_dir: Path, written_files: list[Path], space_key: str) -
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     msg = f"Export Confluence space {space_key} ({timestamp})"
     return _run_git(output_dir, "commit", "-m", msg) is not None
+
+
+def _remove_stale_files(output_dir: Path, written_files: list[Path]) -> None:
+    """Remove tracked files that are no longer part of the export."""
+    if not _has_commits(output_dir):
+        return
+
+    result = _run_git(output_dir, "ls-files", ".", check=False)
+    if result is None or not result.stdout.strip():
+        return
+
+    written_resolved = {f.resolve() for f in written_files}
+    stale = []
+    for rel_path in result.stdout.strip().splitlines():
+        full = (output_dir / rel_path).resolve()
+        if full not in written_resolved:
+            stale.append(rel_path)
+
+    if stale:
+        _run_git(output_dir, "rm", "--quiet", "--", *stale)
