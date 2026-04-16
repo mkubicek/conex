@@ -33,6 +33,22 @@ class TestEnsureRepo:
         assert ensure_repo(tmp_path) is True
         assert (tmp_path / ".git").is_dir()
 
+    def test_sets_fallback_identity_on_init(self, tmp_path):
+        ensure_repo(tmp_path)
+        name = subprocess.run(
+            ["git", "config", "user.name"], cwd=tmp_path, capture_output=True, text=True
+        )
+        assert name.stdout.strip() == "confluence-export"
+
+    def test_does_not_overwrite_existing_identity(self, tmp_path):
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.name", "Alice"], cwd=tmp_path, capture_output=True)
+        ensure_repo(tmp_path)
+        name = subprocess.run(
+            ["git", "config", "user.name"], cwd=tmp_path, capture_output=True, text=True
+        )
+        assert name.stdout.strip() == "Alice"
+
     def test_inside_parent_repo(self, tmp_path):
         subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
         sub = tmp_path / "sub" / "dir"
@@ -51,7 +67,6 @@ class TestCommitLocalChanges:
 
     def test_no_changes(self, tmp_path):
         self._init_repo(tmp_path)
-        # Create and commit a file so there's a HEAD
         (tmp_path / "file.md").write_text("hello")
         subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
         subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True)
@@ -69,7 +84,6 @@ class TestCommitLocalChanges:
 
         assert commit_local_changes(tmp_path) is True
 
-        # Verify commit was made
         log = subprocess.run(["git", "log", "--oneline"], cwd=tmp_path, capture_output=True, text=True)
         assert "Local changes" in log.stdout
 
@@ -82,6 +96,11 @@ class TestCommitLocalChanges:
         # Create untracked file only
         (tmp_path / "local-notes.txt").write_text("my notes")
 
+        assert commit_local_changes(tmp_path) is False
+
+    def test_skips_on_fresh_repo(self, tmp_path):
+        """No crash or noise on a freshly initialized repo with no commits."""
+        self._init_repo(tmp_path)
         assert commit_local_changes(tmp_path) is False
 
 
@@ -147,3 +166,14 @@ class TestCommitExport:
         msg = log.stdout.strip()
         assert "NB" in msg
         assert "UTC" in msg
+
+    def test_fresh_repo_no_identity_needed(self, tmp_path):
+        """ensure_repo sets fallback identity; commit works without global config."""
+        ensure_repo(tmp_path)
+        md = tmp_path / "Page.md"
+        md.write_text("# Page")
+
+        assert commit_export(tmp_path, [md], "TEST") is True
+
+        log = subprocess.run(["git", "log", "--oneline"], cwd=tmp_path, capture_output=True, text=True)
+        assert "Export Confluence space TEST" in log.stdout
