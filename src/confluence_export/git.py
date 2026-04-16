@@ -109,13 +109,13 @@ def _remove_stale_files(output_dir: Path, written_files: list[Path]) -> None:
     if not _has_commits(output_dir):
         return
 
-    result = _run_git(output_dir, "ls-files", ".", check=False)
-    if result is None or not result.stdout.strip():
+    result = _run_git(output_dir, "ls-files", "-z", ".", check=False)
+    if result is None or not result.stdout.strip("\0"):
         return
 
     written_resolved = {f.resolve() for f in written_files}
     stale = []
-    for rel_path in result.stdout.strip().splitlines():
+    for rel_path in result.stdout.strip("\0").split("\0"):
         full = (output_dir / rel_path).resolve()
         if full not in written_resolved:
             stale.append(rel_path)

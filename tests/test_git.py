@@ -236,3 +236,23 @@ class TestCommitExport:
         # Manifest should still be tracked
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True)
         assert "media/.versions.json" in ls.stdout
+
+    def test_removes_stale_file_with_non_ascii_path(self, tmp_path):
+        """Paths with non-ASCII characters (umlauts etc.) are handled correctly."""
+        self._init_repo(tmp_path)
+        umlaut_dir = tmp_path / "Pascal-Spörri"
+        umlaut_dir.mkdir()
+        old = umlaut_dir / "old.md"
+        old.write_text("# Old")
+        new = tmp_path / "New.md"
+        new.write_text("# New")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first"], cwd=tmp_path, capture_output=True)
+
+        # Second export: only New.md remains
+        new.write_text("# New v2")
+        commit_export(tmp_path, [new], "TEST")
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True)
+        assert "old.md" not in ls.stdout
+        assert "New.md" in ls.stdout
