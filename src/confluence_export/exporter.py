@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from confluence_export.cache import CacheStore
@@ -23,6 +24,14 @@ from confluence_export.tree import (
     page_path,
 )
 from confluence_export.types import Attachment, CachedSpace, Page, PageNode, Space
+
+
+@dataclass
+class ExportResult:
+    """Result of an export operation."""
+
+    count: int = 0
+    written_files: list[Path] = field(default_factory=list)
 
 
 class Exporter:
@@ -96,8 +105,8 @@ class Exporter:
         no_children: bool = False,
         force_refresh: bool = False,
         include_archived: bool = False,
-    ) -> int:
-        """Export a space (or subtree) to output_dir. Returns number of pages exported."""
+    ) -> ExportResult:
+        """Export a space (or subtree) to output_dir."""
         # Ensure cache
         if force_refresh:
             cs = self.cache.refresh(self.client, space)
@@ -116,28 +125,29 @@ class Exporter:
             node = find_node_by_path(roots, path_filter)
             if not node:
                 print(f"Error: path '{path_filter}' not found in space {space.key}", file=sys.stderr)
-                return 0
+                return ExportResult()
             if no_children:
                 nodes_to_export = [node]
             else:
-                nodes_to_export = [node]  # _export_node handles recursion
                 return self._export_node(node, output_dir, cs, space.key, depth=0)
         else:
             if no_children:
-                # Export only root pages
                 nodes_to_export = roots
             else:
-                count = 0
+                result = ExportResult()
                 for root in roots:
-                    count += self._export_node(root, output_dir, cs, space.key, depth=0)
-                return count
+                    r = self._export_node(root, output_dir, cs, space.key, depth=0)
+                    result.count += r.count
+                    result.written_files.extend(r.written_files)
+                return result
 
         # Export flat list (no_children case)
-        count = 0
+        result = ExportResult()
         for node in nodes_to_export:
-            self._export_single_page(node.page, output_dir, cs, space.key)
-            count += 1
-        return count
+            files = self._export_single_page(node.page, output_dir, cs, space.key)
+            result.count += 1 if files else 0
+            result.written_files.extend(files)
+        return result
 
     def _export_node(
         self,
@@ -146,7 +156,7 @@ class Exporter:
         cs: CachedSpace,
         space_key: str,
         depth: int,
-    ) -> int:
+    ) -> ExportResult:
         """Recursively export a node and its children."""
         page = node.page
         dir_name = sanitize_filename(page.title)
@@ -156,12 +166,15 @@ class Exporter:
         indent = "  " * depth
         print(f"{indent}Exporting: {page.title}")
 
-        count = self._export_single_page(page, page_dir, cs, space_key)
+        files = self._export_single_page(page, page_dir, cs, space_key)
+        result = ExportResult(count=1 if files else 0, written_files=list(files))
 
         for child in node.children:
-            count += self._export_node(child, page_dir, cs, space_key, depth + 1)
+            child_result = self._export_node(child, page_dir, cs, space_key, depth + 1)
+            result.count += child_result.count
+            result.written_files.extend(child_result.written_files)
 
-        return count
+        return result
 
     def _export_single_page(
         self,
@@ -169,11 +182,11 @@ class Exporter:
         page_dir: Path,
         cs: CachedSpace,
         space_key: str,
-    ) -> int:
-        """Export a single page: fetch body, convert, download media, write file."""
+    ) -> list[Path]:
+        """Export a single page. Returns list of files written (empty if skipped)."""
         # Folders are structural only — no content to export
         if page.status == "folder":
-            return 0
+            return []
 
         # Fetch full page body if not already loaded
         if not page.body_storage:
@@ -187,7 +200,7 @@ class Exporter:
                     page.webui = full_page.webui
             except Exception as exc:
                 print(f"  Warning: could not fetch body for {page.title}: {exc}", file=sys.stderr)
-                return 0
+                return []
 
         # Get attachments from cache
         attachments = cs.attachments.get(page.id, [])
@@ -196,10 +209,10 @@ class Exporter:
         path = page_path(cs.pages, page.id)
 
         # Download media
-        downloaded_files: list = []
+        written: list[Path] = []
         if self.download_media and attachments:
             media_dir = ensure_media_dir(page_dir)
-            downloaded_files = download_attachments(self.client, attachments, media_dir)
+            written.extend(download_attachments(self.client, attachments, media_dir))
 
         # Convert to markdown
         markdown = convert_page(
@@ -223,6 +236,7 @@ class Exporter:
                         png_path = render_drawio_to_png(drawio_file)
                         if png_path:
                             rendered[att.title] = png_path
+                            written.append(png_path)
                 if rendered:
                     markdown = replace_drawio_placeholders(markdown, rendered)
 
@@ -230,10 +244,12 @@ class Exporter:
         base_filename = sanitize_filename(page.title)
         md_path = page_dir / (base_filename + ".md")
         md_path.write_text(markdown, encoding="utf-8")
+        written.append(md_path)
 
         # Debug: save raw HTML alongside markdown
         if self.debug:
             html_path = page_dir / (base_filename + ".html")
             html_path.write_text(page.body_storage, encoding="utf-8")
+            written.append(html_path)
 
-        return 1
+        return written

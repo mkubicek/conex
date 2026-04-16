@@ -186,6 +186,7 @@ def main() -> None:
     export_p.add_argument("--cached", action="store_true", help="Use cached data instead of refreshing from Confluence")
     export_p.add_argument("--include-html", action="store_true", help="Save raw HTML alongside markdown")
     export_p.add_argument("--include-archived", action="store_true", help="Include archived pages (skipped by default)")
+    export_p.add_argument("--no-git", action="store_true", help="Skip automatic git versioning")
 
     # diff
     diff_p = sub.add_parser("diff", help="Compare export dir against current Confluence state")
@@ -259,6 +260,7 @@ def main() -> None:
                 force_refresh=not args.cached,
                 debug=args.include_html,
                 include_archived=args.include_archived,
+                no_git=args.no_git,
             )
         case "diff":
             _cmd_diff(
@@ -381,12 +383,25 @@ def _cmd_export(
     force_refresh: bool,
     debug: bool = False,
     include_archived: bool = False,
+    no_git: bool = False,
 ) -> None:
     """Export page tree as LLM-ready markdown."""
     space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
 
-    out = Path(output_dir)
+    out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
+
+    # Git: pre-export
+    use_git = False
+    if not no_git:
+        from confluence_export.git import git_available, ensure_repo, commit_local_changes
+
+        if git_available():
+            if ensure_repo(out):
+                use_git = True
+                commit_local_changes(out)
+        else:
+            print("Warning: git not found, skipping git versioning.", file=sys.stderr)
 
     exporter = Exporter(
         client,
@@ -397,7 +412,7 @@ def _cmd_export(
         debug=debug,
     )
 
-    count = exporter.export_space(
+    result = exporter.export_space(
         space,
         out,
         path_filter=path_filter,
@@ -406,7 +421,13 @@ def _cmd_export(
         include_archived=include_archived,
     )
 
-    print(f"\nExported {count} page(s) to {out.resolve()}")
+    # Git: post-export
+    if use_git and result.written_files:
+        from confluence_export.git import commit_export
+
+        commit_export(out, result.written_files, space_key)
+
+    print(f"\nExported {result.count} page(s) to {out.resolve()}")
 
 
 def _cmd_diff(
