@@ -100,6 +100,9 @@ class TestTreeExport:
 
         result = exporter.export_space(_make_space(), tmp_path)
         assert result.count == 2
+        assert len(result.written_files) == 2
+        written_names = {f.name for f in result.written_files}
+        assert written_names == {"Parent.md", "Child.md"}
 
         parent_md = (tmp_path / "Parent" / "Parent.md").read_text()
         child_md = (tmp_path / "Parent" / "Child" / "Child.md").read_text()

@@ -135,7 +135,7 @@ class TestExportCommand:
         cache = MagicMock()
         cache.refresh.return_value = _cached_space()
         out = str(tmp_path / "out")
-        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media"]), \
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media", "--no-git"]), \
              patch("confluence_export.cli.load_config", return_value=_config()), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client), \
              patch("confluence_export.cli.CacheStore", return_value=cache):
@@ -147,6 +147,45 @@ class TestExportCommand:
         # Verify actual files were written
         md_files = list(Path(out).rglob("*.md"))
         assert len(md_files) == 2
+
+
+    def test_export_creates_git_commit(self, tmp_path, capsys):
+        import subprocess
+
+        client = _mock_client()
+        cache = MagicMock()
+        cache.refresh.return_value = _cached_space()
+        out = str(tmp_path / "out")
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media"]), \
+             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
+            main()
+
+        # Verify git repo was created and export was committed
+        log = subprocess.run(
+            ["git", "log", "--oneline"], cwd=out, capture_output=True, text=True
+        )
+        assert "Export Confluence space TEST" in log.stdout
+
+        # Verify working tree is clean (no untracked files from export)
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=out, capture_output=True, text=True
+        )
+        assert status.stdout.strip() == ""
+
+    def test_no_git_flag_skips_versioning(self, tmp_path):
+        client = _mock_client()
+        cache = MagicMock()
+        cache.refresh.return_value = _cached_space()
+        out = str(tmp_path / "out")
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media", "--no-git"]), \
+             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
+            main()
+
+        assert not (Path(out) / ".git").exists()
 
 
 class TestRefreshCommand:
