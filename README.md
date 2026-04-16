@@ -56,10 +56,10 @@ If no token or cookie is provided, the tool will prompt interactively. Browser c
 ## Commands
 
 ```bash
-confluence-export spaces                          # list accessible spaces
-confluence-export tree SPACEKEY                    # show page hierarchy
-confluence-export find SPACEKEY "query"            # search pages by title
-confluence-export export SPACEKEY -o ./output      # export full space
+confluence-export spaces                            # list accessible spaces
+confluence-export tree SPACEKEY                     # show page hierarchy
+confluence-export find SPACEKEY "query"             # search pages by title
+confluence-export export SPACEKEY -o ./output       # export full space
 confluence-export export SPACEKEY --path /Sub/Tree  # export a subtree
 confluence-export export SPACEKEY --no-media        # skip attachments
 confluence-export diff SPACEKEY ./output            # compare export vs. live
