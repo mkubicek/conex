@@ -21,6 +21,11 @@ def _att(title="img.png", version=1, file_size=100, download_link="/wiki/downloa
     )
 
 
+def _attachment_paths(result: list[Path]) -> list[Path]:
+    """Filter out the manifest from download results."""
+    return [p for p in result if p.name != _VERSIONS_FILE]
+
+
 class TestEnsureMediaDir:
     def test_creates_dir(self, tmp_path):
         page_dir = tmp_path / "page"
@@ -40,7 +45,7 @@ class TestDownloadAttachments:
         client = MagicMock()
         result = download_attachments(client, [_att(version=3)], media_dir)
 
-        assert len(result) == 1
+        assert len(_attachment_paths(result)) == 1
         client.download_attachment_to_file.assert_not_called()
 
     def test_redownload_when_version_changes(self, tmp_path):
@@ -52,7 +57,7 @@ class TestDownloadAttachments:
         client = MagicMock()
         result = download_attachments(client, [_att(version=3)], media_dir)
 
-        assert len(result) == 1
+        assert len(_attachment_paths(result)) == 1
         client.download_attachment_to_file.assert_called_once()
 
     def test_download_when_no_manifest(self, tmp_path):
@@ -64,7 +69,7 @@ class TestDownloadAttachments:
         client = MagicMock()
         result = download_attachments(client, [_att(version=3)], media_dir)
 
-        assert len(result) == 1
+        assert len(_attachment_paths(result)) == 1
         client.download_attachment_to_file.assert_called_once()
 
     def test_saves_version_after_download(self, tmp_path):
@@ -84,8 +89,18 @@ class TestDownloadAttachments:
         client = MagicMock()
         result = download_attachments(client, [_att()], media_dir)
 
-        assert len(result) == 1
+        assert len(_attachment_paths(result)) == 1
         client.download_attachment_to_file.assert_called_once()
+
+    def test_includes_manifest_in_result(self, tmp_path):
+        media_dir = tmp_path / "media"
+        media_dir.mkdir()
+
+        client = MagicMock()
+        result = download_attachments(client, [_att()], media_dir)
+
+        manifest_paths = [p for p in result if p.name == _VERSIONS_FILE]
+        assert len(manifest_paths) == 1
 
     def test_no_download_link(self, tmp_path, capsys):
         media_dir = tmp_path / "media"
@@ -95,7 +110,7 @@ class TestDownloadAttachments:
         client = MagicMock()
 
         result = download_attachments(client, [att], media_dir)
-        assert len(result) == 0
+        assert len(_attachment_paths(result)) == 0
         assert "no download link" in capsys.readouterr().err
 
     def test_download_failure(self, tmp_path, capsys):
@@ -106,7 +121,7 @@ class TestDownloadAttachments:
         client.download_attachment_to_file.side_effect = Exception("network error")
 
         result = download_attachments(client, [_att()], media_dir)
-        assert len(result) == 0
+        assert len(_attachment_paths(result)) == 0
         assert "failed to download" in capsys.readouterr().err
 
     def test_prepends_wiki_prefix(self, tmp_path):

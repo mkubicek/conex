@@ -214,3 +214,25 @@ class TestCommitExport:
 
         log = subprocess.run(["git", "log", "--oneline"], cwd=tmp_path, capture_output=True, text=True)
         assert "Export Confluence space TEST" in log.stdout
+
+    def test_metadata_files_survive_repeated_exports(self, tmp_path):
+        """Files like .versions.json included in written_files are not removed."""
+        self._init_repo(tmp_path)
+        media = tmp_path / "media"
+        media.mkdir()
+        md = tmp_path / "Page.md"
+        md.write_text("# Page")
+        manifest = media / ".versions.json"
+        manifest.write_text('{"img.png": 1}')
+
+        # First export includes both md and manifest
+        commit_export(tmp_path, [md, manifest], "TEST")
+
+        # Second export with same files
+        md.write_text("# Page v2")
+        manifest.write_text('{"img.png": 2}')
+        commit_export(tmp_path, [md, manifest], "TEST")
+
+        # Manifest should still be tracked
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True)
+        assert "media/.versions.json" in ls.stdout

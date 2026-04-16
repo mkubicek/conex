@@ -91,5 +91,6 @@ def download_attachments(
             versions.setdefault(att.title, att.version.number)
 
     _save_versions(media_dir, versions)
+    downloaded.append(media_dir / _VERSIONS_FILE)
 
     return downloaded

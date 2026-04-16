@@ -182,8 +182,9 @@ class TestDownloadParallelErrorIsolation:
 
         result = download_attachments(client, [att_ok, att_fail], media_dir, skip_existing=False)
 
-        assert len(result) == 1
-        assert result[0].name == "good.png"
+        attachment_results = [p for p in result if p.name != ".versions.json"]
+        assert len(attachment_results) == 1
+        assert attachment_results[0].name == "good.png"
 
 
 # ---------------------------------------------------------------------------
