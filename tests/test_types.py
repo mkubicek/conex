@@ -68,6 +68,19 @@ class TestPage:
         assert p2.title == p.title
         assert p2.version.number == 3
 
+    def test_round_trip_preserves_body_storage(self):
+        p = Page(id="1", title="Test", space_id="s1",
+                 body_storage="<p>Hello <strong>world</strong></p>")
+        d = p.to_dict()
+        assert d["body"]["storage"]["value"] == "<p>Hello <strong>world</strong></p>"
+        p2 = Page.from_dict(d)
+        assert p2.body_storage == p.body_storage
+
+    def test_to_dict_omits_body_when_empty(self):
+        p = Page(id="1", title="Test", space_id="s1", body_storage="")
+        d = p.to_dict()
+        assert "body" not in d
+
 
 class TestAttachment:
     def test_from_api(self):
@@ -112,3 +125,17 @@ class TestCachedSpace:
         assert len(cs2.pages) == 1
         assert len(cs2.attachments["p1"]) == 1
         assert cs2.updated_at == "2025-01-01T00:00:00Z"
+
+    def test_round_trip_preserves_page_bodies(self):
+        space = Space(id="1", key="TEST", name="Test")
+        with_body = Page(id="p1", title="Has Body", space_id="1",
+                         body_storage="<p>content</p>",
+                         version=Version(number=1))
+        without_body = Page(id="p2", title="No Body", space_id="1",
+                            status="folder", version=Version(number=1))
+        cs = CachedSpace(space=space, pages=[with_body, without_body],
+                         attachments={}, updated_at="2025-01-01T00:00:00Z")
+        d = cs.to_dict()
+        cs2 = CachedSpace.from_dict(d)
+        assert cs2.pages[0].body_storage == "<p>content</p>"
+        assert cs2.pages[1].body_storage == ""
