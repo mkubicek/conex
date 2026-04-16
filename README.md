@@ -62,6 +62,13 @@ confluence-export find SPACEKEY "query"             # search pages by title
 confluence-export export SPACEKEY -o ./output       # export full space
 confluence-export export SPACEKEY --path /Sub/Tree  # export a subtree
 confluence-export export SPACEKEY --no-media        # skip attachments
+confluence-export export SPACEKEY --no-git          # skip git versioning
 confluence-export diff SPACEKEY ./output            # compare export vs. live
 confluence-export refresh SPACEKEY                  # force-refresh cache
 ```
+
+## Git Versioning
+
+Exports are automatically versioned with git. After each export, only Confluence-sourced files are committed. If you've made local edits to previously exported files, those are captured in a separate commit first. Locally created files are never auto-committed.
+
+Git versioning is enabled by default and requires git to be installed. If git is not available, the export proceeds normally with a warning. Disable with `--no-git`.

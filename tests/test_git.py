@@ -1,0 +1,149 @@
+"""Tests for git versioning module."""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+from unittest.mock import patch
+
+from confluence_export.git import (
+    commit_export,
+    commit_local_changes,
+    ensure_repo,
+    git_available,
+)
+
+
+class TestGitAvailable:
+    def test_found(self):
+        with patch("confluence_export.git.shutil.which", return_value="/usr/bin/git"):
+            assert git_available() is True
+
+    def test_not_found(self):
+        with patch("confluence_export.git.shutil.which", return_value=None):
+            assert git_available() is False
+
+
+class TestEnsureRepo:
+    def test_already_a_repo(self, tmp_path):
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+        assert ensure_repo(tmp_path) is True
+
+    def test_initializes_new_repo(self, tmp_path):
+        assert ensure_repo(tmp_path) is True
+        assert (tmp_path / ".git").is_dir()
+
+    def test_inside_parent_repo(self, tmp_path):
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+        sub = tmp_path / "sub" / "dir"
+        sub.mkdir(parents=True)
+        assert ensure_repo(sub) is True
+        # Should NOT create a nested .git
+        assert not (sub / ".git").exists()
+
+
+class TestCommitLocalChanges:
+    def _init_repo(self, tmp_path: Path) -> Path:
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, capture_output=True)
+        return tmp_path
+
+    def test_no_changes(self, tmp_path):
+        self._init_repo(tmp_path)
+        # Create and commit a file so there's a HEAD
+        (tmp_path / "file.md").write_text("hello")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True)
+
+        assert commit_local_changes(tmp_path) is False
+
+    def test_with_modifications(self, tmp_path):
+        self._init_repo(tmp_path)
+        (tmp_path / "file.md").write_text("hello")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True)
+
+        # Modify tracked file
+        (tmp_path / "file.md").write_text("modified")
+
+        assert commit_local_changes(tmp_path) is True
+
+        # Verify commit was made
+        log = subprocess.run(["git", "log", "--oneline"], cwd=tmp_path, capture_output=True, text=True)
+        assert "Local changes" in log.stdout
+
+    def test_ignores_untracked_files(self, tmp_path):
+        self._init_repo(tmp_path)
+        (tmp_path / "tracked.md").write_text("hello")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True)
+
+        # Create untracked file only
+        (tmp_path / "local-notes.txt").write_text("my notes")
+
+        assert commit_local_changes(tmp_path) is False
+
+
+class TestCommitExport:
+    def _init_repo(self, tmp_path: Path) -> Path:
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, capture_output=True)
+        # Need an initial commit for diff --cached to work
+        (tmp_path / ".gitkeep").write_text("")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True)
+        return tmp_path
+
+    def test_commits_written_files(self, tmp_path):
+        self._init_repo(tmp_path)
+        md = tmp_path / "Page.md"
+        md.write_text("# Page")
+        media = tmp_path / "media" / "img.png"
+        media.parent.mkdir()
+        media.write_bytes(b"\x89PNG")
+
+        assert commit_export(tmp_path, [md, media], "TEST") is True
+
+        log = subprocess.run(["git", "log", "--oneline"], cwd=tmp_path, capture_output=True, text=True)
+        assert "Export Confluence space TEST" in log.stdout
+
+    def test_does_not_commit_other_files(self, tmp_path):
+        self._init_repo(tmp_path)
+        # A locally created file that should NOT be committed
+        (tmp_path / "local-notes.txt").write_text("my notes")
+        # An exporter-written file
+        md = tmp_path / "Page.md"
+        md.write_text("# Page")
+
+        commit_export(tmp_path, [md], "TEST")
+
+        # local-notes.txt should still be untracked
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=tmp_path, capture_output=True, text=True)
+        assert "local-notes.txt" in status.stdout
+        assert "??" in status.stdout  # untracked marker
+
+    def test_nothing_to_commit(self, tmp_path):
+        self._init_repo(tmp_path)
+        md = tmp_path / "Page.md"
+        md.write_text("# Page")
+        subprocess.run(["git", "add", "Page.md"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "already committed"], cwd=tmp_path, capture_output=True)
+
+        # Re-export with identical content
+        assert commit_export(tmp_path, [md], "TEST") is False
+
+    def test_commit_message_contains_timestamp(self, tmp_path):
+        self._init_repo(tmp_path)
+        md = tmp_path / "Page.md"
+        md.write_text("# Page")
+
+        commit_export(tmp_path, [md], "NB")
+
+        log = subprocess.run(
+            ["git", "log", "-1", "--format=%s"], cwd=tmp_path, capture_output=True, text=True
+        )
+        msg = log.stdout.strip()
+        assert "NB" in msg
+        assert "UTC" in msg

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from confluence_export.exporter import Exporter
+from confluence_export.exporter import ExportResult, Exporter
 from confluence_export.types import (
     Attachment,
     CachedSpace,
@@ -98,8 +98,8 @@ class TestTreeExport:
         cs = _make_cached_space(pages=[parent, child])
         cache.ensure_loaded.return_value = cs
 
-        count = exporter.export_space(_make_space(), tmp_path)
-        assert count == 2
+        result = exporter.export_space(_make_space(), tmp_path)
+        assert result.count == 2
 
         parent_md = (tmp_path / "Parent" / "Parent.md").read_text()
         child_md = (tmp_path / "Parent" / "Child" / "Child.md").read_text()
@@ -116,8 +116,8 @@ class TestTreeExport:
         cs = _make_cached_space(pages=[root, sub, leaf])
         cache.ensure_loaded.return_value = cs
 
-        count = exporter.export_space(_make_space(), tmp_path, path_filter="/Root/Sub")
-        assert count == 2  # Sub + Leaf
+        result = exporter.export_space(_make_space(), tmp_path, path_filter="/Root/Sub")
+        assert result.count == 2  # Sub + Leaf
 
         assert (tmp_path / "Sub" / "Sub.md").exists()
         assert (tmp_path / "Sub" / "Leaf" / "Leaf.md").exists()
@@ -127,8 +127,8 @@ class TestTreeExport:
         cs = _make_cached_space()
         cache.ensure_loaded.return_value = cs
 
-        count = exporter.export_space(_make_space(), tmp_path, path_filter="/Nonexistent")
-        assert count == 0
+        result = exporter.export_space(_make_space(), tmp_path, path_filter="/Nonexistent")
+        assert result.count == 0
         assert "not found" in capsys.readouterr().err
 
     def test_no_children_exports_only_roots(self, tmp_path):
@@ -139,8 +139,8 @@ class TestTreeExport:
         cs = _make_cached_space(pages=[parent, child])
         cache.ensure_loaded.return_value = cs
 
-        count = exporter.export_space(_make_space(), tmp_path, no_children=True)
-        assert count == 1  # only the root
+        result = exporter.export_space(_make_space(), tmp_path, no_children=True)
+        assert result.count == 1  # only the root
 
 
 class TestFolderHandling:
@@ -150,8 +150,8 @@ class TestFolderHandling:
         page.status = "folder"
         cs = _make_cached_space()
 
-        count = exporter._export_single_page(page, tmp_path, cs, "TEST")
-        assert count == 0
+        files = exporter._export_single_page(page, tmp_path, cs, "TEST")
+        assert files == []
         assert list(tmp_path.glob("*.md")) == []
 
 
@@ -175,8 +175,8 @@ class TestBodyFetching:
         client.get_page_by_id.side_effect = Exception("timeout")
         cs = _make_cached_space(pages=[page])
 
-        count = exporter._export_single_page(page, tmp_path, cs, "TEST")
-        assert count == 0
+        files = exporter._export_single_page(page, tmp_path, cs, "TEST")
+        assert files == []
         assert "Warning" in capsys.readouterr().err
 
     def test_prefetch_fills_bodies_before_export(self):
