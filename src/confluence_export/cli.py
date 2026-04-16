@@ -388,7 +388,7 @@ def _cmd_export(
     """Export page tree as LLM-ready markdown."""
     space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
 
-    out = Path(output_dir)
+    out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
 
     # Git: pre-export
