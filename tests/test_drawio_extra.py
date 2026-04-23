@@ -88,37 +88,46 @@ class TestRenderDrawioToPng:
         drawio.write_text("<xml/>")
         expected_png = drawio.with_suffix(".drawio.png")
 
-        def fake_render(*args, **kwargs):
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+
+        def fake_popen(*args, **kwargs):
             expected_png.write_bytes(b"PNG data")
-            return MagicMock(returncode=0)
+            return mock_proc
 
         with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
-             patch("subprocess.run", side_effect=fake_render) as mock_run:
+             patch("subprocess.Popen", side_effect=fake_popen) as mock_popen:
             result = render_drawio_to_png(drawio)
             assert result == expected_png
-            mock_run.assert_called_once()
+            mock_popen.assert_called_once()
 
     def test_render_failure(self, tmp_path, capsys):
-        import subprocess
         drawio = tmp_path / "test.drawio"
         drawio.write_text("<xml/>")
 
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1  # process exited with error, no file
+
         with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
-             patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "drawio")):
+             patch("subprocess.Popen", return_value=mock_proc):
             result = render_drawio_to_png(drawio)
             assert result is None
-            assert "render failed" in capsys.readouterr().err
+            assert "no output" in capsys.readouterr().err
 
     def test_custom_output_path(self, tmp_path):
         drawio = tmp_path / "test.drawio"
         drawio.write_text("<xml/>")
         custom = tmp_path / "custom.png"
 
-        def fake_render(*args, **kwargs):
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+
+        def fake_popen(*args, **kwargs):
             custom.write_bytes(b"PNG data")
+            return mock_proc
 
         with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
-             patch("subprocess.run", side_effect=fake_render):
+             patch("subprocess.Popen", side_effect=fake_popen):
             result = render_drawio_to_png(drawio, output_path=custom)
             assert result == custom
 

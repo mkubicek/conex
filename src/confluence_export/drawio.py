@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from confluence_export.media import MEDIA_DIR_NAME
@@ -71,7 +72,7 @@ def render_drawio_to_png(drawio_path: Path, output_path: Path | None = None) -> 
         return output_path
 
     try:
-        subprocess.run(
+        proc = subprocess.Popen(
             [
                 cli,
                 "--export",
@@ -80,17 +81,37 @@ def render_drawio_to_png(drawio_path: Path, output_path: Path | None = None) -> 
                 "--output", str(output_path),
                 str(drawio_path),
             ],
-            capture_output=True,
-            timeout=120,
-            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        if not output_path.exists() or output_path.stat().st_size == 0:
-            print(f"  Warning: draw.io produced no output for {drawio_path.name}", file=sys.stderr)
-            return None
-        return output_path
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+    except FileNotFoundError as exc:
         print(f"  Warning: draw.io render failed for {drawio_path.name}: {exc}", file=sys.stderr)
         return None
+
+    # Poll for output file or process exit, whichever comes first.
+    # draw.io writes the PNG before its Electron cleanup, which can hang.
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        if output_path.exists() and output_path.stat().st_size > 0:
+            # File created — kill the (possibly hung) process and return
+            proc.kill()
+            proc.wait()
+            return output_path
+        ret = proc.poll()
+        if ret is not None:
+            # Process exited without creating the file
+            break
+        time.sleep(0.5)
+    else:
+        # Timeout — kill the process
+        proc.kill()
+        proc.wait()
+
+    if output_path.exists() and output_path.stat().st_size > 0:
+        return output_path
+
+    print(f"  Warning: draw.io produced no output for {drawio_path.name}", file=sys.stderr)
+    return None
 
 
 def replace_drawio_placeholders(
