@@ -86,12 +86,16 @@ class TestRenderDrawioToPng:
     def test_successful_render(self, tmp_path):
         drawio = tmp_path / "test.drawio"
         drawio.write_text("<xml/>")
+        expected_png = drawio.with_suffix(".drawio.png")
+
+        def fake_render(*args, **kwargs):
+            expected_png.write_bytes(b"PNG data")
+            return MagicMock(returncode=0)
 
         with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
-             patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+             patch("subprocess.run", side_effect=fake_render) as mock_run:
             result = render_drawio_to_png(drawio)
-            assert result == drawio.with_suffix(".drawio.png")
+            assert result == expected_png
             mock_run.assert_called_once()
 
     def test_render_failure(self, tmp_path, capsys):
@@ -110,8 +114,11 @@ class TestRenderDrawioToPng:
         drawio.write_text("<xml/>")
         custom = tmp_path / "custom.png"
 
+        def fake_render(*args, **kwargs):
+            custom.write_bytes(b"PNG data")
+
         with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
-             patch("subprocess.run"):
+             patch("subprocess.run", side_effect=fake_render):
             result = render_drawio_to_png(drawio, output_path=custom)
             assert result == custom
 

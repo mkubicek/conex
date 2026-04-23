@@ -77,7 +77,6 @@ def render_drawio_to_png(drawio_path: Path, output_path: Path | None = None) -> 
                 "--export",
                 "--format", "png",
                 "--no-sandbox",
-                "--disable-gpu",
                 "--output", str(output_path),
                 str(drawio_path),
             ],
@@ -85,6 +84,9 @@ def render_drawio_to_png(drawio_path: Path, output_path: Path | None = None) -> 
             timeout=120,
             check=True,
         )
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            print(f"  Warning: draw.io produced no output for {drawio_path.name}", file=sys.stderr)
+            return None
         return output_path
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
         print(f"  Warning: draw.io render failed for {drawio_path.name}: {exc}", file=sys.stderr)
