@@ -42,7 +42,7 @@ Each page directory includes a `.workspace/` folder where you can store preparat
 # Example: a script that summarizes a page's attachments
 output/Space-Name/Page-A/.workspace/summarize.py
 
-# Example: notes for a Claude Code session preparing content
+# Example: notes for an AI coding agent session preparing content
 output/Space-Name/Page-A/.workspace/draft-notes.md
 ```
 
