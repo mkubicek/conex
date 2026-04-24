@@ -13,11 +13,14 @@ confluence-export export SPACEKEY -o ./output
 output/
 └── Space-Name/
     ├── Space-Name.md
+    ├── .workspace/
     ├── Page-A/
     │   ├── Page-A.md
+    │   ├── .workspace/
     │   ├── Child-Page/
     │   │   ├── Child-Page.md
-    │   │   └── media/
+    │   │   ├── .workspace/
+    │   │   └── .media/
     │   │       ├── diagram.drawio
     │   │       ├── diagram.drawio.png
     │   │       └── screenshot.png
@@ -25,11 +28,25 @@ output/
     │       └── Another-Child.md
     └── Page-B/
         ├── Page-B.md
-        └── media/
+        └── .media/
             └── report.pdf
 ```
 
-Pages become markdown files. Attachments land in `media/` folders next to their page. The folder hierarchy mirrors the Confluence page tree.
+Pages become markdown files. Attachments land in `.media/` folders next to their page. The folder hierarchy mirrors the Confluence page tree.
+
+## Workspace
+
+Each page directory includes a `.workspace/` folder where you can store preparation files (scripts, notes, aggregation data) that are useful when working with the exported content but should not go to Confluence. Workspace files persist across re-exports.
+
+```bash
+# Example: a script that summarizes a page's attachments
+output/Space-Name/Page-A/.workspace/summarize.py
+
+# Example: notes for a Claude Code session preparing content
+output/Space-Name/Page-A/.workspace/draft-notes.md
+```
+
+Both `.workspace/` and `.media/` use a dot-prefix to avoid collisions with Confluence pages that might be titled "workspace" or "media".
 
 ## Install
 
