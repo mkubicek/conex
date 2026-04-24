@@ -11,13 +11,38 @@ from confluence_export.client import ConfluenceClient
 from confluence_export.types import Attachment
 
 _VERSIONS_FILE = ".versions.json"
+MEDIA_DIR_NAME = ".media"
 
 
 def ensure_media_dir(page_dir: Path) -> Path:
-    """Create and return the media/ subdirectory for a page."""
-    media_dir = page_dir / "media"
+    """Create and return the .media/ subdirectory for a page."""
+    media_dir = page_dir / MEDIA_DIR_NAME
     media_dir.mkdir(parents=True, exist_ok=True)
     return media_dir
+
+
+# TODO(migration): Remove after 2027-01-01 — all users will have migrated by then
+def migrate_media_dirs(root_dir: Path) -> list[tuple[Path, Path]]:
+    """Rename legacy media/ directories to .media/ throughout an export tree.
+
+    Only renames directories that contain .versions.json (the manifest created
+    by download_attachments), which reliably identifies attachment directories
+    vs. page directories that happen to be named "media".
+
+    Returns list of (old_path, new_path) tuples for each renamed directory.
+    """
+    renamed: list[tuple[Path, Path]] = []
+    for dirpath in sorted(root_dir.rglob("media"), reverse=True):
+        if not dirpath.is_dir() or dirpath.name != "media":
+            continue
+        if not (dirpath / _VERSIONS_FILE).exists():
+            continue
+        new_path = dirpath.parent / MEDIA_DIR_NAME
+        if new_path.exists():
+            continue
+        dirpath.rename(new_path)
+        renamed.append((dirpath, new_path))
+    return renamed
 
 
 def _load_versions(media_dir: Path) -> dict[str, int]:

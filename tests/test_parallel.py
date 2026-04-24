@@ -177,7 +177,7 @@ class TestDownloadParallelErrorIsolation:
 
         client.download_attachment_to_file.side_effect = mock_download
 
-        media_dir = tmp_path / "media"
+        media_dir = tmp_path / ".media"
         media_dir.mkdir()
 
         result = download_attachments(client, [att_ok, att_fail], media_dir, skip_existing=False)

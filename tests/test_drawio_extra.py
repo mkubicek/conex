@@ -119,19 +119,19 @@ class TestRenderDrawioToPng:
 class TestReplaceDrawioPlaceholders:
     def test_replace_with_extension(self):
         md = "# Diagram\n\n[drawio:arch.drawio]\n\nMore text"
-        rendered = {"arch.drawio": Path("media/arch.drawio.png")}
+        rendered = {"arch.drawio": Path(".media/arch.drawio.png")}
         result = replace_drawio_placeholders(md, rendered)
-        assert "![arch](media/arch.drawio.png)" in result
+        assert "![arch](.media/arch.drawio.png)" in result
         assert "arch.drawio" in result  # source link
 
     def test_replace_without_extension(self):
         md = "# Diagram\n\n[drawio:arch]\n\nMore text"
-        rendered = {"arch.drawio": Path("media/arch.drawio.png")}
+        rendered = {"arch.drawio": Path(".media/arch.drawio.png")}
         result = replace_drawio_placeholders(md, rendered)
-        assert "![arch](media/arch.drawio.png)" in result
+        assert "![arch](.media/arch.drawio.png)" in result
 
     def test_no_matching_placeholder(self):
         md = "# No diagrams here"
-        rendered = {"other.drawio": Path("media/other.drawio.png")}
+        rendered = {"other.drawio": Path(".media/other.drawio.png")}
         result = replace_drawio_placeholders(md, rendered)
         assert result == md

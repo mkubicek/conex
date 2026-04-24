@@ -62,7 +62,7 @@ def test_replace_drawio_placeholders(tmp_path):
         markdown,
         {"architecture": png},
     )
-    assert "![architecture](media/architecture.drawio.png)" in result
+    assert "![architecture](.media/architecture.drawio.png)" in result
     assert "Draw.io source:" in result
     assert "architecture.drawio" in result
     assert "[drawio:" not in result

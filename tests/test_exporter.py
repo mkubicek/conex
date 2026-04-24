@@ -210,11 +210,11 @@ class TestMediaDownload:
         cs = _make_cached_space(attachments={"p1": [att]})
 
         with patch("confluence_export.exporter.download_attachments") as mock_dl:
-            mock_dl.return_value = [tmp_path / "media" / "img.png"]
+            mock_dl.return_value = [tmp_path / ".media" / "img.png"]
             exporter._export_single_page(page, tmp_path, cs, "TEST")
             mock_dl.assert_called_once()
             # Verify media dir was created and passed
-            assert mock_dl.call_args[0][2].name == "media"
+            assert mock_dl.call_args[0][2].name == ".media"
 
 
 class TestDrawioRendering:
@@ -230,7 +230,7 @@ class TestDrawioRendering:
         ))
         cs = _make_cached_space(attachments={"p1": [att]})
 
-        media_dir = tmp_path / "media"
+        media_dir = tmp_path / ".media"
         media_dir.mkdir()
         (media_dir / "arch.drawio").write_text("<xml/>")
         png_path = media_dir / "arch.drawio.png"
@@ -252,6 +252,51 @@ class TestUserResolution:
         assert exporter._resolve_user("u1") == {"displayName": "Alice"}
         assert exporter._resolve_user("u1") == {"displayName": "Alice"}
         client.get_user_info.assert_called_once_with("u1")  # only 1 API call
+
+
+class TestWorkspaceDirectory:
+    def test_workspace_created_for_each_page(self, tmp_path):
+        exporter, _, cache = _make_exporter()
+        cs = _make_cached_space()
+        cache.ensure_loaded.return_value = cs
+
+        exporter.export_space(_make_space(), tmp_path)
+
+        workspace = tmp_path / "Test-Page" / ".workspace"
+        assert workspace.is_dir()
+
+    def test_workspace_created_for_nested_pages(self, tmp_path):
+        exporter, _, cache = _make_exporter()
+        parent = _make_page(id="p1", title="Parent", body="<p>P</p>")
+        child = _make_page(id="p2", title="Child", body="<p>C</p>",
+                           parent_id="p1", parent_type="page")
+        cs = _make_cached_space(pages=[parent, child])
+        cache.ensure_loaded.return_value = cs
+
+        exporter.export_space(_make_space(), tmp_path)
+
+        assert (tmp_path / "Parent" / ".workspace").is_dir()
+        assert (tmp_path / "Parent" / "Child" / ".workspace").is_dir()
+
+    def test_workspace_preserves_existing_files(self, tmp_path):
+        exporter, _, cache = _make_exporter()
+        cs = _make_cached_space()
+        cache.ensure_loaded.return_value = cs
+
+        # First export
+        exporter.export_space(_make_space(), tmp_path)
+
+        # User adds a file to the workspace
+        workspace = tmp_path / "Test-Page" / ".workspace"
+        script = workspace / "aggregate.py"
+        script.write_text("print('hello')")
+
+        # Re-export
+        exporter.export_space(_make_space(), tmp_path)
+
+        # User's file is still there
+        assert script.exists()
+        assert script.read_text() == "print('hello')"
 
 
 class TestForceRefresh:

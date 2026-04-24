@@ -52,7 +52,7 @@ def test_convert_page_frontmatter_has_attachments():
 def test_preprocess_ac_image():
     html = '<ac:image><ri:attachment ri:filename="screenshot.png"/></ac:image>'
     result = _preprocess_html(html, [])
-    assert "media/screenshot.png" in result
+    assert ".media/screenshot.png" in result
     assert "ac:image" not in result
 
 
@@ -63,7 +63,7 @@ def test_preprocess_ac_link():
         "</ac:link>"
     )
     result = _preprocess_html(html, [])
-    assert "media/doc.pdf" in result
+    assert ".media/doc.pdf" in result
     assert "My Document" in result
 
 

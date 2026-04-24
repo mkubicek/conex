@@ -34,7 +34,7 @@ PREPROCESS_CASES = [
     ),
 
     # Images
-    ("attachment image", '<ac:image><ri:attachment ri:filename="shot.png"/></ac:image>', ["media/shot.png"], ["ac:image"]),
+    ("attachment image", '<ac:image><ri:attachment ri:filename="shot.png"/></ac:image>', [".media/shot.png"], ["ac:image"]),
     ("external image", '<ac:image><ri:url ri:value="https://example.com/img.png"/></ac:image>', ["https://example.com/img.png"], []),
     ("image no source removed", "<ac:image></ac:image>", [], ["ac:image"]),
 
@@ -43,7 +43,7 @@ PREPROCESS_CASES = [
         "attachment link",
         '<ac:link><ri:attachment ri:filename="doc.pdf"/>'
         "<ac:plain-text-link-body>My Doc</ac:plain-text-link-body></ac:link>",
-        ["media/doc.pdf", "My Doc"], [],
+        [".media/doc.pdf", "My Doc"], [],
     ),
     (
         "page link preserves label",
@@ -78,8 +78,8 @@ PREPROCESS_CASES = [
     ),
     ("jira macro", '<ac:structured-macro ac:name="jira"><ac:parameter ac:name="key">PROJ-42</ac:parameter></ac:structured-macro>', ["PROJ-42"], []),
     ("jira macro empty", '<ac:structured-macro ac:name="jira"></ac:structured-macro>', [], ["ac:structured-macro"]),
-    ("view-file via ri:attachment", '<ac:structured-macro ac:name="view-file"><ri:attachment ri:filename="report.pdf"/></ac:structured-macro>', ["media/report.pdf"], []),
-    ("view-file via name param", '<ac:structured-macro ac:name="view-file"><ac:parameter ac:name="name">doc.pdf</ac:parameter></ac:structured-macro>', ["media/doc.pdf"], []),
+    ("view-file via ri:attachment", '<ac:structured-macro ac:name="view-file"><ri:attachment ri:filename="report.pdf"/></ac:structured-macro>', [".media/report.pdf"], []),
+    ("view-file via name param", '<ac:structured-macro ac:name="view-file"><ac:parameter ac:name="name">doc.pdf</ac:parameter></ac:structured-macro>', [".media/doc.pdf"], []),
     ("view-file empty", '<ac:structured-macro ac:name="view-file"></ac:structured-macro>', [], ["ac:structured-macro"]),
     ("drawio placeholder", '<ac:structured-macro ac:name="drawio"><ac:parameter ac:name="diagramName">arch</ac:parameter></ac:structured-macro>', ["[drawio:arch]"], []),
 
@@ -177,7 +177,7 @@ def test_full_conversion_pipeline():
     assert "Updated for v2" in md
 
     # Image converted to markdown
-    assert "media/diagram.png" in md
+    assert ".media/diagram.png" in md
 
     # Code block preserved
     assert "services:" in md

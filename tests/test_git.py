@@ -119,7 +119,7 @@ class TestCommitExport:
         self._init_repo(tmp_path)
         md = tmp_path / "Page.md"
         md.write_text("# Page")
-        media = tmp_path / "media" / "img.png"
+        media = tmp_path / ".media" / "img.png"
         media.parent.mkdir()
         media.write_bytes(b"\x89PNG")
 
@@ -218,7 +218,7 @@ class TestCommitExport:
     def test_metadata_files_survive_repeated_exports(self, tmp_path):
         """Files like .versions.json included in written_files are not removed."""
         self._init_repo(tmp_path)
-        media = tmp_path / "media"
+        media = tmp_path / ".media"
         media.mkdir()
         md = tmp_path / "Page.md"
         md.write_text("# Page")
@@ -235,7 +235,27 @@ class TestCommitExport:
 
         # Manifest should still be tracked
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True)
-        assert "media/.versions.json" in ls.stdout
+        assert ".media/.versions.json" in ls.stdout
+
+    def test_workspace_files_survive_reexport(self, tmp_path):
+        """Files inside workspace/ directories are never removed as stale."""
+        self._init_repo(tmp_path)
+        md = tmp_path / "Page.md"
+        md.write_text("# Page")
+        ws = tmp_path / ".workspace"
+        ws.mkdir()
+        script = ws / "prep.py"
+        script.write_text("print('hello')")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        # Re-export: only md is in written_files, workspace file should survive
+        md.write_text("# Page v2")
+        commit_export(tmp_path, [md], "TEST")
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True)
+        assert ".workspace/prep.py" in ls.stdout
+        assert "Page.md" in ls.stdout
 
     def test_removes_stale_file_with_non_ascii_path(self, tmp_path):
         """Paths with non-ASCII characters (umlauts etc.) are handled correctly."""

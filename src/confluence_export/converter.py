@@ -8,6 +8,8 @@ import yaml
 from bs4 import BeautifulSoup, NavigableString, Tag
 from markdownify import markdownify as md
 
+from confluence_export.media import MEDIA_DIR_NAME
+
 from typing import Callable
 
 from confluence_export.types import Attachment, Page
@@ -294,7 +296,7 @@ def _replace_ac_image(soup: BeautifulSoup, tag: Tag, attach_map: dict[str, Attac
     if ri:
         filename = ri.get("ri:filename", "")
         if filename:
-            img = soup.new_tag("img", src=f"media/{filename}", alt=filename)
+            img = soup.new_tag("img", src=f"{MEDIA_DIR_NAME}/{filename}", alt=filename)
             tag.replace_with(img)
             return
     # Fallback: external image URL
@@ -316,7 +318,7 @@ def _replace_ac_link(soup: BeautifulSoup, tag: Tag, attach_map: dict[str, Attach
         label_tag = tag.find("ac:plain-text-link-body") or tag.find("ac:link-body")
         label = label_tag.get_text().strip() if label_tag else filename
         if filename:
-            a = soup.new_tag("a", href=f"media/{filename}")
+            a = soup.new_tag("a", href=f"{MEDIA_DIR_NAME}/{filename}")
             a.string = label or filename
             tag.replace_with(a)
             return
@@ -470,7 +472,7 @@ def _convert_view_file(soup: BeautifulSoup, macro: Tag) -> None:
         filename = name_param.get_text().strip()
 
     if filename:
-        a = soup.new_tag("a", href=f"media/{filename}")
+        a = soup.new_tag("a", href=f"{MEDIA_DIR_NAME}/{filename}")
         a.string = filename
         macro.replace_with(a)
     else:

@@ -158,6 +158,27 @@ class TestExportCommand:
         assert len(md_files) == 2
 
 
+    def test_export_migrates_legacy_media_dirs(self, tmp_path, capsys):
+        client = _mock_client()
+        cache = MagicMock()
+        cache.refresh.return_value = _cached_space()
+        out = str(tmp_path / "out")
+        # Create a legacy media/ dir with .versions.json before export
+        out_path = Path(out)
+        out_path.mkdir(parents=True)
+        legacy = out_path / "Root" / "media"
+        legacy.mkdir(parents=True)
+        (legacy / ".versions.json").write_text("{}")
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media", "--no-git"]), \
+             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
+            main()
+
+        captured = capsys.readouterr()
+        assert "Migrated 1 media/" in captured.err
+        assert (out_path / "Root" / ".media" / ".versions.json").exists()
+
     def test_export_creates_git_commit(self, tmp_path, capsys):
         import subprocess
 
