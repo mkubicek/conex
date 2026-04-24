@@ -46,7 +46,7 @@ output/Space-Name/Page-A/.workspace/summarize.py
 output/Space-Name/Page-A/.workspace/draft-notes.md
 ```
 
-Both `.workspace/` and `.media/` use a dot-prefix to avoid collisions with Confluence pages that might be titled "workspace" or "media".
+Both `.workspace/` and `.media/` use a dot-prefix to avoid name collisions with Confluence pages. Since each page title becomes a directory name, a page titled "workspace" or "media" would clash with a non-prefixed directory. The dot-prefix is safe because page titles are sanitized to only contain word characters, spaces, and hyphens, so no page can produce a directory name starting with a dot.
 
 ## Install
 
