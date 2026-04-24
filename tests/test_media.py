@@ -199,6 +199,17 @@ class TestMigrateMediaDirs:
         assert (tmp_path / "Parent" / ".media" / "att.png").exists()
         assert (tmp_path / "Parent" / "Child" / ".media" / "att.png").exists()
 
+    def test_skips_file_named_media(self, tmp_path):
+        """A file named 'media' (not a directory) is ignored."""
+        page_dir = tmp_path / "Page"
+        page_dir.mkdir()
+        (page_dir / "media").write_text("just a file")
+
+        renamed = migrate_media_dirs(tmp_path)
+
+        assert len(renamed) == 0
+        assert (page_dir / "media").is_file()
+
     def test_empty_tree(self, tmp_path):
         """No media/ dirs at all — returns empty list."""
         assert migrate_media_dirs(tmp_path) == []
