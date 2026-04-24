@@ -116,6 +116,10 @@ def _remove_stale_files(output_dir: Path, written_files: list[Path]) -> None:
     written_resolved = {f.resolve() for f in written_files}
     stale = []
     for rel_path in result.stdout.strip("\0").split("\0"):
+        # Preserve user workspace directories across re-exports
+        parts = Path(rel_path).parts
+        if ".workspace" in parts:
+            continue
         full = (output_dir / rel_path).resolve()
         if full not in written_resolved:
             stale.append(rel_path)

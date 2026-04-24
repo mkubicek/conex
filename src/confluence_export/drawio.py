@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from confluence_export.media import MEDIA_DIR_NAME
+
 from confluence_export.types import Attachment
 
 
@@ -92,7 +94,7 @@ def render_drawio_to_png(drawio_path: Path, output_path: Path | None = None) -> 
 def replace_drawio_placeholders(
     markdown: str,
     rendered_diagrams: dict[str, Path],
-    media_dir_name: str = "media",
+    media_dir_name: str = MEDIA_DIR_NAME,
 ) -> str:
     """Replace [drawio:name] placeholders in markdown with image + source link."""
     for diagram_name, png_path in rendered_diagrams.items():

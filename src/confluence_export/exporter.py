@@ -163,6 +163,11 @@ class Exporter:
         page_dir = parent_dir / dir_name
         page_dir.mkdir(parents=True, exist_ok=True)
 
+        # Create workspace directory for user's preparation files
+        # Dot-prefix avoids collision with a Confluence page titled "workspace"
+        # (sanitize_filename strips dots, so no page can produce ".workspace")
+        (page_dir / ".workspace").mkdir(exist_ok=True)
+
         indent = "  " * depth
         print(f"{indent}Exporting: {page.title}")
 

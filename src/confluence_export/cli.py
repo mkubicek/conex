@@ -391,6 +391,13 @@ def _cmd_export(
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
 
+    # TODO(migration): Remove after 2027-01-01
+    from confluence_export.media import migrate_media_dirs
+
+    renamed = migrate_media_dirs(out)
+    if renamed:
+        print(f"Migrated {len(renamed)} media/ directories to .media/", file=sys.stderr)
+
     # Git: pre-export
     use_git = False
     if not no_git:
