@@ -90,22 +90,21 @@ def render_drawio_to_png(drawio_path: Path, output_path: Path | None = None) -> 
 
     # Poll for output file or process exit, whichever comes first.
     # draw.io writes the PNG before its Electron cleanup, which can hang.
-    deadline = time.monotonic() + 120
-    while time.monotonic() < deadline:
-        if output_path.exists() and output_path.stat().st_size > 0:
-            # File created — kill the (possibly hung) process and return
+    # try/finally guarantees the subprocess is reaped even if the caller
+    # raises (KeyboardInterrupt mid-export would otherwise leak Electron procs).
+    try:
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            if output_path.exists() and output_path.stat().st_size > 0:
+                return output_path
+            ret = proc.poll()
+            if ret is not None:
+                break
+            time.sleep(0.5)
+    finally:
+        if proc.poll() is None:
             proc.kill()
             proc.wait()
-            return output_path
-        ret = proc.poll()
-        if ret is not None:
-            # Process exited without creating the file
-            break
-        time.sleep(0.5)
-    else:
-        # Timeout — kill the process
-        proc.kill()
-        proc.wait()
 
     if output_path.exists() and output_path.stat().st_size > 0:
         return output_path
