@@ -302,6 +302,29 @@ class TestCommitExport:
         assert ".workspace/prep.py" in ls.stdout
         assert "Page.md" in ls.stdout
 
+    def test_aborts_when_batch_add_fails(self, tmp_path):
+        """If a chunked git add batch fails, commit_export returns False without committing.
+
+        Mixing a non-existent path in causes git add to fail with pathspec error,
+        which exercises the per-batch early-return guard added with chunking.
+        """
+        self._init_repo(tmp_path)
+        good = tmp_path / "page.md"
+        good.write_text("# Page")
+        bad = tmp_path / "does-not-exist.md"
+
+        # Capture HEAD before the failed export to confirm no new commit follows
+        before = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True
+        ).stdout.strip()
+
+        assert commit_export(tmp_path, [good, bad], "TEST") is False
+
+        after = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True
+        ).stdout.strip()
+        assert before == after  # HEAD unchanged — no commit was made
+
     def test_commits_many_paths_without_argv_overflow(self, tmp_path):
         """Real-world large-space scenario: thousands of paths in one export.
 
