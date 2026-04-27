@@ -84,7 +84,23 @@ PREPROCESS_CASES = [
     ("drawio placeholder", '<ac:structured-macro ac:name="drawio"><ac:parameter ac:name="diagramName">arch</ac:parameter></ac:structured-macro>', ["[drawio:arch]"], []),
 
     # Structural macros
-    ("toc removed", '<ac:structured-macro ac:name="toc"></ac:structured-macro>', [], []),
+    ("toc placeholder", '<ac:structured-macro ac:name="toc"></ac:structured-macro>', ["[Confluence dynamic content: toc]"], ["ac:structured-macro"]),
+    ("children placeholder", '<ac:structured-macro ac:name="children"></ac:structured-macro>', ["[Confluence dynamic content: children]"], []),
+    ("recently-updated placeholder", '<ac:structured-macro ac:name="recently-updated"></ac:structured-macro>', ["[Confluence dynamic content: recently-updated]"], []),
+    (
+        "include macro placeholder with page param",
+        '<ac:structured-macro ac:name="include">'
+        '<ac:parameter ac:name="page"><ri:page ri:content-title="Other Page"/></ac:parameter>'
+        "</ac:structured-macro>",
+        ["[Confluence dynamic content: include (page=Other Page)]"], [],
+    ),
+    (
+        "unknown future macro placeholder",
+        '<ac:structured-macro ac:name="future-2099-widget">'
+        '<ac:parameter ac:name="depth">3</ac:parameter>'
+        "</ac:structured-macro>",
+        ["[Confluence dynamic content: future-2099-widget (depth=3)]"], [],
+    ),
     ("excerpt preserves body", '<ac:structured-macro ac:name="excerpt"><ac:rich-text-body><p>Summary</p></ac:rich-text-body></ac:structured-macro>', ["Summary"], []),
     (
         "section/column unwrapped",
@@ -94,7 +110,7 @@ PREPROCESS_CASES = [
         ["Col"], [],
     ),
     ("unknown macro keeps body", '<ac:structured-macro ac:name="xyz"><ac:rich-text-body><p>Keep</p></ac:rich-text-body></ac:structured-macro>', ["Keep"], []),
-    ("unknown macro no body removed", '<ac:structured-macro ac:name="xyz"></ac:structured-macro>', [], []),
+    ("unknown macro no body emits placeholder", '<ac:structured-macro ac:name="xyz"></ac:structured-macro>', ["[Confluence dynamic content: xyz]"], []),
 
     # Decision lists
     ("decision item with text", '<ac:adf-node type="decisionItem" state="DECIDED"><p>Decided X</p></ac:adf-node>', ["Decided X"], []),
