@@ -252,28 +252,23 @@ def _preprocess_html(
             _convert_jira(soup, macro)
         elif macro_name == "view-file":
             _convert_view_file(soup, macro)
-        elif macro_name == "excerpt":
-            # Keep excerpt body content
+        elif macro_name in ("excerpt", "section", "column"):
+            # Pure layout/wrapper — keep body, drop wrapper, no placeholder
             body = macro.find("ac:rich-text-body")
             if body:
                 body.unwrap()
             macro.unwrap()
-        elif macro_name in ("section", "column"):
-            body = macro.find("ac:rich-text-body")
-            if body:
-                body.unwrap()
-            macro.unwrap()
-        elif macro_name in ("toc", "children", "pagetree", "attachments",
-                            "create-from-template", "decisionreport"):
-            # Navigation/interactive macros — no content to preserve
-            macro.decompose()
         else:
-            # Unknown macro: keep rich-text-body content, drop the wrapper
+            # Default: if body content exists, preserve it. Otherwise the
+            # macro is dynamic/widget-like (toc, children, recently-updated,
+            # include, future Confluence additions) — emit a visible
+            # placeholder so the reader knows something was there instead
+            # of silently dropping it.
             body = macro.find("ac:rich-text-body")
-            if body:
+            if body and body.get_text(strip=True):
                 macro.replace_with(*list(body.children))
             else:
-                macro.decompose()
+                _convert_dynamic_macro_placeholder(soup, macro, macro_name)
 
     # --- Inline comment markers: just unwrap ---
     for tag in list(soup.find_all("ac:inline-comment-marker")):
@@ -487,3 +482,32 @@ def _convert_drawio_placeholder(soup: BeautifulSoup, macro: Tag) -> None:
     placeholder = soup.new_tag("p")
     placeholder.string = f"[drawio:{diagram_name}]"
     macro.replace_with(placeholder)
+
+
+def _convert_dynamic_macro_placeholder(
+    soup: BeautifulSoup, macro: Tag, macro_name: str
+) -> None:
+    """Emit a visible italic placeholder for content-less macros.
+
+    Captures the macro name plus any non-default parameters (resolving page
+    references) so the reader sees what was there without the export trying
+    to keep dynamic content fresh. Future-proof: any new Confluence macro
+    without a body lands here automatically.
+    """
+    params: list[str] = []
+    for p in macro.find_all("ac:parameter", recursive=False):
+        name = p.get("ac:name", "")
+        page_ref = p.find("ri:page")
+        if page_ref is not None:
+            value = page_ref.get("ri:content-title", "").strip()
+        else:
+            value = p.get_text().strip()
+        if name and value:
+            params.append(f"{name}={value}")
+
+    suffix = f" ({', '.join(params)})" if params else ""
+    em = soup.new_tag("em")
+    em.string = f"[Confluence dynamic content: {macro_name or 'unnamed'}{suffix}]"
+    p = soup.new_tag("p")
+    p.append(em)
+    macro.replace_with(p)

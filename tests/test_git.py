@@ -7,11 +7,56 @@ from pathlib import Path
 from unittest.mock import patch
 
 from confluence_export.git import (
+    _chunked_paths,
     commit_export,
     commit_local_changes,
     ensure_repo,
     git_available,
 )
+
+
+class TestChunkedPaths:
+    def test_empty_input_yields_nothing(self):
+        assert list(_chunked_paths([])) == []
+
+    def test_single_small_path_one_batch(self):
+        batches = list(_chunked_paths(["a.md"]))
+        assert batches == [["a.md"]]
+
+    def test_all_paths_fit_in_one_batch(self):
+        paths = [f"page-{i}.md" for i in range(50)]
+        batches = list(_chunked_paths(paths, max_bytes=10_000))
+        assert batches == [paths]
+
+    def test_splits_when_total_exceeds_budget(self):
+        # Each path is ~50 bytes; 100 paths = 5000 bytes; budget 1500 → 4 batches
+        paths = [f"some/deeply/nested/path/page-{i:03d}.md" for i in range(100)]
+        batches = list(_chunked_paths(paths, max_bytes=1500))
+        assert len(batches) >= 3
+        # Round-trip: every path appears exactly once, in original order
+        assert [p for batch in batches for p in batch] == paths
+        # No batch exceeds the budget (each path counted with +1 overhead)
+        for batch in batches:
+            assert sum(len(p.encode("utf-8")) + 1 for p in batch) <= 1500
+
+    def test_oversized_single_path_still_yielded(self):
+        """A path larger than the budget cannot be split — yield it alone."""
+        huge = "x" * 5000
+        normal = "small.md"
+        batches = list(_chunked_paths([huge, normal], max_bytes=1000))
+        # Huge path gets its own batch even though it busts the budget;
+        # alternative would be silently dropping it. Better to let git fail loudly.
+        assert batches[0] == [huge]
+        assert normal in batches[-1]
+
+    def test_unicode_byte_length_respected(self):
+        """Multi-byte UTF-8 chars count by encoded byte length, not codepoint count."""
+        # Each "ä" is 2 bytes in UTF-8. 50 chars × 2 + ".md" = 103 bytes per path.
+        paths = [("ä" * 50) + f"-{i}.md" for i in range(20)]
+        batches = list(_chunked_paths(paths, max_bytes=300))
+        # 300 / ~108 → ~2 paths per batch → ~10 batches
+        assert len(batches) >= 5
+        assert [p for batch in batches for p in batch] == paths
 
 
 class TestGitAvailable:
@@ -256,6 +301,79 @@ class TestCommitExport:
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True)
         assert ".workspace/prep.py" in ls.stdout
         assert "Page.md" in ls.stdout
+
+    def test_aborts_when_batch_add_fails(self, tmp_path):
+        """If a chunked git add batch fails, commit_export returns False without committing.
+
+        Mixing a non-existent path in causes git add to fail with pathspec error,
+        which exercises the per-batch early-return guard added with chunking.
+        """
+        self._init_repo(tmp_path)
+        good = tmp_path / "page.md"
+        good.write_text("# Page")
+        bad = tmp_path / "does-not-exist.md"
+
+        # Capture HEAD before the failed export to confirm no new commit follows
+        before = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True
+        ).stdout.strip()
+
+        assert commit_export(tmp_path, [good, bad], "TEST") is False
+
+        after = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True
+        ).stdout.strip()
+        assert before == after  # HEAD unchanged — no commit was made
+
+    def test_commits_many_paths_without_argv_overflow(self, tmp_path):
+        """Real-world large-space scenario: thousands of paths in one export.
+
+        Without chunking this raises OSError(7) "Argument list too long" on
+        macOS where ARG_MAX is 1 MiB. We synthesize a path list whose joined
+        argv comfortably exceeds that limit (~3 MiB) so the chunker is the
+        only thing standing between us and the bug.
+        """
+        self._init_repo(tmp_path)
+        # 5000 files with ~100-char names → ~500 KB of paths alone, well past
+        # the per-batch budget but still within disk reason for a unit test.
+        files = []
+        for i in range(5000):
+            sub = tmp_path / f"section-{i // 100:03d}"
+            sub.mkdir(exist_ok=True)
+            f = sub / f"page-with-a-reasonably-long-name-{i:05d}.md"
+            f.write_text(f"# Page {i}")
+            files.append(f)
+
+        assert commit_export(tmp_path, files, "BIG") is True
+
+        ls = subprocess.run(
+            ["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True
+        )
+        # All 5000 should be tracked
+        assert ls.stdout.count("\n") == 5000
+
+    def test_removes_many_stale_files_without_argv_overflow(self, tmp_path):
+        """Same chunking guard for `git rm` when thousands of pages get deleted upstream."""
+        self._init_repo(tmp_path)
+        # Create + commit 3000 files
+        old_files = []
+        for i in range(3000):
+            f = tmp_path / f"deeply-nested-path-{i:05d}-with-some-extra-bytes.md"
+            f.write_text(f"# Page {i}")
+            old_files.append(f)
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        # Re-export with only ONE file kept — the other 2999 are stale
+        survivor = old_files[0]
+        survivor.write_text("# Page 0 v2")
+        assert commit_export(tmp_path, [survivor], "TEST") is True
+
+        ls = subprocess.run(
+            ["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True
+        )
+        # Only the survivor should remain
+        assert ls.stdout.strip() == survivor.name
 
     def test_removes_stale_file_with_non_ascii_path(self, tmp_path):
         """Paths with non-ASCII characters (umlauts etc.) are handled correctly."""

@@ -5,8 +5,32 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Conservative per-call argv budget for git add / git rm path lists. macOS
+# ARG_MAX is 1 MiB (and includes the environment block), so 100 KiB leaves
+# ~90% headroom for env vars, argv pointers, and the "git add --" prefix.
+# Batches above this size risk OSError(7) "Argument list too long" on macOS.
+_MAX_ARGV_BYTES = 100_000
+
+
+def _chunked_paths(paths: list[str], max_bytes: int = _MAX_ARGV_BYTES) -> Iterator[list[str]]:
+    """Yield batches of paths whose joined byte length stays under max_bytes."""
+    batch: list[str] = []
+    batch_bytes = 0
+    for p in paths:
+        # +1 accounts for the per-argv overhead (separator/pointer alignment)
+        size = len(p.encode("utf-8")) + 1
+        if batch and batch_bytes + size > max_bytes:
+            yield batch
+            batch = []
+            batch_bytes = 0
+        batch.append(p)
+        batch_bytes += size
+    if batch:
+        yield batch
 
 
 def git_available() -> bool:
@@ -86,10 +110,13 @@ def commit_export(output_dir: Path, written_files: list[Path], space_key: str) -
     are not in written_files (handles upstream deletions, renames, and moves).
     Returns True if a commit was made.
     """
-    # Stage only the files the exporter wrote
+    # Stage only the files the exporter wrote. Chunk to avoid hitting the
+    # OS argv limit on big spaces (thousands of paths joined into one exec
+    # call exceeds macOS ARG_MAX).
     paths = [str(f) for f in written_files]
-    if _run_git(output_dir, "add", "--", *paths) is None:
-        return False
+    for batch in _chunked_paths(paths):
+        if _run_git(output_dir, "add", "--", *batch) is None:
+            return False
 
     # Remove stale tracked files (deletions/renames/moves upstream)
     _remove_stale_files(output_dir, written_files)
@@ -125,4 +152,7 @@ def _remove_stale_files(output_dir: Path, written_files: list[Path]) -> None:
             stale.append(rel_path)
 
     if stale:
-        _run_git(output_dir, "rm", "--quiet", "--", *stale)
+        # Same chunking rationale as commit_export: a large stale list can
+        # exceed argv limits when passed to a single git rm call.
+        for batch in _chunked_paths(stale):
+            _run_git(output_dir, "rm", "--quiet", "--", *batch)
