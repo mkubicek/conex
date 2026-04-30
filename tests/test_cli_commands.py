@@ -246,6 +246,27 @@ class TestExportCommand:
 
         assert not (Path(out) / ".git").exists()
 
+    def test_no_author_lookup_flag_propagates_to_exporter(self, tmp_path):
+        client = _mock_client()
+        cache = MagicMock()
+        cache.refresh.return_value = _cached_space()
+        out = str(tmp_path / "out")
+        argv = [
+            "confluence-export", "export", "TEST",
+            "-o", out, "--no-media", "--no-git", "--no-author-lookup",
+        ]
+        with patch("sys.argv", argv), \
+             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache), \
+             patch("confluence_export.cli.Exporter") as exporter_cls:
+            exporter_cls.return_value.export_space.return_value = MagicMock(
+                count=0, written_files=[]
+            )
+            main()
+
+        assert exporter_cls.call_args.kwargs["skip_author_lookup"] is True
+
 
 class TestRefreshCommand:
     def test_refreshes_and_reports(self, capsys):

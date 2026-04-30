@@ -187,6 +187,11 @@ def main() -> None:
     export_p.add_argument("--include-html", action="store_true", help="Save raw HTML alongside markdown")
     export_p.add_argument("--include-archived", action="store_true", help="Include archived pages (skipped by default)")
     export_p.add_argument("--no-git", action="store_true", help="Skip automatic git versioning")
+    export_p.add_argument(
+        "--no-author-lookup",
+        action="store_true",
+        help="Skip Confluence user lookups (for tokens without read:user:confluence)",
+    )
 
     # diff
     diff_p = sub.add_parser("diff", help="Compare export dir against current Confluence state")
@@ -261,6 +266,7 @@ def main() -> None:
                 debug=args.include_html,
                 include_archived=args.include_archived,
                 no_git=args.no_git,
+                no_author_lookup=args.no_author_lookup,
             )
         case "diff":
             _cmd_diff(
@@ -321,6 +327,15 @@ def _cmd_configure() -> None:
     cfg = Config(base_url=base_url.rstrip("/"), email=email, api_token=token)
     path = save_config(cfg)
     print(f"\nConfiguration saved to {path}")
+    print(
+        "\nIf this is a scoped API token, grant these five read scopes:\n"
+        "  read:space:confluence\n"
+        "  read:page:confluence\n"
+        "  read:folder:confluence\n"
+        "  read:attachment:confluence\n"
+        "  read:user:confluence  (omit and pass --no-author-lookup to skip)\n"
+        "Basic Auth and unscoped tokens already have full access."
+    )
 
 
 def _cmd_spaces(client: ConfluenceClient) -> None:
@@ -384,6 +399,7 @@ def _cmd_export(
     debug: bool = False,
     include_archived: bool = False,
     no_git: bool = False,
+    no_author_lookup: bool = False,
 ) -> None:
     """Export page tree as LLM-ready markdown."""
     space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
@@ -417,6 +433,7 @@ def _cmd_export(
         download_media=not no_media,
         render_drawio=not no_drawio_render,
         debug=debug,
+        skip_author_lookup=no_author_lookup,
     )
 
     result = exporter.export_space(
