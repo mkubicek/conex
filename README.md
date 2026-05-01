@@ -86,6 +86,8 @@ read:user:confluence
 
 For classic OAuth 2.0 (3LO) tokens, the equivalent set is `read:confluence-space.summary`, `read:confluence-content.all`, `readonly:content.attachment:confluence`, and `read:confluence-user`.
 
+Scoped tokens must be addressed via the OAuth gateway URL (`https://api.atlassian.com/ex/confluence/{cloudId}/...`) rather than the site URL. The tool detects this automatically: on first use, it looks up your site's cloud ID from the unauthenticated `/_edge/tenant_info` endpoint, rewrites `base_url` in the saved config, and routes all subsequent requests through the gateway. No manual configuration needed — keep `base_url` set to your site URL.
+
 ## Commands
 
 ```bash

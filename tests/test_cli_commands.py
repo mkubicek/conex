@@ -7,9 +7,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from confluence_export.cli import main, _resolve_space
+from confluence_export.cli import main, _maybe_route_via_gateway, _resolve_space
 from confluence_export.config import Config
 from confluence_export.types import CachedSpace, Page, Space, Version
+
+SCOPED_TOKEN = "ATATT3xFfGF0_dummy_payload_TgVilzYuG3Sh8MtCp_8=ADA80198"
+LEGACY_TOKEN = "ATATT3xFfGF0_dummy_no_scope_marker_here"
 
 
 def _space(key="TEST", name="Test Space"):
@@ -349,6 +352,86 @@ class TestNeedsToken:
              patch("confluence_export.cli._apply_browser_credentials") as mock_apply:
             main()
         mock_apply.assert_called_once()
+
+
+class TestMaybeRouteViaGateway:
+    """Auto-rewrite of site URL to OAuth gateway for scoped tokens."""
+
+    def test_scoped_token_on_site_url_rewrites_and_persists(self):
+        cfg = Config(
+            base_url="https://acme.atlassian.net",
+            email="a@b.com",
+            api_token=SCOPED_TOKEN,
+        )
+        with patch(
+            "confluence_export.cli._resolve_cloud_id", return_value="cloud-uuid-123"
+        ), patch("confluence_export.cli.save_config") as mock_save:
+            result = _maybe_route_via_gateway(cfg)
+
+        assert result.base_url == "https://api.atlassian.com/ex/confluence/cloud-uuid-123"
+        mock_save.assert_called_once_with(cfg)
+
+    def test_legacy_token_left_alone(self):
+        cfg = Config(
+            base_url="https://acme.atlassian.net",
+            email="a@b.com",
+            api_token=LEGACY_TOKEN,
+        )
+        with patch("confluence_export.cli._resolve_cloud_id") as mock_resolve, \
+             patch("confluence_export.cli.save_config") as mock_save:
+            result = _maybe_route_via_gateway(cfg)
+
+        # No network call, no rewrite, no save
+        mock_resolve.assert_not_called()
+        mock_save.assert_not_called()
+        assert result.base_url == "https://acme.atlassian.net"
+
+    def test_already_gateway_url_left_alone(self):
+        # If base_url is already the gateway, nothing to do.
+        cfg = Config(
+            base_url="https://api.atlassian.com/ex/confluence/cloud-uuid",
+            email="a@b.com",
+            api_token=SCOPED_TOKEN,
+        )
+        with patch("confluence_export.cli._resolve_cloud_id") as mock_resolve, \
+             patch("confluence_export.cli.save_config") as mock_save:
+            result = _maybe_route_via_gateway(cfg)
+
+        mock_resolve.assert_not_called()
+        mock_save.assert_not_called()
+        assert result.base_url == cfg.base_url
+
+    def test_cloud_id_lookup_failure_leaves_url_intact(self):
+        """If /_edge/tenant_info is unreachable, fall back to the original URL
+        so the caller sees the underlying 401 instead of a silent rewrite."""
+        cfg = Config(
+            base_url="https://acme.atlassian.net",
+            email="a@b.com",
+            api_token=SCOPED_TOKEN,
+        )
+        with patch(
+            "confluence_export.cli._resolve_cloud_id", return_value=None
+        ), patch("confluence_export.cli.save_config") as mock_save:
+            result = _maybe_route_via_gateway(cfg)
+
+        mock_save.assert_not_called()
+        assert result.base_url == "https://acme.atlassian.net"
+
+    def test_persist_failure_does_not_break_run(self, tmp_path):
+        """A read-only filesystem must not stop the rewrite from applying."""
+        cfg = Config(
+            base_url="https://acme.atlassian.net",
+            email="a@b.com",
+            api_token=SCOPED_TOKEN,
+        )
+        with patch(
+            "confluence_export.cli._resolve_cloud_id", return_value="cloud-uuid"
+        ), patch(
+            "confluence_export.cli.save_config", side_effect=OSError("read-only fs")
+        ):
+            result = _maybe_route_via_gateway(cfg)
+
+        assert result.base_url.startswith("https://api.atlassian.com/")
 
 
 class TestConfigError:

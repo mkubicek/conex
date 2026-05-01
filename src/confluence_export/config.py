@@ -4,11 +4,40 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 CONFIG_DIR_NAME = "confluence-export"
 CONFIG_FILE = "config.json"
+
+GATEWAY_HOST = "api.atlassian.com"
+_SITE_HOST_RE = re.compile(r"^[a-z0-9][a-z0-9-]*\.atlassian\.net$", re.IGNORECASE)
+
+
+def is_scoped_token(token: str) -> bool:
+    """True if token looks like an Atlassian scoped API token (ATATT…=ADA…).
+
+    Scoped tokens require requests to be routed through the OAuth gateway URL
+    `https://api.atlassian.com/ex/confluence/{cloudId}/...` rather than the
+    Confluence site URL. The `=ADA<hex>` suffix encodes the scope set; tokens
+    without it are full-access (legacy) tokens that work with the site URL.
+    """
+    return bool(token) and token.startswith("ATATT") and "=ADA" in token
+
+
+def is_atlassian_site_url(url: str) -> bool:
+    """True if url points at a `*.atlassian.net` site (not the OAuth gateway)."""
+    if not url:
+        return False
+    host = urlparse(url).hostname or ""
+    return bool(_SITE_HOST_RE.match(host))
+
+
+def gateway_url(cloud_id: str) -> str:
+    """Build the OAuth gateway base URL for a Confluence cloud ID."""
+    return f"https://{GATEWAY_HOST}/ex/confluence/{cloud_id}"
 
 
 def _config_dir() -> Path:

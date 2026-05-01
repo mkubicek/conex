@@ -12,7 +12,15 @@ import requests
 
 from confluence_export.cache import CacheStore
 from confluence_export.client import AuthenticationError, ConfluenceClient
-from confluence_export.config import Config, config_path, load_config, save_config
+from confluence_export.config import (
+    Config,
+    config_path,
+    gateway_url,
+    is_atlassian_site_url,
+    is_scoped_token,
+    load_config,
+    save_config,
+)
 from confluence_export.diff import compute_diff, format_diff, scan_export_dir
 from confluence_export.tree import (
     build_tree,
@@ -106,6 +114,58 @@ def _apply_browser_credentials(client: ConfluenceClient, base_url: str, reason: 
         print(f"Authentication failed (HTTP {status}).", file=sys.stderr)
         sys.exit(1)
     print("Authenticated.", file=sys.stderr, flush=True)
+
+
+def _resolve_cloud_id(site_url: str) -> str | None:
+    """Look up the Confluence cloud ID for a site URL via /_edge/tenant_info.
+
+    The endpoint is unauthenticated and returns `{"cloudId": "<uuid>"}`.
+    Returns None on any failure so callers can fall back to the site URL.
+    """
+    try:
+        resp = requests.get(
+            site_url.rstrip("/") + "/_edge/tenant_info",
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        cloud_id = resp.json().get("cloudId")
+        return cloud_id if isinstance(cloud_id, str) and cloud_id else None
+    except (requests.exceptions.RequestException, ValueError):
+        return None
+
+
+def _maybe_route_via_gateway(config: Config) -> Config:
+    """Rewrite a site-URL `base_url` to the OAuth gateway when the token is scoped.
+
+    Atlassian scoped API tokens (ATATT…=ADA…) are rejected with 401 against
+    the site URL — they must go through `api.atlassian.com/ex/confluence/{cloudId}`.
+    This is invisible to users: we detect a site URL paired with a scoped token,
+    resolve the cloudId, rewrite the config, and persist so the round-trip
+    happens at most once per token rotation.
+    """
+    if not (is_atlassian_site_url(config.base_url) and is_scoped_token(config.api_token)):
+        return config
+
+    cloud_id = _resolve_cloud_id(config.base_url)
+    if not cloud_id:
+        # Cloud ID lookup failed — leave config alone and let the request fail
+        # with the underlying 401 so the user sees the real error.
+        return config
+
+    new_url = gateway_url(cloud_id)
+    print(
+        f"Routing scoped token through OAuth gateway: {new_url}",
+        file=sys.stderr,
+    )
+    config.base_url = new_url
+    try:
+        save_config(config)
+    except OSError:
+        # If we can't persist (e.g. read-only filesystem in CI), the rewrite
+        # still applies for this run — next run will redo the lookup.
+        pass
+    return config
 
 
 def _is_auth_error(exc: Exception) -> int | None:
@@ -226,6 +286,8 @@ def main() -> None:
         print(f"\nRun 'confluence-export configure' to set up credentials.", file=sys.stderr)
         sys.exit(1)
 
+    config = _maybe_route_via_gateway(config)
+
     client = ConfluenceClient(config, verbose=args.verbose)
 
     if args.cookie:
@@ -327,6 +389,10 @@ def _cmd_configure() -> None:
     cfg = Config(base_url=base_url.rstrip("/"), email=email, api_token=token)
     path = save_config(cfg)
     print(f"\nConfiguration saved to {path}")
+    # Scoped tokens must be routed through the OAuth gateway. Resolve the
+    # cloudId now so the user sees the rewrite (and the eventual saved URL)
+    # before they hit the first command.
+    _maybe_route_via_gateway(cfg)
     print(
         "\nIf this is a scoped API token, grant these five read scopes:\n"
         "  read:space:confluence\n"

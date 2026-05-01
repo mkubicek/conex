@@ -94,9 +94,22 @@ def download_attachments(
 
     def _download_one(item: tuple[Attachment, Path]) -> Path:
         att, dest = item
-        download_path = att.download_link
-        if not download_path.startswith("/wiki"):
-            download_path = f"/wiki{download_path}"
+        # Prefer the v1 REST attachment-download endpoint over the legacy
+        # `_links.download` path (`/wiki/download/attachments/...`). The REST
+        # endpoint works on both the site URL and the OAuth gateway URL used
+        # for scoped API tokens, whereas the legacy download path 401s through
+        # the gateway. Fall back to the legacy path only when the cached
+        # attachment has no page_id (very old caches written before this field
+        # existed).
+        if att.page_id and att.id:
+            download_path = (
+                f"/wiki/rest/api/content/{att.page_id}"
+                f"/child/attachment/{att.id}/download"
+            )
+        else:
+            download_path = att.download_link
+            if not download_path.startswith("/wiki"):
+                download_path = f"/wiki{download_path}"
         client.download_attachment_to_file(download_path, str(dest))
         return dest
 
