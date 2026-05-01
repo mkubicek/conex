@@ -46,6 +46,7 @@ class Exporter:
         download_media: bool = True,
         render_drawio: bool = True,
         debug: bool = False,
+        skip_author_lookup: bool = False,
     ):
         self.client = client
         self.cache = cache
@@ -53,10 +54,13 @@ class Exporter:
         self.download_media = download_media
         self.render_drawio = render_drawio
         self.debug = debug
+        self.skip_author_lookup = skip_author_lookup
         self._user_cache: dict[str, dict | None] = {}
 
     def _resolve_user(self, account_id: str) -> dict | None:
         """Resolve user account ID to user info dict, with caching."""
+        if self.skip_author_lookup:
+            return None
         if account_id not in self._user_cache:
             self._user_cache[account_id] = self.client.get_user_info(account_id)
         return self._user_cache[account_id]

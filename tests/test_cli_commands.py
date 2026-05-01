@@ -7,9 +7,19 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from confluence_export.cli import main, _resolve_space
+import requests
+
+from confluence_export.cli import (
+    _maybe_route_via_gateway,
+    _resolve_cloud_id,
+    _resolve_space,
+    main,
+)
 from confluence_export.config import Config
 from confluence_export.types import CachedSpace, Page, Space, Version
+
+SCOPED_TOKEN = "ATATT3xFfGF0_dummy_payload_TgVilzYuG3Sh8MtCp_8=ADA80198"
+LEGACY_TOKEN = "ATATT3xFfGF0_dummy_no_scope_marker_here"
 
 
 def _space(key="TEST", name="Test Space"):
@@ -246,6 +256,27 @@ class TestExportCommand:
 
         assert not (Path(out) / ".git").exists()
 
+    def test_no_author_lookup_flag_propagates_to_exporter(self, tmp_path):
+        client = _mock_client()
+        cache = MagicMock()
+        cache.refresh.return_value = _cached_space()
+        out = str(tmp_path / "out")
+        argv = [
+            "confluence-export", "export", "TEST",
+            "-o", out, "--no-media", "--no-git", "--no-author-lookup",
+        ]
+        with patch("sys.argv", argv), \
+             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache), \
+             patch("confluence_export.cli.Exporter") as exporter_cls:
+            exporter_cls.return_value.export_space.return_value = MagicMock(
+                count=0, written_files=[]
+            )
+            main()
+
+        assert exporter_cls.call_args.kwargs["skip_author_lookup"] is True
+
 
 class TestRefreshCommand:
     def test_refreshes_and_reports(self, capsys):
@@ -328,6 +359,144 @@ class TestNeedsToken:
              patch("confluence_export.cli._apply_browser_credentials") as mock_apply:
             main()
         mock_apply.assert_called_once()
+
+
+class TestResolveCloudId:
+    """Cloud-ID lookup against the unauthenticated /_edge/tenant_info endpoint."""
+
+    def _mock_response(self, *, status=200, body=None, raise_json=False):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        if status >= 400:
+            resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+                f"HTTP {status}"
+            )
+        if raise_json:
+            resp.json.side_effect = ValueError("bad json")
+        else:
+            resp.json.return_value = body or {}
+        return resp
+
+    def test_happy_path_returns_cloud_id(self):
+        resp = self._mock_response(body={"cloudId": "abc-123"})
+        with patch("confluence_export.cli.requests.get", return_value=resp) as mock_get:
+            assert _resolve_cloud_id("https://acme.atlassian.net/") == "abc-123"
+        # Trailing slash stripped, /_edge/tenant_info appended.
+        called_url = mock_get.call_args[0][0]
+        assert called_url == "https://acme.atlassian.net/_edge/tenant_info"
+
+    def test_network_error_returns_none(self):
+        with patch(
+            "confluence_export.cli.requests.get",
+            side_effect=requests.exceptions.ConnectionError("dns"),
+        ):
+            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+
+    def test_http_error_returns_none(self):
+        resp = self._mock_response(status=503)
+        with patch("confluence_export.cli.requests.get", return_value=resp):
+            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+
+    def test_bad_json_returns_none(self):
+        resp = self._mock_response(raise_json=True)
+        with patch("confluence_export.cli.requests.get", return_value=resp):
+            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+
+    def test_missing_cloud_id_field_returns_none(self):
+        resp = self._mock_response(body={"someOther": "value"})
+        with patch("confluence_export.cli.requests.get", return_value=resp):
+            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+
+    def test_non_string_cloud_id_returns_none(self):
+        # Defensive: API contract says string, but guard against future drift.
+        resp = self._mock_response(body={"cloudId": 12345})
+        with patch("confluence_export.cli.requests.get", return_value=resp):
+            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+
+    def test_empty_cloud_id_returns_none(self):
+        resp = self._mock_response(body={"cloudId": ""})
+        with patch("confluence_export.cli.requests.get", return_value=resp):
+            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+
+
+class TestMaybeRouteViaGateway:
+    """Auto-rewrite of site URL to OAuth gateway for scoped tokens."""
+
+    def test_scoped_token_on_site_url_rewrites_and_persists(self):
+        cfg = Config(
+            base_url="https://acme.atlassian.net",
+            email="a@b.com",
+            api_token=SCOPED_TOKEN,
+        )
+        with patch(
+            "confluence_export.cli._resolve_cloud_id", return_value="cloud-uuid-123"
+        ), patch("confluence_export.cli.save_config") as mock_save:
+            result = _maybe_route_via_gateway(cfg)
+
+        assert result.base_url == "https://api.atlassian.com/ex/confluence/cloud-uuid-123"
+        mock_save.assert_called_once_with(cfg)
+
+    def test_legacy_token_left_alone(self):
+        cfg = Config(
+            base_url="https://acme.atlassian.net",
+            email="a@b.com",
+            api_token=LEGACY_TOKEN,
+        )
+        with patch("confluence_export.cli._resolve_cloud_id") as mock_resolve, \
+             patch("confluence_export.cli.save_config") as mock_save:
+            result = _maybe_route_via_gateway(cfg)
+
+        # No network call, no rewrite, no save
+        mock_resolve.assert_not_called()
+        mock_save.assert_not_called()
+        assert result.base_url == "https://acme.atlassian.net"
+
+    def test_already_gateway_url_left_alone(self):
+        # If base_url is already the gateway, nothing to do.
+        cfg = Config(
+            base_url="https://api.atlassian.com/ex/confluence/cloud-uuid",
+            email="a@b.com",
+            api_token=SCOPED_TOKEN,
+        )
+        with patch("confluence_export.cli._resolve_cloud_id") as mock_resolve, \
+             patch("confluence_export.cli.save_config") as mock_save:
+            result = _maybe_route_via_gateway(cfg)
+
+        mock_resolve.assert_not_called()
+        mock_save.assert_not_called()
+        assert result.base_url == cfg.base_url
+
+    def test_cloud_id_lookup_failure_leaves_url_intact(self):
+        """If /_edge/tenant_info is unreachable, fall back to the original URL
+        so the caller sees the underlying 401 instead of a silent rewrite."""
+        cfg = Config(
+            base_url="https://acme.atlassian.net",
+            email="a@b.com",
+            api_token=SCOPED_TOKEN,
+        )
+        with patch(
+            "confluence_export.cli._resolve_cloud_id", return_value=None
+        ), patch("confluence_export.cli.save_config") as mock_save:
+            result = _maybe_route_via_gateway(cfg)
+
+        mock_save.assert_not_called()
+        assert result.base_url == "https://acme.atlassian.net"
+
+    def test_persist_failure_does_not_break_run(self, tmp_path):
+        """A read-only filesystem must not stop the rewrite from applying."""
+        cfg = Config(
+            base_url="https://acme.atlassian.net",
+            email="a@b.com",
+            api_token=SCOPED_TOKEN,
+        )
+        with patch(
+            "confluence_export.cli._resolve_cloud_id", return_value="cloud-uuid"
+        ), patch(
+            "confluence_export.cli.save_config", side_effect=OSError("read-only fs")
+        ):
+            result = _maybe_route_via_gateway(cfg)
+
+        assert result.base_url.startswith("https://api.atlassian.com/")
 
 
 class TestConfigError:

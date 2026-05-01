@@ -70,6 +70,24 @@ confluence-export --base-url https://example.atlassian.net --cookie 'tenant.sess
 
 If no token or cookie is provided, the tool will prompt interactively. Browser credentials are used for the current run only and never saved.
 
+## Required permissions
+
+Basic Auth (email + API token) and unscoped Personal Access Tokens use the underlying user's full permissions — no further setup needed. If you provision a [scoped API token](https://developer.atlassian.com/cloud/confluence/scopes-for-oauth-2-3LO-and-forge-apps/) or use OAuth 2.0 / Forge, grant these five granular read scopes:
+
+```
+read:space:confluence
+read:page:confluence
+read:folder:confluence
+read:attachment:confluence
+read:user:confluence
+```
+
+`read:user:confluence` is only needed to render `@mentions` and `profile` macros with display names instead of opaque Atlassian account IDs in the exported markdown. If your token can't grant it, pass `--no-author-lookup` to skip user resolution; mentions fall back to the raw account ID. The other four scopes are required.
+
+For classic OAuth 2.0 (3LO) tokens, the equivalent set is `read:confluence-space.summary`, `read:confluence-content.all`, `readonly:content.attachment:confluence`, and `read:confluence-user`.
+
+Scoped tokens must be addressed via the OAuth gateway URL (`https://api.atlassian.com/ex/confluence/{cloudId}/...`) rather than the site URL. The tool detects this automatically: on first use, it looks up your site's cloud ID from the unauthenticated `/_edge/tenant_info` endpoint, rewrites `base_url` in the saved config, and routes all subsequent requests through the gateway. No manual configuration needed — keep `base_url` set to your site URL.
+
 ## Commands
 
 ```bash
@@ -80,6 +98,7 @@ confluence-export export SPACEKEY -o ./output       # export full space
 confluence-export export SPACEKEY --path /Sub/Tree  # export a subtree
 confluence-export export SPACEKEY --no-media        # skip attachments
 confluence-export export SPACEKEY --no-git          # skip git versioning
+confluence-export export SPACEKEY --no-author-lookup # skip Confluence user lookup
 confluence-export diff SPACEKEY ./output            # compare export vs. live
 confluence-export refresh SPACEKEY                  # force-refresh cache
 ```

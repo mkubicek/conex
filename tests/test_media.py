@@ -15,9 +15,16 @@ from confluence_export.media import (
 from confluence_export.types import Attachment, Version
 
 
-def _att(title="img.png", version=1, file_size=100, download_link="/wiki/download/a1"):
+def _att(
+    title="img.png",
+    version=1,
+    file_size=100,
+    download_link="/wiki/download/a1",
+    page_id="p1",
+    att_id="att1",
+):
     return Attachment(
-        id="a1", title=title, file_size=file_size,
+        id=att_id, title=title, file_size=file_size, page_id=page_id,
         download_link=download_link, version=Version(number=version),
     )
 
@@ -125,16 +132,37 @@ class TestDownloadAttachments:
         assert len(_attachment_paths(result)) == 0
         assert "failed to download" in capsys.readouterr().err
 
-    def test_prepends_wiki_prefix(self, tmp_path):
+    def test_uses_v1_content_attachment_endpoint(self, tmp_path):
+        """The download path is built from page_id + att_id, ignoring the
+        legacy `_links.download` URL — the v1 REST endpoint works on both
+        the site URL and the OAuth gateway URL used for scoped tokens.
+        """
         media_dir = tmp_path / ".media"
         media_dir.mkdir()
 
-        att = _att(download_link="/rest/api/content/a1/download")
+        att = _att(page_id="2172649563", att_id="att2173468762")
         client = MagicMock()
 
         download_attachments(client, [att], media_dir)
-        call_args = client.download_attachment_to_file.call_args[0]
-        assert call_args[0].startswith("/wiki")
+        path = client.download_attachment_to_file.call_args[0][0]
+        assert path == "/wiki/rest/api/content/2172649563/child/attachment/att2173468762/download"
+
+    def test_falls_back_to_download_link_for_legacy_cache(self, tmp_path):
+        """Cached attachments written before page_id was tracked still work
+        via the legacy `_links.download` path."""
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+
+        att = _att(
+            page_id="",
+            att_id="",
+            download_link="/download/attachments/123/img.png?version=1",
+        )
+        client = MagicMock()
+
+        download_attachments(client, [att], media_dir)
+        path = client.download_attachment_to_file.call_args[0][0]
+        assert path.startswith("/wiki/download/attachments/")
 
 
 class TestMigrateMediaDirs:

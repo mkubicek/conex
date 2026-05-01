@@ -253,6 +253,13 @@ class TestUserResolution:
         assert exporter._resolve_user("u1") == {"displayName": "Alice"}
         client.get_user_info.assert_called_once_with("u1")  # only 1 API call
 
+    def test_skip_author_lookup_returns_none_without_api_call(self):
+        exporter, client, _ = _make_exporter(skip_author_lookup=True)
+
+        assert exporter._resolve_user("u1") is None
+        assert exporter._resolve_user("u2") is None
+        client.get_user_info.assert_not_called()
+
 
 class TestWorkspaceDirectory:
     def test_workspace_created_for_each_page(self, tmp_path):

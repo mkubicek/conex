@@ -9,7 +9,14 @@ from unittest.mock import patch
 
 import pytest
 
-from confluence_export.config import Config, load_config, save_config
+from confluence_export.config import (
+    Config,
+    gateway_url,
+    is_atlassian_site_url,
+    is_scoped_token,
+    load_config,
+    save_config,
+)
 
 
 class TestConfig:
@@ -97,6 +104,45 @@ class TestLoadConfig:
 
         with pytest.raises(ValueError, match="base_url"):
             load_config()
+
+
+class TestIsScopedToken:
+    def test_scoped_token_detected(self):
+        # Real-world scoped token shape: ATATT3 + ... + =ADA<hex>
+        token = "ATATT3xFfGF0_dummy_payload_TgVilzYuG3Sh8MtCp_8=ADA80198"
+        assert is_scoped_token(token) is True
+
+    def test_legacy_atatt_without_ada_suffix(self):
+        # Old-style ATATT tokens (full-access) lack the =ADA scope marker
+        assert is_scoped_token("ATATT3xFfGF0_dummy_no_scope_marker_here") is False
+
+    def test_non_atatt_token(self):
+        # Server PATs (Bearer-style) don't start with ATATT
+        assert is_scoped_token("NDgyNDk2OTk2NzY3OmDsiR4mCSIaSjMqOg") is False
+
+    def test_empty_token(self):
+        assert is_scoped_token("") is False
+
+
+class TestIsAtlassianSiteUrl:
+    def test_site_url(self):
+        assert is_atlassian_site_url("https://acme.atlassian.net") is True
+        assert is_atlassian_site_url("https://acme.atlassian.net/") is True
+
+    def test_gateway_url(self):
+        assert is_atlassian_site_url("https://api.atlassian.com/ex/confluence/abc") is False
+
+    def test_self_hosted(self):
+        assert is_atlassian_site_url("https://wiki.example.com") is False
+
+    def test_empty(self):
+        assert is_atlassian_site_url("") is False
+
+
+class TestGatewayUrl:
+    def test_format(self):
+        cid = "6298609d-df12-4367-a2f6-2ead80671779"
+        assert gateway_url(cid) == f"https://api.atlassian.com/ex/confluence/{cid}"
 
 
 class TestSaveConfig:

@@ -12,7 +12,15 @@ import requests
 
 from confluence_export.cache import CacheStore
 from confluence_export.client import AuthenticationError, ConfluenceClient
-from confluence_export.config import Config, config_path, load_config, save_config
+from confluence_export.config import (
+    Config,
+    config_path,
+    gateway_url,
+    is_atlassian_site_url,
+    is_scoped_token,
+    load_config,
+    save_config,
+)
 from confluence_export.diff import compute_diff, format_diff, scan_export_dir
 from confluence_export.tree import (
     build_tree,
@@ -108,6 +116,58 @@ def _apply_browser_credentials(client: ConfluenceClient, base_url: str, reason: 
     print("Authenticated.", file=sys.stderr, flush=True)
 
 
+def _resolve_cloud_id(site_url: str) -> str | None:
+    """Look up the Confluence cloud ID for a site URL via /_edge/tenant_info.
+
+    The endpoint is unauthenticated and returns `{"cloudId": "<uuid>"}`.
+    Returns None on any failure so callers can fall back to the site URL.
+    """
+    try:
+        resp = requests.get(
+            site_url.rstrip("/") + "/_edge/tenant_info",
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        cloud_id = resp.json().get("cloudId")
+        return cloud_id if isinstance(cloud_id, str) and cloud_id else None
+    except (requests.exceptions.RequestException, ValueError):
+        return None
+
+
+def _maybe_route_via_gateway(config: Config) -> Config:
+    """Rewrite a site-URL `base_url` to the OAuth gateway when the token is scoped.
+
+    Atlassian scoped API tokens (ATATT…=ADA…) are rejected with 401 against
+    the site URL — they must go through `api.atlassian.com/ex/confluence/{cloudId}`.
+    This is invisible to users: we detect a site URL paired with a scoped token,
+    resolve the cloudId, rewrite the config, and persist so the round-trip
+    happens at most once per token rotation.
+    """
+    if not (is_atlassian_site_url(config.base_url) and is_scoped_token(config.api_token)):
+        return config
+
+    cloud_id = _resolve_cloud_id(config.base_url)
+    if not cloud_id:
+        # Cloud ID lookup failed — leave config alone and let the request fail
+        # with the underlying 401 so the user sees the real error.
+        return config
+
+    new_url = gateway_url(cloud_id)
+    print(
+        f"Routing scoped token through OAuth gateway: {new_url}",
+        file=sys.stderr,
+    )
+    config.base_url = new_url
+    try:
+        save_config(config)
+    except OSError:
+        # If we can't persist (e.g. read-only filesystem in CI), the rewrite
+        # still applies for this run — next run will redo the lookup.
+        pass
+    return config
+
+
 def _is_auth_error(exc: Exception) -> int | None:
     """Return the HTTP status code if exc looks like an auth failure, else None.
 
@@ -187,6 +247,11 @@ def main() -> None:
     export_p.add_argument("--include-html", action="store_true", help="Save raw HTML alongside markdown")
     export_p.add_argument("--include-archived", action="store_true", help="Include archived pages (skipped by default)")
     export_p.add_argument("--no-git", action="store_true", help="Skip automatic git versioning")
+    export_p.add_argument(
+        "--no-author-lookup",
+        action="store_true",
+        help="Skip Confluence user lookups (for tokens without read:user:confluence)",
+    )
 
     # diff
     diff_p = sub.add_parser("diff", help="Compare export dir against current Confluence state")
@@ -220,6 +285,8 @@ def main() -> None:
         print(f"Error: {exc}", file=sys.stderr)
         print(f"\nRun 'confluence-export configure' to set up credentials.", file=sys.stderr)
         sys.exit(1)
+
+    config = _maybe_route_via_gateway(config)
 
     client = ConfluenceClient(config, verbose=args.verbose)
 
@@ -261,6 +328,7 @@ def main() -> None:
                 debug=args.include_html,
                 include_archived=args.include_archived,
                 no_git=args.no_git,
+                no_author_lookup=args.no_author_lookup,
             )
         case "diff":
             _cmd_diff(
@@ -321,6 +389,19 @@ def _cmd_configure() -> None:
     cfg = Config(base_url=base_url.rstrip("/"), email=email, api_token=token)
     path = save_config(cfg)
     print(f"\nConfiguration saved to {path}")
+    # Scoped tokens must be routed through the OAuth gateway. Resolve the
+    # cloudId now so the user sees the rewrite (and the eventual saved URL)
+    # before they hit the first command.
+    _maybe_route_via_gateway(cfg)
+    print(
+        "\nIf this is a scoped API token, grant these five read scopes:\n"
+        "  read:space:confluence\n"
+        "  read:page:confluence\n"
+        "  read:folder:confluence\n"
+        "  read:attachment:confluence\n"
+        "  read:user:confluence  (omit and pass --no-author-lookup to skip)\n"
+        "Basic Auth and unscoped tokens already have full access."
+    )
 
 
 def _cmd_spaces(client: ConfluenceClient) -> None:
@@ -384,6 +465,7 @@ def _cmd_export(
     debug: bool = False,
     include_archived: bool = False,
     no_git: bool = False,
+    no_author_lookup: bool = False,
 ) -> None:
     """Export page tree as LLM-ready markdown."""
     space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
@@ -417,6 +499,7 @@ def _cmd_export(
         download_media=not no_media,
         render_drawio=not no_drawio_render,
         debug=debug,
+        skip_author_lookup=no_author_lookup,
     )
 
     result = exporter.export_space(
