@@ -7,7 +7,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from confluence_export.cli import main, _maybe_route_via_gateway, _resolve_space
+import requests
+
+from confluence_export.cli import (
+    _maybe_route_via_gateway,
+    _resolve_cloud_id,
+    _resolve_space,
+    main,
+)
 from confluence_export.config import Config
 from confluence_export.types import CachedSpace, Page, Space, Version
 
@@ -352,6 +359,64 @@ class TestNeedsToken:
              patch("confluence_export.cli._apply_browser_credentials") as mock_apply:
             main()
         mock_apply.assert_called_once()
+
+
+class TestResolveCloudId:
+    """Cloud-ID lookup against the unauthenticated /_edge/tenant_info endpoint."""
+
+    def _mock_response(self, *, status=200, body=None, raise_json=False):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        if status >= 400:
+            resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+                f"HTTP {status}"
+            )
+        if raise_json:
+            resp.json.side_effect = ValueError("bad json")
+        else:
+            resp.json.return_value = body or {}
+        return resp
+
+    def test_happy_path_returns_cloud_id(self):
+        resp = self._mock_response(body={"cloudId": "abc-123"})
+        with patch("confluence_export.cli.requests.get", return_value=resp) as mock_get:
+            assert _resolve_cloud_id("https://acme.atlassian.net/") == "abc-123"
+        # Trailing slash stripped, /_edge/tenant_info appended.
+        called_url = mock_get.call_args[0][0]
+        assert called_url == "https://acme.atlassian.net/_edge/tenant_info"
+
+    def test_network_error_returns_none(self):
+        with patch(
+            "confluence_export.cli.requests.get",
+            side_effect=requests.exceptions.ConnectionError("dns"),
+        ):
+            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+
+    def test_http_error_returns_none(self):
+        resp = self._mock_response(status=503)
+        with patch("confluence_export.cli.requests.get", return_value=resp):
+            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+
+    def test_bad_json_returns_none(self):
+        resp = self._mock_response(raise_json=True)
+        with patch("confluence_export.cli.requests.get", return_value=resp):
+            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+
+    def test_missing_cloud_id_field_returns_none(self):
+        resp = self._mock_response(body={"someOther": "value"})
+        with patch("confluence_export.cli.requests.get", return_value=resp):
+            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+
+    def test_non_string_cloud_id_returns_none(self):
+        # Defensive: API contract says string, but guard against future drift.
+        resp = self._mock_response(body={"cloudId": 12345})
+        with patch("confluence_export.cli.requests.get", return_value=resp):
+            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+
+    def test_empty_cloud_id_returns_none(self):
+        resp = self._mock_response(body={"cloudId": ""})
+        with patch("confluence_export.cli.requests.get", return_value=resp):
+            assert _resolve_cloud_id("https://acme.atlassian.net") is None
 
 
 class TestMaybeRouteViaGateway:
