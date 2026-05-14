@@ -42,10 +42,12 @@ class CacheStore:
         if p.exists():
             p.unlink()
 
-    def refresh(self, client: ConfluenceClient, space: Space) -> CachedSpace:
+    def refresh(
+        self, client: ConfluenceClient, space: Space, include_archived: bool = False
+    ) -> CachedSpace:
         """Fetch all pages + attachments from the API and cache them."""
         print(f"Fetching pages for space {space.key}...", file=sys.stderr)
-        pages = client.get_pages_in_space(space.id)
+        pages = client.get_pages_in_space(space.id, include_archived=include_archived)
         print(f"Found {len(pages)} pages.", file=sys.stderr)
 
         # Resolve folders: pages may reference parent IDs that are folders,
@@ -122,9 +124,11 @@ class CacheStore:
 
         return pages
 
-    def ensure_loaded(self, client: ConfluenceClient, space: Space) -> CachedSpace:
+    def ensure_loaded(
+        self, client: ConfluenceClient, space: Space, include_archived: bool = False
+    ) -> CachedSpace:
         """Load from cache, or refresh if not cached."""
         cs = self.load(space.key)
         if cs is not None:
             return cs
-        return self.refresh(client, space)
+        return self.refresh(client, space, include_archived=include_archived)

@@ -323,7 +323,19 @@ class TestCookieV1Mode:
         _, params = mock.call_args.args
         assert params["spaceKey"] == "ENG"
         assert params["type"] == "page"
+        assert params["status"] == "current"
         assert "body.storage" in params["expand"]
+
+    def test_get_pages_in_space_archived_issues_second_call(self):
+        client = _make_client()
+        client.set_cookies("session=abc")
+        client._space_key_by_id["100"] = "ENG"
+
+        with patch.object(client, "_paginate_offset", return_value=[]) as mock:
+            client.get_pages_in_space("100", include_archived=True)
+
+        statuses = [call.args[1]["status"] for call in mock.call_args_list]
+        assert statuses == ["current", "archived"]
 
     def test_get_space_by_key_uses_v1_endpoint(self):
         client = _make_client()

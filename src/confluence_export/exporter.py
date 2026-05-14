@@ -113,9 +113,9 @@ class Exporter:
         """Export a space (or subtree) to output_dir."""
         # Ensure cache
         if force_refresh:
-            cs = self.cache.refresh(self.client, space)
+            cs = self.cache.refresh(self.client, space, include_archived=include_archived)
         else:
-            cs = self.cache.ensure_loaded(self.client, space)
+            cs = self.cache.ensure_loaded(self.client, space, include_archived=include_archived)
 
         self._prefetch_bodies(cs)
 

@@ -549,7 +549,9 @@ def _cmd_diff(
         space = cs.space
     else:
         space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
-    cs = _with_auth_fallback(lambda: cache.refresh(client, space), client, config)
+    cs = _with_auth_fallback(
+        lambda: cache.refresh(client, space, include_archived=include_archived), client, config
+    )
 
     # Filter API pages
     api_pages = [p for p in cs.pages if p.status != "folder"]

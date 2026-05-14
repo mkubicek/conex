@@ -299,23 +299,29 @@ class ConfluenceClient:
         results = self._paginate("/wiki/api/v2/spaces", {"limit": "250"})
         return [self._remember_space(Space.from_api(r)) for r in results]
 
-    def get_pages_in_space(self, space_id: str) -> list[Page]:
+    def get_pages_in_space(self, space_id: str, include_archived: bool = False) -> list[Page]:
         if self.api_flavor == "cookie_v1":
             space_key = self._space_key_for_v1(space_id)
-            results = self._paginate_offset(
-                "/wiki/rest/api/content",
-                {
-                    "spaceKey": space_key,
-                    "type": "page",
-                    "status": "current",
-                    "expand": "body.storage,version,ancestors,space,history,extensions",
-                    "limit": "250",
-                },
-            )
-            return [self._page_from_v1(r) for r in results]
+            # v1 status is single-valued, so archived pages need a second call.
+            statuses = ["current", "archived"] if include_archived else ["current"]
+            pages: list[Page] = []
+            for status in statuses:
+                results = self._paginate_offset(
+                    "/wiki/rest/api/content",
+                    {
+                        "spaceKey": space_key,
+                        "type": "page",
+                        "status": status,
+                        "expand": "body.storage,version,ancestors,space,history,extensions",
+                        "limit": "250",
+                    },
+                )
+                pages.extend(self._page_from_v1(r) for r in results)
+            return pages
 
         # body-format=storage returns the body inline with every page, so the
         # exporter doesn't need an N+1 round trip to fetch each body later.
+        # v2 defaults to status=current,archived; no flag-gating needed.
         path = f"/wiki/api/v2/spaces/{space_id}/pages"
         results = self._paginate(path, {"limit": "250", "body-format": "storage"})
         return [Page.from_api(r) for r in results]
