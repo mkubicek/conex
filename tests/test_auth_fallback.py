@@ -77,6 +77,7 @@ class TestSetBearerToken:
         client.set_bearer_token("browser-tok-123")
         assert client.session.auth is None
         assert client.session.headers["Authorization"] == "Bearer browser-tok-123"
+        assert client.api_flavor == "v2"
 
 
 # -- Config.needs_token ------------------------------------------------------
@@ -230,6 +231,7 @@ class TestSetCookies:
         assert "Authorization" not in client.session.headers
         assert client.session.cookies.get("session") == "abc123"
         assert client.session.cookies.get("token") == "xyz789"
+        assert client.api_flavor == "cookie_v1"
 
     def test_clears_existing_bearer(self):
         config = Config(base_url="https://x.atlassian.net", email="", api_token="pat")
@@ -238,6 +240,7 @@ class TestSetCookies:
 
         client.set_cookies("foo=bar; baz=qux")
         assert "Authorization" not in client.session.headers
+        assert client.api_flavor == "cookie_v1"
 
 
 # -- Client init without token ----------------------------------------------

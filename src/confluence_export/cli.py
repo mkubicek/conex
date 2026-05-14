@@ -69,7 +69,9 @@ def _prompt_browser_credentials(base_url: str, reason: str) -> tuple[str, str]:
         f"  1. Open {base_url} in your browser and log in\n"
         f"  2. Open DevTools (F12) -> Network tab\n"
         f"  3. Reload the page and click any API request to /wiki/\n"
-        f"  4. Copy the 'Cookie' or 'Authorization' header value\n",
+        f"  4. Copy the 'Cookie' or 'Authorization' header value\n"
+        f"\n"
+        f"Cookie headers use Confluence's legacy REST read endpoints for this run.\n",
         file=sys.stderr,
     )
     try:
@@ -105,7 +107,7 @@ def _apply_browser_credentials(client: ConfluenceClient, base_url: str, reason: 
     # Verify credentials with a minimal request (1 space, fast)
     print("Verifying credentials...", file=sys.stderr, flush=True)
     try:
-        client._get("/wiki/api/v2/spaces", {"limit": "1"})
+        client.verify_auth()
     except AuthenticationError as exc:
         print(f"Authentication failed (HTTP {exc.status_code}).", file=sys.stderr)
         sys.exit(1)
@@ -200,8 +202,8 @@ def _with_auth_fallback(fn, client: ConfluenceClient, config) -> object:
             if status2 is None:
                 raise
             print(
-                f"\nBrowser token also rejected (HTTP {status2}). "
-                f"The token may have expired — try again with a fresh one.",
+                f"\nBrowser credentials also rejected (HTTP {status2}). "
+                f"They may have expired — try again with fresh credentials.",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -286,7 +288,8 @@ def main() -> None:
         print(f"\nRun 'confluence-export configure' to set up credentials.", file=sys.stderr)
         sys.exit(1)
 
-    config = _maybe_route_via_gateway(config)
+    if not args.cookie:
+        config = _maybe_route_via_gateway(config)
 
     client = ConfluenceClient(config, verbose=args.verbose)
 
@@ -294,7 +297,7 @@ def main() -> None:
         client.set_cookies(args.cookie)
         print("Using browser cookies. Verifying credentials...", file=sys.stderr, flush=True)
         try:
-            client._get("/wiki/api/v2/spaces", {"limit": "1"})
+            client.verify_auth()
         except Exception:
             print("Cookie authentication failed.", file=sys.stderr)
             sys.exit(1)

@@ -337,17 +337,28 @@ class TestCookieFlag:
              patch("confluence_export.cli.ConfluenceClient", return_value=client):
             main()
         client.set_cookies.assert_called_once_with("session=abc; tok=xyz")
+        client.verify_auth.assert_called_once_with()
         assert "Authenticated" in capsys.readouterr().err
 
     def test_bad_cookie_exits(self, capsys):
         client = _mock_client()
-        client._get.side_effect = Exception("401")
+        client.verify_auth.side_effect = Exception("401")
         with patch("sys.argv", ["confluence-export", "--cookie", "bad=val", "spaces"]), \
              patch("confluence_export.cli.load_config", return_value=_config()), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client):
             with pytest.raises(SystemExit):
                 main()
         assert "failed" in capsys.readouterr().err
+
+    def test_cookie_does_not_route_scoped_token_via_gateway(self):
+        client = _mock_client()
+        config = _config(api_token=SCOPED_TOKEN)
+        with patch("sys.argv", ["confluence-export", "--cookie", "session=abc", "spaces"]), \
+             patch("confluence_export.cli.load_config", return_value=config), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli._maybe_route_via_gateway") as mock_route:
+            main()
+        mock_route.assert_not_called()
 
 
 class TestNeedsToken:
