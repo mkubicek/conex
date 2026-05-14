@@ -82,6 +82,7 @@ class CacheStore:
             pages=pages,
             attachments=attachments,
             updated_at=datetime.now(timezone.utc).isoformat(),
+            include_archived=include_archived,
         )
         self.save(cs)
         return cs
@@ -129,6 +130,8 @@ class CacheStore:
     ) -> CachedSpace:
         """Load from cache, or refresh if not cached."""
         cs = self.load(space.key)
-        if cs is not None:
+        # A current-only cache cannot satisfy an archived export. Older cache
+        # files have no provenance bit and intentionally fall into this branch.
+        if cs is not None and (cs.include_archived or not include_archived):
             return cs
         return self.refresh(client, space, include_archived=include_archived)

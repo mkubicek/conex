@@ -315,3 +315,22 @@ class TestForceRefresh:
         exporter.export_space(_make_space(), tmp_path, force_refresh=True)
         cache.refresh.assert_called_once()
         cache.ensure_loaded.assert_not_called()
+
+    def test_cached_include_archived_requests_archive_capable_cache(self, tmp_path):
+        exporter, client, cache = _make_exporter()
+        cs = _make_cached_space(
+            pages=[
+                _make_page(),
+                _make_page(id="p2", title="Archived Page", body="<p>Old</p>"),
+            ]
+        )
+        cs.pages[1].status = "archived"
+        cs.include_archived = True
+        cache.ensure_loaded.return_value = cs
+
+        exporter.export_space(_make_space(), tmp_path, include_archived=True)
+
+        cache.ensure_loaded.assert_called_once_with(
+            client, _make_space(), include_archived=True
+        )
+        cache.refresh.assert_not_called()

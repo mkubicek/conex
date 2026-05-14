@@ -197,6 +197,7 @@ class CachedSpace:
     pages: list[Page]
     attachments: dict[str, list[Attachment]]  # page_id -> attachments
     updated_at: str = ""
+    include_archived: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -215,6 +216,7 @@ class CachedSpace:
                 for pid, atts in self.attachments.items()
             },
             "updated_at": self.updated_at,
+            "include_archived": self.include_archived,
         }
 
     @classmethod
@@ -227,4 +229,5 @@ class CachedSpace:
                 for pid, atts in data.get("attachments", {}).items()
             },
             updated_at=data.get("updated_at", ""),
+            include_archived=bool(data.get("include_archived", False)),
         )
