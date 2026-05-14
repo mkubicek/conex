@@ -83,6 +83,16 @@ class ConfluenceClient:
         else:
             self._get("/wiki/api/v2/spaces", {"limit": "1"})
 
+    @property
+    def returns_archived_pages(self) -> bool:
+        """True when get_pages_in_space returns archived pages regardless of include_archived.
+
+        v2 defaults to status=current,archived. cookie_v1 only fetches archived when
+        the flag is set. Callers (e.g. the cache) use this to label what the server
+        actually delivered, not just what the caller asked for.
+        """
+        return self.api_flavor != "cookie_v1"
+
     def _get(self, path: str, params: dict | None = None, max_retries: int = 3) -> dict:
         """GET with retry + rate-limit handling."""
         url = self.base_url + path

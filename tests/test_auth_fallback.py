@@ -80,6 +80,26 @@ class TestSetBearerToken:
         assert client.api_flavor == "v2"
 
 
+class TestReturnsArchivedPages:
+    def test_true_for_v2_default(self):
+        config = Config(base_url="https://x.atlassian.net", email="a@b.com", api_token="tok")
+        client = ConfluenceClient(config)
+        assert client.returns_archived_pages is True
+
+    def test_false_after_set_cookies(self):
+        config = Config(base_url="https://x.atlassian.net", email="a@b.com", api_token="tok")
+        client = ConfluenceClient(config)
+        client.set_cookies("session=abc")
+        assert client.returns_archived_pages is False
+
+    def test_true_again_after_set_bearer(self):
+        config = Config(base_url="https://x.atlassian.net", email="a@b.com", api_token="tok")
+        client = ConfluenceClient(config)
+        client.set_cookies("session=abc")
+        client.set_bearer_token("tok-2")
+        assert client.returns_archived_pages is True
+
+
 # -- Config.needs_token ------------------------------------------------------
 
 

@@ -97,6 +97,7 @@ class TestCacheStore:
         with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
             store = CacheStore()
             client = MagicMock()
+            client.returns_archived_pages = True
             client.get_pages_in_space.return_value = [
                 Page(id="p1", title="Page", space_id="1", version=Version(number=1))
             ]
@@ -122,6 +123,7 @@ class TestCacheStore:
             store = CacheStore()
             store.save(_make_cached_space(include_archived=False))
             client = MagicMock()
+            client.returns_archived_pages = False
             client.get_pages_in_space.return_value = [
                 Page(id="p1", title="Page", space_id="1", version=Version(number=1)),
                 Page(
@@ -141,3 +143,39 @@ class TestCacheStore:
             client.get_pages_in_space.assert_called_once_with(
                 "1", include_archived=True
             )
+
+    def test_refresh_marks_v2_cache_archive_capable_when_not_requested(self, tmp_path):
+        with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
+            store = CacheStore()
+            client = MagicMock()
+            client.returns_archived_pages = True
+            client.get_pages_in_space.return_value = []
+            client.get_attachments.return_value = []
+
+            cs = store.refresh(client, _make_space(), include_archived=False)
+
+            assert cs.include_archived is True
+
+    def test_refresh_marks_cookie_v1_current_only_when_not_requested(self, tmp_path):
+        with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
+            store = CacheStore()
+            client = MagicMock()
+            client.returns_archived_pages = False
+            client.get_pages_in_space.return_value = []
+            client.get_attachments.return_value = []
+
+            cs = store.refresh(client, _make_space(), include_archived=False)
+
+            assert cs.include_archived is False
+
+    def test_refresh_marks_cookie_v1_archive_capable_when_requested(self, tmp_path):
+        with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
+            store = CacheStore()
+            client = MagicMock()
+            client.returns_archived_pages = False
+            client.get_pages_in_space.return_value = []
+            client.get_attachments.return_value = []
+
+            cs = store.refresh(client, _make_space(), include_archived=True)
+
+            assert cs.include_archived is True

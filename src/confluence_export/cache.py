@@ -77,12 +77,16 @@ class CacheStore:
                     attachments[page_id] = atts
         print(file=sys.stderr)
 
+        # v2 always returns current+archived regardless of the requested flag, so
+        # the cache is archive-capable even when the caller asked for current-only.
+        # Derive the bit from the client's delivered shape, not just the request.
+        cache_includes_archived = include_archived or client.returns_archived_pages
         cs = CachedSpace(
             space=space,
             pages=pages,
             attachments=attachments,
             updated_at=datetime.now(timezone.utc).isoformat(),
-            include_archived=include_archived,
+            include_archived=cache_includes_archived,
         )
         self.save(cs)
         return cs
