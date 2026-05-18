@@ -243,6 +243,156 @@ class TestApiMethodsExtra:
             assert len(atts) == 1
 
 
+class TestCookieV1Mode:
+    def test_verify_auth_uses_v1_space_endpoint(self):
+        client = _make_client()
+        client.set_cookies("tenant.session.token=abc")
+
+        with patch.object(client, "_get", return_value={"results": []}) as mock:
+            client.verify_auth()
+
+        mock.assert_called_once_with("/wiki/rest/api/space", {"limit": "1"})
+
+    def test_verify_auth_uses_v2_for_token_auth(self):
+        client = _make_client()
+
+        with patch.object(client, "_get", return_value={"results": []}) as mock:
+            client.verify_auth()
+
+        mock.assert_called_once_with("/wiki/api/v2/spaces", {"limit": "1"})
+
+    def test_get_spaces_uses_v1_mapper_in_cookie_mode(self):
+        client = _make_client()
+        client.set_cookies("session=abc")
+
+        with patch.object(client, "_paginate_offset") as mock:
+            mock.return_value = [
+                {
+                    "id": "100",
+                    "key": "ENG",
+                    "name": "Engineering",
+                    "type": "global",
+                    "status": "current",
+                    "_links": {"webui": "/display/ENG", "base": "https://x.atlassian.net/wiki"},
+                }
+            ]
+            spaces = client.get_spaces()
+
+        assert spaces[0].id == "100"
+        assert spaces[0].key == "ENG"
+        assert client._space_key_by_id["100"] == "ENG"
+        mock.assert_called_once_with("/wiki/rest/api/space", {"limit": "250"})
+
+    def test_get_pages_in_space_uses_mapped_space_key(self):
+        client = _make_client()
+        client.set_cookies("session=abc")
+        client._space_key_by_id["100"] = "ENG"
+
+        with patch.object(client, "_paginate_offset") as mock:
+            mock.return_value = [
+                {
+                    "id": "42",
+                    "title": "Child",
+                    "status": "current",
+                    "space": {"id": "100"},
+                    "ancestors": [{"id": "1", "type": "page"}],
+                    "extensions": {"position": 7},
+                    "body": {"storage": {"value": "<p>Hello</p>"}},
+                    "history": {
+                        "createdDate": "2026-01-01T00:00:00Z",
+                        "createdBy": {"accountId": "creator"},
+                    },
+                    "version": {
+                        "when": "2026-01-02T00:00:00Z",
+                        "number": 3,
+                        "by": {"accountId": "editor"},
+                    },
+                    "_links": {"webui": "/display/ENG/Child"},
+                }
+            ]
+            pages = client.get_pages_in_space("100")
+
+        assert pages[0].id == "42"
+        assert pages[0].space_id == "100"
+        assert pages[0].parent_id == "1"
+        assert pages[0].position == 7
+        assert pages[0].body_storage == "<p>Hello</p>"
+        assert pages[0].author_id == "creator"
+        assert pages[0].version.author_id == "editor"
+        assert pages[0].version.number == 3
+        _, params = mock.call_args.args
+        assert params["spaceKey"] == "ENG"
+        assert params["type"] == "page"
+        assert params["status"] == "current"
+        assert "body.storage" in params["expand"]
+
+    def test_get_pages_in_space_archived_issues_second_call(self):
+        client = _make_client()
+        client.set_cookies("session=abc")
+        client._space_key_by_id["100"] = "ENG"
+
+        with patch.object(client, "_paginate_offset", return_value=[]) as mock:
+            client.get_pages_in_space("100", include_archived=True)
+
+        statuses = [call.args[1]["status"] for call in mock.call_args_list]
+        assert statuses == ["current", "archived"]
+
+    def test_get_space_by_key_uses_v1_endpoint(self):
+        client = _make_client()
+        client.set_cookies("session=abc")
+
+        with patch.object(client, "_get") as mock:
+            mock.return_value = {"id": "100", "key": "ENG", "name": "Engineering"}
+            space = client.get_space_by_key("ENG")
+
+        assert space is not None
+        assert space.key == "ENG"
+        mock.assert_called_once_with("/wiki/rest/api/space/ENG")
+
+    def test_get_page_by_id_uses_v1_endpoint(self):
+        client = _make_client()
+        client.set_cookies("session=abc")
+
+        with patch.object(client, "_get") as mock:
+            mock.return_value = {
+                "id": "42",
+                "title": "Page",
+                "space": {"id": "100"},
+                "body": {"storage": {"value": "<p>Body</p>"}},
+            }
+            page = client.get_page_by_id("42")
+
+        assert page.body_storage == "<p>Body</p>"
+        assert mock.call_args.args[0] == "/wiki/rest/api/content/42"
+
+    def test_get_attachments_uses_v1_endpoint(self):
+        client = _make_client()
+        client.set_cookies("session=abc")
+
+        with patch.object(client, "_paginate_offset") as mock:
+            mock.return_value = [
+                {
+                    "id": "att1",
+                    "title": "file.png",
+                    "metadata": {"mediaType": "image/png"},
+                    "extensions": {"fileSize": 1234},
+                    "version": {"number": 5, "when": "2026-01-03T00:00:00Z"},
+                    "_links": {"download": "/download/attachments/42/file.png"},
+                }
+            ]
+            atts = client.get_attachments("42")
+
+        assert atts[0].id == "att1"
+        assert atts[0].page_id == "42"
+        assert atts[0].media_type == "image/png"
+        assert atts[0].file_size == 1234
+        assert atts[0].version.number == 5
+        mock.assert_called_once_with(
+            "/wiki/rest/api/content/42/child/attachment",
+            {"expand": "version,metadata,extensions,history", "limit": "250"},
+        )
+
+
 class TestVerboseLogging:
     def test_log_when_verbose(self, capsys):
         client = _make_client()

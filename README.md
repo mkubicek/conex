@@ -68,7 +68,7 @@ If you don't have an API token, you can authenticate with a browser cookie inste
 confluence-export --base-url https://example.atlassian.net --cookie 'tenant.session.token=...' export SPACEKEY -o ./output
 ```
 
-If no token or cookie is provided, the tool will prompt interactively. Browser credentials are used for the current run only and never saved.
+Cookie authentication uses Confluence's legacy REST read endpoints because Confluence Cloud REST v2 rejects browser session cookies. Use the normal site URL (`https://example.atlassian.net`), not the OAuth gateway URL. If no token or cookie is provided, the tool will prompt interactively. Browser credentials are used for the current run only and never saved.
 
 ## Required permissions
 

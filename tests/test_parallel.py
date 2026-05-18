@@ -58,6 +58,7 @@ class TestRefreshCollectsAllAttachments:
         }
 
         client = MagicMock()
+        client.returns_archived_pages = True
         client.get_pages_in_space.return_value = pages
         client.get_attachments.side_effect = lambda pid: atts_by_page.get(pid, [])
         client.get_folder_by_id.return_value = None
@@ -79,6 +80,7 @@ class TestRefreshCollectsAllAttachments:
         ]
 
         client = MagicMock()
+        client.returns_archived_pages = True
         client.get_pages_in_space.return_value = pages
         client.get_attachments.return_value = []
         client.get_folder_by_id.return_value = None
@@ -198,6 +200,7 @@ class TestProgressReachesTotal:
         pages = [_make_page(str(i)) for i in range(1, n + 1)]
 
         client = MagicMock()
+        client.returns_archived_pages = True
         client.get_pages_in_space.return_value = pages
         client.get_attachments.return_value = []
         client.get_folder_by_id.return_value = None

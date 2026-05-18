@@ -42,10 +42,12 @@ class CacheStore:
         if p.exists():
             p.unlink()
 
-    def refresh(self, client: ConfluenceClient, space: Space) -> CachedSpace:
+    def refresh(
+        self, client: ConfluenceClient, space: Space, include_archived: bool = False
+    ) -> CachedSpace:
         """Fetch all pages + attachments from the API and cache them."""
         print(f"Fetching pages for space {space.key}...", file=sys.stderr)
-        pages = client.get_pages_in_space(space.id)
+        pages = client.get_pages_in_space(space.id, include_archived=include_archived)
         print(f"Found {len(pages)} pages.", file=sys.stderr)
 
         # Resolve folders: pages may reference parent IDs that are folders,
@@ -75,11 +77,16 @@ class CacheStore:
                     attachments[page_id] = atts
         print(file=sys.stderr)
 
+        # v2 always returns current+archived regardless of the requested flag, so
+        # the cache is archive-capable even when the caller asked for current-only.
+        # Derive the bit from the client's delivered shape, not just the request.
+        cache_includes_archived = include_archived or client.returns_archived_pages
         cs = CachedSpace(
             space=space,
             pages=pages,
             attachments=attachments,
             updated_at=datetime.now(timezone.utc).isoformat(),
+            include_archived=cache_includes_archived,
         )
         self.save(cs)
         return cs
@@ -122,9 +129,13 @@ class CacheStore:
 
         return pages
 
-    def ensure_loaded(self, client: ConfluenceClient, space: Space) -> CachedSpace:
+    def ensure_loaded(
+        self, client: ConfluenceClient, space: Space, include_archived: bool = False
+    ) -> CachedSpace:
         """Load from cache, or refresh if not cached."""
         cs = self.load(space.key)
-        if cs is not None:
+        # A current-only cache cannot satisfy an archived export. Older cache
+        # files have no provenance bit and intentionally fall into this branch.
+        if cs is not None and (cs.include_archived or not include_archived):
             return cs
-        return self.refresh(client, space)
+        return self.refresh(client, space, include_archived=include_archived)

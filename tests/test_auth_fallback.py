@@ -77,6 +77,27 @@ class TestSetBearerToken:
         client.set_bearer_token("browser-tok-123")
         assert client.session.auth is None
         assert client.session.headers["Authorization"] == "Bearer browser-tok-123"
+        assert client.api_flavor == "v2"
+
+
+class TestReturnsArchivedPages:
+    def test_true_for_v2_default(self):
+        config = Config(base_url="https://x.atlassian.net", email="a@b.com", api_token="tok")
+        client = ConfluenceClient(config)
+        assert client.returns_archived_pages is True
+
+    def test_false_after_set_cookies(self):
+        config = Config(base_url="https://x.atlassian.net", email="a@b.com", api_token="tok")
+        client = ConfluenceClient(config)
+        client.set_cookies("session=abc")
+        assert client.returns_archived_pages is False
+
+    def test_true_again_after_set_bearer(self):
+        config = Config(base_url="https://x.atlassian.net", email="a@b.com", api_token="tok")
+        client = ConfluenceClient(config)
+        client.set_cookies("session=abc")
+        client.set_bearer_token("tok-2")
+        assert client.returns_archived_pages is True
 
 
 # -- Config.needs_token ------------------------------------------------------
@@ -230,6 +251,7 @@ class TestSetCookies:
         assert "Authorization" not in client.session.headers
         assert client.session.cookies.get("session") == "abc123"
         assert client.session.cookies.get("token") == "xyz789"
+        assert client.api_flavor == "cookie_v1"
 
     def test_clears_existing_bearer(self):
         config = Config(base_url="https://x.atlassian.net", email="", api_token="pat")
@@ -238,6 +260,7 @@ class TestSetCookies:
 
         client.set_cookies("foo=bar; baz=qux")
         assert "Authorization" not in client.session.headers
+        assert client.api_flavor == "cookie_v1"
 
 
 # -- Client init without token ----------------------------------------------

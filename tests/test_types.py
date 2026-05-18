@@ -118,6 +118,7 @@ class TestCachedSpace:
             pages=[page],
             attachments={"p1": [att]},
             updated_at="2025-01-01T00:00:00Z",
+            include_archived=True,
         )
         d = cs.to_dict()
         cs2 = CachedSpace.from_dict(d)
@@ -125,6 +126,16 @@ class TestCachedSpace:
         assert len(cs2.pages) == 1
         assert len(cs2.attachments["p1"]) == 1
         assert cs2.updated_at == "2025-01-01T00:00:00Z"
+        assert cs2.include_archived is True
+
+    def test_round_trip_defaults_old_cache_to_current_only(self):
+        cs = CachedSpace.from_dict({
+            "space": {"id": "1", "key": "TEST", "name": "Test"},
+            "pages": [],
+            "attachments": {},
+            "updated_at": "2025-01-01T00:00:00Z",
+        })
+        assert cs.include_archived is False
 
     def test_round_trip_preserves_page_bodies(self):
         space = Space(id="1", key="TEST", name="Test")
