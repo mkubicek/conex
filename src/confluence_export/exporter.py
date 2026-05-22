@@ -399,8 +399,11 @@ class Exporter:
                 for pid, row in raw["pages"].items():
                     if not isinstance(row, dict):
                         continue
+                    path = str(row.get("path", ""))
+                    if not _is_safe_manifest_path(path, output_dir):
+                        continue
                     entries[str(pid)] = _ManifestEntry(
-                        path=str(row.get("path", "")),
+                        path=path,
                         title=str(row.get("title", "")),
                         parent_id=str(row.get("parent_id", "")),
                         is_folder=bool(row.get("is_folder", False)),
@@ -416,7 +419,10 @@ class Exporter:
 
         Uses the on-disk parent directory of each .md file (not the YAML
         `path` field) so that previously-disambiguated names like
-        "Page-2" survive into the manifest.
+        "Page-2" survive into the manifest. Skips files sitting directly
+        at output_dir (path would resolve to "." and drive Phase B into
+        moving output_dir itself) — these typically come from a prior
+        --no-children export and shouldn't be tracked as page dirs.
         """
         if not output_dir.is_dir():
             return {}
@@ -426,6 +432,8 @@ class Exporter:
             try:
                 rel = exp.file_path.parent.relative_to(output_dir).as_posix()
             except ValueError:
+                continue
+            if not _is_safe_manifest_path(rel, output_dir):
                 continue
             entries[page_id] = _ManifestEntry(
                 path=rel,
@@ -658,6 +666,27 @@ class Exporter:
                 pass
 
         return written
+
+
+def _is_safe_manifest_path(rel: str, output_dir: Path) -> bool:
+    """Reject manifest paths that would drive Phase B into operating on
+    output_dir itself or anything outside it.
+
+    Rejects empty, `.`, absolute paths, and paths that resolve outside
+    output_dir via `..` segments. A page directory must always be a
+    proper subdirectory of output_dir; otherwise relocate_subtree would
+    target output_dir (or worse) and either crash or destroy state.
+    """
+    if not rel or rel == "." or rel.startswith("/"):
+        return False
+    try:
+        target = (output_dir / rel).resolve()
+        out = output_dir.resolve()
+    except OSError:
+        return False
+    if target == out:
+        return False
+    return out in target.parents
 
 
 def _looks_like_conex_export(path: Path) -> bool:

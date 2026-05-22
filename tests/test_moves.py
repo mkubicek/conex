@@ -492,6 +492,86 @@ class TestStrayCleanupSpareUserFiles:
         assert not (tmp_path / "Bar" / "Foo.md").exists()
 
 
+class TestManifestPathSafety:
+    def test_no_children_artifacts_do_not_corrupt_reconstruction(self, tmp_path):
+        """A prior --no-children export leaves .md files directly at
+        output_dir. When the manifest is missing and the next run
+        reconstructs from frontmatter, those root-level files must NOT
+        produce path='.' entries — Phase B would then try to relocate
+        output_dir itself."""
+        # Simulate a prior --no-children export: page at root, no manifest
+        (tmp_path / "Page1.md").write_text(
+            "---\ntitle: Page1\npage_id: p1\nspace_key: TEST\nversion: 1\n---\n# Page1\n"
+        )
+        # Plus a properly-nested export from earlier (must survive)
+        (tmp_path / "Page2").mkdir()
+        (tmp_path / "Page2" / "Page2.md").write_text(
+            "---\ntitle: Page2\npage_id: p2\nspace_key: TEST\nversion: 1\n---\n# Page2\n"
+        )
+
+        # Re-run as a normal export — both pages still exist in Confluence
+        p1 = _make_page("p1", "Page1")
+        p2 = _make_page("p2", "Page2")
+        exporter, cache = _make_exporter()
+        # Must not crash trying to shutil.move(tmp_path, tmp_path/"Page1")
+        _run_export(exporter, cache, [p1, p2], tmp_path)
+
+        # Both pages exported into proper subdirs
+        assert (tmp_path / "Page1" / "Page1.md").exists()
+        assert (tmp_path / "Page2" / "Page2.md").exists()
+
+    def test_manifest_with_dot_path_entry_ignored(self, tmp_path):
+        """A corrupted/hand-edited manifest with path='.' must not be
+        honored. Otherwise the next export's Phase B would attempt to
+        relocate output_dir itself."""
+        manifest_file = tmp_path / ".test.path_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "version": 1,
+            "space_key": "TEST",
+            "pages": {
+                "p": {"path": ".", "title": "Page", "parent_id": "", "is_folder": False},
+            },
+        }, indent=2, sort_keys=True) + "\n")
+
+        p = _make_page("p", "Page")
+        exporter, cache = _make_exporter()
+        _run_export(exporter, cache, [p], tmp_path)
+        assert (tmp_path / "Page" / "Page.md").exists()
+
+    def test_manifest_with_absolute_path_entry_ignored(self, tmp_path):
+        """Absolute paths in the manifest must be rejected — defense
+        against hand-edits or downstream corruption."""
+        manifest_file = tmp_path / ".test.path_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "version": 1,
+            "space_key": "TEST",
+            "pages": {
+                "p": {"path": "/etc/passwd", "title": "X", "parent_id": "", "is_folder": False},
+            },
+        }, indent=2, sort_keys=True) + "\n")
+
+        p = _make_page("p", "Page")
+        exporter, cache = _make_exporter()
+        _run_export(exporter, cache, [p], tmp_path)
+        assert (tmp_path / "Page" / "Page.md").exists()
+
+    def test_manifest_with_parent_traversal_ignored(self, tmp_path):
+        """Manifest paths that escape output_dir via '..' must be rejected."""
+        manifest_file = tmp_path / ".test.path_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "version": 1,
+            "space_key": "TEST",
+            "pages": {
+                "p": {"path": "../outside", "title": "X", "parent_id": "", "is_folder": False},
+            },
+        }, indent=2, sort_keys=True) + "\n")
+
+        p = _make_page("p", "Page")
+        exporter, cache = _make_exporter()
+        _run_export(exporter, cache, [p], tmp_path)
+        assert (tmp_path / "Page" / "Page.md").exists()
+
+
 class TestNestedWorkspacePreserved:
     def test_recursive_workspace_check_preserves_nested_data(self, tmp_path):
         """A parked subtree where the parent's .workspace is empty but a
