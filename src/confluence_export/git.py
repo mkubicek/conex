@@ -157,7 +157,17 @@ def _remove_stale_files(output_dir: Path, written_files: list[Path]) -> None:
         for batch in _chunked_paths(stale):
             _run_git(output_dir, "rm", "--quiet", "--", *batch)
 
-    _prune_empty_dirs(output_dir, output_dir)
+    # Prune empty parent directories left behind by `git rm`. Walking from
+    # output_dir itself is a no-op (start == stop), so iterate over the
+    # parents of each removed path and let _prune_empty_dirs walk upward
+    # until it hits the output_dir boundary.
+    seen: set[Path] = set()
+    for rel_path in stale:
+        parent = (output_dir / rel_path).parent
+        if parent in seen:
+            continue
+        seen.add(parent)
+        _prune_empty_dirs(parent, output_dir)
 
 
 def relocate_subtree(

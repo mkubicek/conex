@@ -477,11 +477,17 @@ class Exporter:
                 entry.path = new_prefix + entry.path[len(old_prefix):]
 
     def _sweep_orphan_parks(self, run: _ExportRun) -> None:
-        """Recover or remove .__conex_tmp_<id> dirs left by a crashed prior run.
+        """Recover or quarantine .__conex_tmp_<id> dirs left by a crashed prior run.
 
-        If the parked page_id is in the manifest, move the dir back to its
-        recorded path so its .workspace/ content is preserved for the
-        current run's reconciliation. Otherwise drop the orphan.
+        If the parked page_id is in the manifest and its recorded path is
+        free, restore the dir there so .workspace/ content survives. If
+        the path is occupied (a half-finished swap committed the other
+        leg before crashing), park the content under .__conex_orphan_<id>
+        and warn — never silently destroy user workspace data.
+
+        Dirs whose page_id we no longer know about (page deleted upstream
+        between crash and recovery) are dropped only when they carry no
+        .workspace content.
         """
         if not run.output_dir.is_dir():
             return
@@ -491,17 +497,44 @@ class Exporter:
                 continue
             page_id = child.name[len(prefix):]
             entry = run.manifest.get(page_id)
+            has_user_data = _has_workspace_content(child)
             if entry is None:
-                # No record of where it came from — drop the orphan.
-                shutil.rmtree(child, ignore_errors=True)
+                if has_user_data:
+                    self._quarantine_orphan(child, page_id, run.output_dir)
+                else:
+                    shutil.rmtree(child, ignore_errors=True)
                 continue
             target = run.output_dir / entry.path
             if target.exists():
-                # Manifest path is occupied; can't safely restore. Drop.
-                shutil.rmtree(child, ignore_errors=True)
+                if has_user_data:
+                    self._quarantine_orphan(child, page_id, run.output_dir)
+                else:
+                    shutil.rmtree(child, ignore_errors=True)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             relocate_subtree(child, target, output_dir=run.output_dir, use_git=run.use_git)
+
+    def _quarantine_orphan(self, park: Path, page_id: str, output_dir: Path) -> None:
+        """Move a parked dir we can't safely restore to .__conex_orphan_<id>.
+
+        Picks a numeric suffix if a prior orphan with the same id already
+        sits there, so repeated crashes don't clobber each other.
+        """
+        base = f".__conex_orphan_{page_id}"
+        candidate = output_dir / base
+        n = 2
+        while candidate.exists():
+            candidate = output_dir / f"{base}-{n}"
+            n += 1
+        try:
+            shutil.move(str(park), str(candidate))
+        except OSError:
+            return
+        print(
+            f"  Warning: recovered workspace content from a prior aborted run; "
+            f"preserved at {candidate.name} for manual review",
+            file=sys.stderr,
+        )
 
     def _finalize(self, run: _ExportRun, result: ExportResult, space_key: str) -> None:
         """Write manifest, transfer run-level counters onto the result."""
@@ -581,7 +614,38 @@ class Exporter:
             html_path.write_text(page.body_storage, encoding="utf-8")
             written.append(html_path)
 
+        # After a rename, the relocated directory still carries the .md/.html
+        # named after the old title. Without explicit cleanup the page_dir
+        # would end up with both files; in git mode commit_export's stale
+        # pass removes the old one, but non-git output dirs would keep it
+        # forever. Drop any top-level .md/.html that doesn't match the
+        # current basename. Workspace and media live in subdirs and are
+        # untouched.
+        for stray in page_dir.glob("*.md"):
+            if stray.name != md_path.name:
+                try:
+                    stray.unlink()
+                except OSError:
+                    pass
+        for stray in page_dir.glob("*.html"):
+            if not self.debug or stray.name != md_path.with_suffix(".html").name:
+                try:
+                    stray.unlink()
+                except OSError:
+                    pass
+
         return written
+
+
+def _has_workspace_content(page_dir: Path) -> bool:
+    """Return True if the dir contains a non-empty .workspace/ subtree."""
+    ws = page_dir / ".workspace"
+    if not ws.is_dir():
+        return False
+    try:
+        return any(ws.iterdir())
+    except OSError:
+        return False
 
 
 def _matches_base_with_suffix(candidate: str, base_name: str) -> bool:

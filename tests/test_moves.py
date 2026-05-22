@@ -324,6 +324,57 @@ class TestEmptyOldParentPruned:
         assert not (tmp_path / "ParentA").exists()
 
 
+class TestStaleBasenameCleanup:
+    def test_rename_does_not_leave_stale_md_in_non_git_mode(self, tmp_path):
+        """Issue #17 follow-up: when a page is renamed, the relocated dir
+        carries the old `<oldname>.md` inside, and writing `<newname>.md`
+        afterwards leaves both files. Non-git mode has no commit_export
+        sweep to clean it, so the exporter itself must remove stray
+        top-level .md/.html files."""
+        exporter, cache = _make_exporter()
+        p = _make_page("p", "Foo")
+        _run_export(exporter, cache, [p], tmp_path)
+        assert (tmp_path / "Foo" / "Foo.md").exists()
+
+        # Rename in Confluence
+        p2 = _make_page("p", "Bar")
+        exporter2, cache2 = _make_exporter()
+        _run_export(exporter2, cache2, [p2], tmp_path)
+
+        assert (tmp_path / "Bar" / "Bar.md").exists()
+        # The relocated dir must NOT carry the old Foo.md anymore
+        assert not (tmp_path / "Bar" / "Foo.md").exists()
+
+    def test_rename_does_not_leave_stale_html_in_debug_mode(self, tmp_path):
+        client = MagicMock()
+        cache = MagicMock()
+        exporter = Exporter(
+            client=client, cache=cache,
+            base_url="https://x.atlassian.net",
+            download_media=False, render_drawio=False,
+            debug=True,
+        )
+        p = _make_page("p", "Foo")
+        cs = CachedSpace(space=_make_space(), pages=[p], attachments={}, updated_at="x")
+        cache.ensure_loaded.return_value = cs
+        exporter.export_space(_make_space(), tmp_path)
+        assert (tmp_path / "Foo" / "Foo.html").exists()
+
+        p2 = _make_page("p", "Bar")
+        cs2 = CachedSpace(space=_make_space(), pages=[p2], attachments={}, updated_at="x")
+        cache2 = MagicMock()
+        cache2.ensure_loaded.return_value = cs2
+        exporter2 = Exporter(
+            client=MagicMock(), cache=cache2,
+            base_url="https://x.atlassian.net",
+            download_media=False, render_drawio=False,
+            debug=True,
+        )
+        exporter2.export_space(_make_space(), tmp_path)
+        assert (tmp_path / "Bar" / "Bar.html").exists()
+        assert not (tmp_path / "Bar" / "Foo.html").exists()
+
+
 class TestOrphanParkRecovery:
     def test_orphan_park_with_known_page_id_restored(self, tmp_path):
         """A .__conex_tmp_<id> dir left by a crashed prior run is moved back
@@ -354,12 +405,13 @@ class TestOrphanParkRecovery:
         assert not park.exists()
 
     def test_orphan_park_with_unknown_page_id_dropped(self, tmp_path):
-        """A .__conex_tmp_<id> dir whose page_id isn't in the manifest is dropped."""
+        """A .__conex_tmp_<id> dir whose page_id isn't in the manifest is dropped
+        when it carries no workspace content."""
         exporter, cache = _make_exporter()
         p = _make_page("p", "MyPage")
         _run_export(exporter, cache, [p], tmp_path)
 
-        # Park for a totally unknown page id
+        # Park for a totally unknown page id, no workspace content
         park = tmp_path / ".__conex_tmp_unknown999"
         park.mkdir()
         (park / "junk.md").write_text("nope")
@@ -367,6 +419,81 @@ class TestOrphanParkRecovery:
         exporter2, cache2 = _make_exporter()
         _run_export(exporter2, cache2, [p], tmp_path)
         assert not park.exists()
+
+    def test_orphan_park_target_occupied_preserves_workspace(self, tmp_path):
+        """Aborted two-page swap: p is parked, q moves into p's old path,
+        then process dies before manifest write. Next run sees
+        .__conex_tmp_p AND the manifest still says p→A/X, but A/X now
+        holds q's content. The park must NOT be destroyed — quarantine
+        it under .__conex_orphan_p so p's .workspace/ data survives."""
+        # Simulate the crashed state directly.
+        # Manifest from before the swap: p → ParentA/X, q → ParentA/Y
+        manifest_dir = tmp_path
+        manifest_file = manifest_dir / ".test.path_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "version": 1,
+            "space_key": "TEST",
+            "pages": {
+                "p": {"path": "ParentA/X", "title": "X", "parent_id": "a", "is_folder": False},
+                "q": {"path": "ParentA/Y", "title": "Y", "parent_id": "a", "is_folder": False},
+                "a": {"path": "ParentA", "title": "ParentA", "parent_id": "", "is_folder": True},
+            },
+        }, indent=2, sort_keys=True) + "\n")
+        # Crashed state on disk: q already moved to ParentA/X (the slot p
+        # used to occupy), p sitting in the park with its .workspace data.
+        parent_a = tmp_path / "ParentA"
+        parent_a.mkdir()
+        q_at_x = parent_a / "X"
+        q_at_x.mkdir()
+        (q_at_x / "X.md").write_text("---\ntitle: Y\npage_id: q\nspace_key: TEST\nversion: 1\n---\n")
+        park = tmp_path / ".__conex_tmp_p"
+        park.mkdir()
+        ws = park / ".workspace"
+        ws.mkdir()
+        (ws / "important.txt").write_text("user data we MUST not lose")
+
+        # Re-export with the same logical swap: p→Y, q→X
+        a = _make_page("a", "ParentA")
+        a.status = "folder"
+        p2 = _make_page("p", "Y", parent_id="a")
+        q2 = _make_page("q", "X", parent_id="a")
+        exporter, cache = _make_exporter()
+        _run_export(exporter, cache, [a, p2, q2], tmp_path)
+
+        # The park must NOT be rmtree'd; user content preserved under orphan name
+        orphan = tmp_path / ".__conex_orphan_p"
+        assert orphan.exists()
+        assert (orphan / ".workspace" / "important.txt").read_text() == "user data we MUST not lose"
+        assert not park.exists()
+
+
+class TestGitModeEmptyDirCleanup:
+    def test_git_rm_prunes_empty_parent_chain(self, tmp_path):
+        """In git mode, when a page is deleted upstream its markdown is
+        git rm'd. The empty parent dirs left behind must also be removed
+        — _prune_empty_dirs(output_dir, output_dir) used to be called
+        with start == stop and was a no-op."""
+        import subprocess
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, capture_output=True)
+
+        page = tmp_path / "Old" / "Page"
+        page.mkdir(parents=True)
+        (page / "Page.md").write_text("# Old")
+        # Commit
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True)
+
+        # Re-export with a different page so we have something to commit
+        new_page = tmp_path / "New.md"
+        new_page.write_text("# New")
+        from confluence_export.git import commit_export
+        commit_export(tmp_path, [new_page], "TEST")
+
+        # Page.md removed, AND the empty Old/Page → Old chain pruned
+        assert not (tmp_path / "Old").exists()
+        assert (tmp_path / "New.md").exists()
 
 
 class TestDeletedPageWorkspacePreserved:
