@@ -179,12 +179,27 @@ class Exporter:
                 return ExportResult()
             if no_children:
                 result = ExportResult()
-                files = self._export_single_page(node.page, output_dir, cs, space.key)
+                page_dir = self._filtered_page_dir(node, output_dir, run)
+                entry = run.manifest.get(node.page.id)
+                name = Path(entry.path).name if entry is not None else None
+                files = self._export_single_page(
+                    node.page, page_dir, cs, space.key, name=name
+                )
                 result.count += 1 if files else 0
                 result.written_files.extend(files)
                 self._finalize(run, result, space.key, cs)
                 return result
-            result = self._export_siblings([node], output_dir, cs, space.key, run, depth=0)
+            # If the user passed --path /Root/Sub against an output dir
+            # that already holds a full export with Sub at Root/Sub, the
+            # manifest entry for Sub records the deeper path while this
+            # run normally treats Sub as top-level. Anchor the filtered
+            # export at the recorded parent so Phase B doesn't relocate
+            # Root/Sub to Sub.
+            page_dir = self._filtered_page_dir(node, output_dir, run)
+            parent_dir = page_dir.parent if node.page.id in run.manifest else output_dir
+            result = self._export_siblings(
+                [node], parent_dir, cs, space.key, run, depth=0
+            )
             self._finalize(run, result, space.key, cs)
             return result
 
@@ -202,6 +217,19 @@ class Exporter:
         return result
 
     # ------------------------------------------------------------------ siblings
+
+    def _filtered_page_dir(self, node: PageNode, output_dir: Path, run: _ExportRun) -> Path:
+        """Return the page directory for a filtered export.
+
+        Fresh filtered exports keep the legacy behavior of placing the selected
+        subtree at output_dir. When a manifest already records the page, reuse
+        that directory so a partial refresh of a full export does not rewrite
+        the selected page as a new top-level root.
+        """
+        entry = run.manifest.get(node.page.id)
+        if entry is None:
+            return output_dir
+        return output_dir / entry.path
 
     def _export_siblings(
         self,
@@ -589,7 +617,7 @@ class Exporter:
                 if full_visibility or not page_dir_exists:
                     del run.manifest[pid]
 
-        if not result.written_files and not run.manifest:
+        if not result.written_files:
             return
         mpath = self._write_manifest(run.output_dir, space_key, run.manifest)
         result.written_files.append(mpath)

@@ -715,12 +715,59 @@ class TestManifestPruneStale:
             base_url="https://x.atlassian.net",
             download_media=False, render_drawio=False,
         )
-        exporter2.export_space(_make_space(), tmp_path, include_archived=True)
+        result = exporter2.export_space(_make_space(), tmp_path, include_archived=True)
 
         # Manifest entries survived the empty-API hiccup
         manifest = json.loads((tmp_path / ".test.path_manifest.json").read_text())
         assert "p" in manifest["pages"]
         assert "other" in manifest["pages"]
+        assert result.written_files == []
+
+    def test_empty_cs_pages_does_not_trigger_git_stale_cleanup(self, tmp_path):
+        """A transient empty API view must not produce a manifest-only result
+        that the CLI would hand to commit_export and use to git-rm every
+        tracked page file as stale."""
+        from confluence_export.git import commit_export
+
+        _init_repo(tmp_path)
+        exporter, cache = _make_exporter()
+        p = _make_page("p", "Page")
+        other = _make_page("other", "Other")
+        first = _run_export(exporter, cache, [p, other], tmp_path, use_git=True)
+        assert commit_export(tmp_path, first.written_files, "TEST") is True
+
+        cs_empty = CachedSpace(
+            space=_make_space(),
+            pages=[],
+            attachments={},
+            updated_at="x",
+            include_archived=True,
+        )
+        cache2 = MagicMock()
+        cache2.ensure_loaded.return_value = cs_empty
+        exporter2 = Exporter(
+            client=MagicMock(), cache=cache2,
+            base_url="https://x.atlassian.net",
+            download_media=False, render_drawio=False,
+        )
+
+        result = exporter2.export_space(
+            _make_space(), tmp_path, include_archived=True, use_git=True
+        )
+        if result.written_files:
+            commit_export(tmp_path, result.written_files, "TEST")
+
+        assert result.written_files == []
+        assert (tmp_path / "Page" / "Page.md").exists()
+        tracked = subprocess.run(
+            ["git", "ls-files"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "Page/Page.md" in tracked.stdout
+        assert "Other/Other.md" in tracked.stdout
 
     def test_preserves_entry_when_limited_visibility_and_dir_exists(self, tmp_path):
         """include_archived=False + page absent from cs.pages + dir still
@@ -739,6 +786,41 @@ class TestManifestPruneStale:
         manifest = json.loads((tmp_path / ".test.path_manifest.json").read_text())
         # Conservative: entry kept (could be archive vs delete; we can't tell)
         assert "p" in manifest["pages"]
+
+
+class TestFailedRunDoesNotTriggerStaleCleanup:
+    def test_empty_pages_does_not_append_manifest_to_written_files(self, tmp_path):
+        """A failed export (empty cs.pages) used to append the manifest to
+        written_files, then commit_export's stale pass would git rm every
+        previously tracked file. Now _finalize bails before appending the
+        manifest when nothing was written this run."""
+        # Seed a full export so the manifest has entries
+        exporter, cache = _make_exporter()
+        p = _make_page("p", "Page")
+        other = _make_page("other", "Other")
+        _run_export(exporter, cache, [p, other], tmp_path)
+        assert (tmp_path / "Page" / "Page.md").exists()
+        assert (tmp_path / ".test.path_manifest.json").exists()
+
+        # Run 2: empty cs.pages (transient API failure)
+        cs_empty = CachedSpace(
+            space=_make_space(), pages=[], attachments={}, updated_at="x",
+        )
+        cache2 = MagicMock()
+        cache2.ensure_loaded.return_value = cs_empty
+        exporter2 = Exporter(
+            client=MagicMock(), cache=cache2,
+            base_url="https://x.atlassian.net",
+            download_media=False, render_drawio=False,
+        )
+        result = exporter2.export_space(_make_space(), tmp_path)
+
+        # Failed run: nothing in written_files (no pages, no manifest).
+        # CLI guards commit_export on `if use_git and result.written_files`,
+        # so the stale-removal pass never runs and prior content survives.
+        assert result.written_files == []
+        assert (tmp_path / "Page" / "Page.md").exists()
+        assert (tmp_path / "Other" / "Other.md").exists()
 
 
 class TestCorruptManifestRobustness:

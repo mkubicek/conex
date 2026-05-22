@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -126,6 +127,35 @@ class TestTreeExport:
         assert (tmp_path / "Sub" / "Sub.md").exists()
         assert (tmp_path / "Sub" / "Leaf" / "Leaf.md").exists()
 
+    def test_path_filter_refreshes_full_export_subtree_in_place(self, tmp_path):
+        exporter, _, cache = _make_exporter()
+        root = _make_page(id="p1", title="Root", body="<p>Root</p>")
+        sub = _make_page(id="p2", title="Sub", body="<p>Sub page</p>",
+                         parent_id="p1", parent_type="page")
+        leaf = _make_page(id="p3", title="Leaf", body="<p>Leaf page</p>",
+                          parent_id="p2", parent_type="page")
+        cache.ensure_loaded.return_value = _make_cached_space(pages=[root, sub, leaf])
+
+        exporter.export_space(_make_space(), tmp_path)
+
+        sub_v2 = _make_page(id="p2", title="Sub", body="<p>Updated sub</p>",
+                            parent_id="p1", parent_type="page")
+        leaf_v2 = _make_page(id="p3", title="Leaf", body="<p>Updated leaf</p>",
+                             parent_id="p2", parent_type="page")
+        cache.ensure_loaded.return_value = _make_cached_space(pages=[root, sub_v2, leaf_v2])
+
+        result = exporter.export_space(_make_space(), tmp_path, path_filter="/Root/Sub")
+
+        assert result.count == 2
+        assert (tmp_path / "Root" / "Sub" / "Sub.md").exists()
+        assert (tmp_path / "Root" / "Sub" / "Leaf" / "Leaf.md").exists()
+        assert not (tmp_path / "Sub").exists()
+        assert "Updated sub" in (tmp_path / "Root" / "Sub" / "Sub.md").read_text()
+
+        manifest = json.loads((tmp_path / ".test.path_manifest.json").read_text())
+        assert manifest["pages"]["p2"]["path"] == "Root/Sub"
+        assert manifest["pages"]["p3"]["path"] == "Root/Sub/Leaf"
+
     def test_path_filter_not_found_returns_zero(self, tmp_path, capsys):
         exporter, _, cache = _make_exporter()
         cs = _make_cached_space()
@@ -182,6 +212,24 @@ class TestBodyFetching:
         files = exporter._export_single_page(page, tmp_path, cs, "TEST")
         assert files == []
         assert "Warning" in capsys.readouterr().err
+
+    def test_all_body_fetch_failures_do_not_write_manifest_only_result(self, tmp_path):
+        exporter, client, cache = _make_exporter()
+        page = _make_page()
+        cache.ensure_loaded.return_value = _make_cached_space(pages=[page])
+        exporter.export_space(_make_space(), tmp_path)
+
+        manifest_path = tmp_path / ".test.path_manifest.json"
+        before = manifest_path.read_text()
+
+        failed_page = _make_page(body="")
+        cache.ensure_loaded.return_value = _make_cached_space(pages=[failed_page])
+        client.get_page_by_id.side_effect = Exception("timeout")
+
+        result = exporter.export_space(_make_space(), tmp_path)
+
+        assert result.written_files == []
+        assert manifest_path.read_text() == before
 
     def test_prefetch_fills_bodies_before_export(self):
         exporter, client, _ = _make_exporter()
