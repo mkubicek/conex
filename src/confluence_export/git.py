@@ -156,3 +156,131 @@ def _remove_stale_files(output_dir: Path, written_files: list[Path]) -> None:
         # exceed argv limits when passed to a single git rm call.
         for batch in _chunked_paths(stale):
             _run_git(output_dir, "rm", "--quiet", "--", *batch)
+
+    _prune_empty_dirs(output_dir, output_dir)
+
+
+def _has_path_in_git(repo_dir: Path, rel_path: str) -> bool:
+    """Return True if rel_path is tracked in the repo."""
+    if not _has_commits(repo_dir):
+        return False
+    result = _run_git(
+        repo_dir, "ls-files", "--error-unmatch", "--", rel_path, check=False
+    )
+    return result is not None and result.returncode == 0
+
+
+def relocate_subtree(
+    old_path: Path, new_path: Path, *, output_dir: Path, use_git: bool
+) -> bool:
+    """Move a page subtree from old_path to new_path.
+
+    Returns True if a move happened. Returns False (no-op) when:
+      - old_path doesn't exist (already moved by a prior partial run)
+      - old_path == new_path
+
+    On filesystems, the directory tree (including `.workspace/`) moves as a
+    unit via shutil.move. In a git repo, tracked files are also staged at
+    the new location and removed from the old; rename detection at log/diff
+    time relies on content similarity, so an explicit `git mv` isn't
+    required and handling untracked workspace files uniformly is simpler.
+    """
+    if old_path == new_path:
+        return False
+    if not old_path.exists():
+        # Already at new location, or never existed — self-heal cleanly.
+        return False
+
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if new_path.exists():
+        # Caller is responsible for parking via a tmp path; refuse to clobber.
+        print(
+            f"  Warning: cannot relocate {old_path} → {new_path}: "
+            f"destination exists",
+            file=sys.stderr,
+        )
+        return False
+
+    # Capture tracked paths under old_path before the move so we can stage
+    # the rename in git afterwards.
+    tracked_rel: list[str] = []
+    if use_git and _has_commits(output_dir):
+        try:
+            old_rel = old_path.relative_to(output_dir).as_posix()
+        except ValueError:
+            old_rel = ""
+        if old_rel:
+            result = _run_git(
+                output_dir, "ls-files", "-z", "--", old_rel, check=False
+            )
+            if result is not None and result.stdout.strip("\0"):
+                tracked_rel = [
+                    p for p in result.stdout.strip("\0").split("\0") if p
+                ]
+
+    shutil.move(str(old_path), str(new_path))
+
+    if tracked_rel:
+        # Stage new locations and remove old. Git's rename detection at
+        # log/diff time picks this up as a rename based on content similarity.
+        new_rel_paths: list[str] = []
+        for rel in tracked_rel:
+            try:
+                rest = Path(rel).relative_to(old_path.relative_to(output_dir))
+            except ValueError:
+                continue
+            new_rel = (new_path.relative_to(output_dir) / rest).as_posix()
+            new_rel_paths.append(new_rel)
+
+        for batch in _chunked_paths(new_rel_paths):
+            _run_git(output_dir, "add", "--", *batch)
+        for batch in _chunked_paths(tracked_rel):
+            # --ignore-unmatch in case a stale entry refers to a file that
+            # was deleted between ls-files and now.
+            _run_git(
+                output_dir,
+                "rm",
+                "--quiet",
+                "--ignore-unmatch",
+                "--",
+                *batch,
+            )
+
+    return True
+
+
+def _prune_empty_dirs(start: Path, stop: Path) -> None:
+    """Remove empty directories from `start` upward, stopping at `stop`.
+
+    A directory containing a `.workspace/` subdirectory (with any content)
+    is treated as non-empty so user content under an orphan path stays put
+    until the user removes it themselves.
+    """
+    try:
+        stop_resolved = stop.resolve()
+    except OSError:
+        return
+
+    current = start
+    while True:
+        try:
+            current_resolved = current.resolve()
+        except OSError:
+            return
+        if current_resolved == stop_resolved:
+            return
+        if not current.is_dir():
+            return
+        # Don't remove a directory whose only contents are a non-empty
+        # `.workspace/` subtree — that's user data we shouldn't touch.
+        children = list(current.iterdir())
+        if any(child.name == ".workspace" and any(child.iterdir()) for child in children):
+            return
+        if children:
+            return
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
