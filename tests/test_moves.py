@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from confluence_export.exporter import Exporter
-from confluence_export.git import _prune_empty_dirs, ensure_repo, relocate_subtree
+from confluence_export.git import _prune_empty_dirs, relocate_subtree
 from confluence_export.types import CachedSpace, Page, Space, Version
 
 
@@ -302,6 +302,71 @@ class TestNewDirWritesManifest:
         raw = json.loads(mpath.read_text())
         assert raw["pages"]["p"]["path"] == "Page"
         assert raw["pages"]["p"]["title"] == "Page"
+
+
+class TestEmptyOldParentPruned:
+    def test_relocation_prunes_empty_parent_in_non_git_mode(self, tmp_path):
+        """Issue #17 requires the old path to leave no stale directory behind,
+        including the empty parent dir, even when output_dir is not a git repo."""
+        exporter, cache = _make_exporter()
+        a = _make_page("a", "ParentA")
+        a.status = "folder"
+        p = _make_page("p", "MyPage", parent_id="a")
+        _run_export(exporter, cache, [a, p], tmp_path)
+
+        b = _make_page("b", "ParentB")
+        p2 = _make_page("p", "MyPage", parent_id="b")
+        exporter2, cache2 = _make_exporter()
+        _run_export(exporter2, cache2, [b, p2], tmp_path)
+
+        # The whole ParentA chain is gone — relocate_subtree prunes upward
+        # until it hits output_dir or a dir with .workspace content.
+        assert not (tmp_path / "ParentA").exists()
+
+
+class TestOrphanParkRecovery:
+    def test_orphan_park_with_known_page_id_restored(self, tmp_path):
+        """A .__conex_tmp_<id> dir left by a crashed prior run is moved back
+        to the manifest path so its workspace content survives."""
+        exporter, cache = _make_exporter()
+        a = _make_page("a", "ParentA")
+        p = _make_page("p", "MyPage", parent_id="a")
+        _run_export(exporter, cache, [a, p], tmp_path)
+
+        # Simulate a crashed swap: MyPage's directory got parked.
+        page_dir = tmp_path / "ParentA" / "MyPage"
+        park = tmp_path / ".__conex_tmp_p"
+        # Move workspace content + md into the park to simulate the partial state
+        park.mkdir()
+        ws = park / ".workspace"
+        ws.mkdir()
+        (ws / "data.txt").write_text("user data")
+        # Remove the real page dir to simulate it was parked
+        import shutil as _sh
+        _sh.rmtree(page_dir)
+
+        # Re-export: the sweep should recover the park into the manifest path
+        exporter2, cache2 = _make_exporter()
+        _run_export(exporter2, cache2, [a, p], tmp_path)
+
+        # Workspace content restored, park gone
+        assert (tmp_path / "ParentA" / "MyPage" / ".workspace" / "data.txt").exists()
+        assert not park.exists()
+
+    def test_orphan_park_with_unknown_page_id_dropped(self, tmp_path):
+        """A .__conex_tmp_<id> dir whose page_id isn't in the manifest is dropped."""
+        exporter, cache = _make_exporter()
+        p = _make_page("p", "MyPage")
+        _run_export(exporter, cache, [p], tmp_path)
+
+        # Park for a totally unknown page id
+        park = tmp_path / ".__conex_tmp_unknown999"
+        park.mkdir()
+        (park / "junk.md").write_text("nope")
+
+        exporter2, cache2 = _make_exporter()
+        _run_export(exporter2, cache2, [p], tmp_path)
+        assert not park.exists()
 
 
 class TestDeletedPageWorkspacePreserved:

@@ -160,16 +160,6 @@ def _remove_stale_files(output_dir: Path, written_files: list[Path]) -> None:
     _prune_empty_dirs(output_dir, output_dir)
 
 
-def _has_path_in_git(repo_dir: Path, rel_path: str) -> bool:
-    """Return True if rel_path is tracked in the repo."""
-    if not _has_commits(repo_dir):
-        return False
-    result = _run_git(
-        repo_dir, "ls-files", "--error-unmatch", "--", rel_path, check=False
-    )
-    return result is not None and result.returncode == 0
-
-
 def relocate_subtree(
     old_path: Path, new_path: Path, *, output_dir: Path, use_git: bool
 ) -> bool:
@@ -247,15 +237,21 @@ def relocate_subtree(
                 *batch,
             )
 
+    # Issue #17 requires the old path to leave no stale directory behind.
+    # In git mode commit_export's stale-removal pass also prunes; doing it
+    # here makes non-git output dirs behave consistently with the spec.
+    _prune_empty_dirs(old_path.parent, output_dir)
+
     return True
 
 
 def _prune_empty_dirs(start: Path, stop: Path) -> None:
     """Remove empty directories from `start` upward, stopping at `stop`.
 
-    A directory containing a `.workspace/` subdirectory (with any content)
-    is treated as non-empty so user content under an orphan path stays put
-    until the user removes it themselves.
+    A directory with a non-empty `.workspace/` subtree is treated as
+    user content and left alone. An empty `.workspace/` is fair game:
+    the exporter recreates it on demand, so removing it during a prune
+    can't lose user data.
     """
     try:
         stop_resolved = stop.resolve()
@@ -272,13 +268,23 @@ def _prune_empty_dirs(start: Path, stop: Path) -> None:
             return
         if not current.is_dir():
             return
-        # Don't remove a directory whose only contents are a non-empty
-        # `.workspace/` subtree — that's user data we shouldn't touch.
         children = list(current.iterdir())
-        if any(child.name == ".workspace" and any(child.iterdir()) for child in children):
+        has_user_workspace = any(
+            c.name == ".workspace" and c.is_dir() and any(c.iterdir())
+            for c in children
+        )
+        if has_user_workspace:
             return
-        if children:
+        non_workspace = [c for c in children if c.name != ".workspace"]
+        if non_workspace:
             return
+        # Children, if any, are empty `.workspace/` dirs — prune them too.
+        for c in children:
+            if c.name == ".workspace" and c.is_dir():
+                try:
+                    c.rmdir()
+                except OSError:
+                    return
         try:
             current.rmdir()
         except OSError:

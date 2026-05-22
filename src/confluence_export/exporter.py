@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -64,7 +65,6 @@ class _ExportRun:
     output_dir: Path
     use_git: bool
     manifest: dict[str, _ManifestEntry] = field(default_factory=dict)
-    desired_paths: dict[str, str] = field(default_factory=dict)  # page_id → on-disk path
     relocated: int = 0
     disambiguated: int = 0
 
@@ -166,6 +166,12 @@ class Exporter:
             manifest=self._load_manifest(output_dir, space.key),
         )
 
+        # Sweep any tmp parking dirs left by a prior aborted run. They sit
+        # at output_dir/.__conex_tmp_<page_id>; if the page_id still exists
+        # in the manifest we can recover its content into the manifest path
+        # so the user doesn't lose .workspace data, otherwise just delete.
+        self._sweep_orphan_parks(run)
+
         if path_filter:
             node = find_node_by_path(roots, path_filter)
             if not node:
@@ -250,7 +256,6 @@ class Exporter:
             page_id = node.page.id
             new_dir = parent_dir / name
             new_rel = new_dir.relative_to(run.output_dir).as_posix()
-            run.desired_paths[page_id] = new_rel
 
             entry = run.manifest.get(page_id)
             if entry is None or entry.path == new_rel:
@@ -471,6 +476,33 @@ class Exporter:
             elif entry.path.startswith(old_prefix + "/"):
                 entry.path = new_prefix + entry.path[len(old_prefix):]
 
+    def _sweep_orphan_parks(self, run: _ExportRun) -> None:
+        """Recover or remove .__conex_tmp_<id> dirs left by a crashed prior run.
+
+        If the parked page_id is in the manifest, move the dir back to its
+        recorded path so its .workspace/ content is preserved for the
+        current run's reconciliation. Otherwise drop the orphan.
+        """
+        if not run.output_dir.is_dir():
+            return
+        prefix = ".__conex_tmp_"
+        for child in run.output_dir.iterdir():
+            if not child.is_dir() or not child.name.startswith(prefix):
+                continue
+            page_id = child.name[len(prefix):]
+            entry = run.manifest.get(page_id)
+            if entry is None:
+                # No record of where it came from — drop the orphan.
+                shutil.rmtree(child, ignore_errors=True)
+                continue
+            target = run.output_dir / entry.path
+            if target.exists():
+                # Manifest path is occupied; can't safely restore. Drop.
+                shutil.rmtree(child, ignore_errors=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            relocate_subtree(child, target, output_dir=run.output_dir, use_git=run.use_git)
+
     def _finalize(self, run: _ExportRun, result: ExportResult, space_key: str) -> None:
         """Write manifest, transfer run-level counters onto the result."""
         result.relocated = run.relocated
@@ -553,7 +585,15 @@ class Exporter:
 
 
 def _matches_base_with_suffix(candidate: str, base_name: str) -> bool:
-    """Return True if `candidate` looks like `base_name` plus an optional -N suffix."""
+    """Decide whether the manifest's previous name is reusable for this title.
+
+    Returns True when `candidate` equals `base_name` exactly or when it has the
+    shape of a disambiguated leaf (`<anything>-<digits>`). The latter case is
+    deliberately loose: the page_id link in the manifest is authoritative, so
+    if a page was previously stored at e.g. `page-one-2` and its title now
+    sanitizes to a different base, we still prefer the stable on-disk name
+    over churning the directory on every re-export.
+    """
     if candidate == base_name:
         return True
     return re.fullmatch(r".+-\d+", candidate) is not None
