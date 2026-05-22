@@ -48,14 +48,41 @@ _EMOTICON_MAP = {
 }
 
 
-def sanitize_filename(title: str) -> str:
-    """Convert a page title to a safe directory/file name."""
+MAX_FILENAME_LEN = 100
+
+
+def sanitize_base(title: str) -> str:
+    """Sanitize a title to a safe base name, without length capping.
+
+    Length capping is handled by `truncate_with_suffix` so the collision
+    allocator can reserve room for a numeric suffix.
+    """
     name = re.sub(r"[^\w\s-]", "", title)
     name = re.sub(r"[-\s]+", "-", name)
     name = name.strip("-")
-    if len(name) > 100:
-        name = name[:100].rstrip("-")
     return name or "untitled"
+
+
+def truncate_with_suffix(base: str, suffix: str = "", max_len: int = MAX_FILENAME_LEN) -> str:
+    """Truncate `base` so `base + suffix` fits within `max_len`.
+
+    The suffix is reserved up front; the base shrinks to make room. After
+    truncation, any trailing hyphens on the base are stripped so the
+    concatenation does not produce e.g. "foo--2".
+    """
+    room = max_len - len(suffix)
+    if room <= 0:
+        # Suffix alone exceeds the cap — return it as-is and let the caller
+        # decide. In practice this never happens for our `-N` suffixes.
+        return suffix
+    if len(base) > room:
+        base = base[:room].rstrip("-")
+    return base + suffix
+
+
+def sanitize_filename(title: str) -> str:
+    """Back-compat wrapper: sanitize and cap at MAX_FILENAME_LEN with no suffix."""
+    return truncate_with_suffix(sanitize_base(title))
 
 
 def convert_page(
