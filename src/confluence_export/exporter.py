@@ -670,14 +670,18 @@ class Exporter:
 
 def _is_safe_manifest_path(rel: str, output_dir: Path) -> bool:
     """Reject manifest paths that would drive Phase B into operating on
-    output_dir itself or anything outside it.
+    output_dir itself, anything outside it, or reserved dot-prefixed
+    siblings like .git, .workspace, or our own manifest.
 
-    Rejects empty, `.`, absolute paths, and paths that resolve outside
-    output_dir via `..` segments. A page directory must always be a
-    proper subdirectory of output_dir; otherwise relocate_subtree would
-    target output_dir (or worse) and either crash or destroy state.
+    Sanitize_base strips dots from page titles, so a legitimate page dir
+    can never have a dot-prefixed segment. Any manifest entry that
+    points at one is corrupt or malicious and must be rejected before
+    Phase B tries to relocate it.
     """
     if not rel or rel == "." or rel.startswith("/"):
+        return False
+    parts = rel.split("/")
+    if any(seg.startswith(".") or seg in ("", "..") for seg in parts):
         return False
     try:
         target = (output_dir / rel).resolve()

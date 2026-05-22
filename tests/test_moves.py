@@ -555,6 +555,53 @@ class TestManifestPathSafety:
         _run_export(exporter, cache, [p], tmp_path)
         assert (tmp_path / "Page" / "Page.md").exists()
 
+    def test_manifest_with_dot_prefixed_segment_ignored(self, tmp_path):
+        """A manifest entry pointing at a dot-prefixed dir like .git
+        must be rejected. sanitize_base strips dots, so no legitimate
+        page can produce such a path — only corruption or attack would.
+        Without this guard Phase B would shutil.move(.git → Page/) and
+        destroy the repo metadata."""
+        # Set up a real git repo so .git actually exists at output_dir
+        import subprocess
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+        assert (tmp_path / ".git").is_dir()
+
+        manifest_file = tmp_path / ".test.path_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "version": 1,
+            "space_key": "TEST",
+            "pages": {
+                "p": {"path": ".git", "title": "Page", "parent_id": "", "is_folder": False},
+            },
+        }, indent=2, sort_keys=True) + "\n")
+
+        p = _make_page("p", "Page")
+        exporter, cache = _make_exporter()
+        _run_export(exporter, cache, [p], tmp_path)
+
+        # .git survives, page lands at its legitimate spot
+        assert (tmp_path / ".git").is_dir()
+        assert (tmp_path / "Page" / "Page.md").exists()
+        # And nothing got moved into the page dir from .git
+        assert not (tmp_path / "Page" / "HEAD").exists()
+
+    def test_manifest_with_nested_dot_segment_ignored(self, tmp_path):
+        """Even if only an inner segment is dot-prefixed (e.g. Foo/.git/bar),
+        reject the entry — no legitimate sanitized page name starts with a dot."""
+        manifest_file = tmp_path / ".test.path_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "version": 1,
+            "space_key": "TEST",
+            "pages": {
+                "p": {"path": "Foo/.workspace/inner", "title": "Page", "parent_id": "", "is_folder": False},
+            },
+        }, indent=2, sort_keys=True) + "\n")
+
+        p = _make_page("p", "Page")
+        exporter, cache = _make_exporter()
+        _run_export(exporter, cache, [p], tmp_path)
+        assert (tmp_path / "Page" / "Page.md").exists()
+
     def test_manifest_with_parent_traversal_ignored(self, tmp_path):
         """Manifest paths that escape output_dir via '..' must be rejected."""
         manifest_file = tmp_path / ".test.path_manifest.json"
