@@ -394,7 +394,7 @@ class Exporter:
                 raw = json.loads(mpath.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 raw = None
-            if isinstance(raw, dict) and "pages" in raw:
+            if isinstance(raw, dict) and isinstance(raw.get("pages"), dict):
                 entries: dict[str, _ManifestEntry] = {}
                 for pid, row in raw["pages"].items():
                     if not isinstance(row, dict):
@@ -686,7 +686,9 @@ def _is_safe_manifest_path(rel: str, output_dir: Path) -> bool:
     try:
         target = (output_dir / rel).resolve()
         out = output_dir.resolve()
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError covers embedded null bytes in the path string —
+        # pathlib raises that rather than OSError on those.
         return False
     if target == out:
         return False

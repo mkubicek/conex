@@ -619,6 +619,40 @@ class TestManifestPathSafety:
         assert (tmp_path / "Page" / "Page.md").exists()
 
 
+class TestCorruptManifestRobustness:
+    def test_pages_as_list_does_not_crash(self, tmp_path):
+        """Manifest with pages serialized as a list (not dict) must fall
+        through to reconstruction instead of crashing on .items()."""
+        manifest_file = tmp_path / ".test.path_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "version": 1,
+            "space_key": "TEST",
+            "pages": ["this", "is", "wrong"],
+        }) + "\n")
+
+        p = _make_page("p", "Page")
+        exporter, cache = _make_exporter()
+        _run_export(exporter, cache, [p], tmp_path)
+        assert (tmp_path / "Page" / "Page.md").exists()
+
+    def test_path_with_null_byte_does_not_crash(self, tmp_path):
+        """A path with embedded null bytes makes Path.resolve raise
+        ValueError, not OSError. _is_safe_manifest_path must catch both."""
+        manifest_file = tmp_path / ".test.path_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "version": 1,
+            "space_key": "TEST",
+            "pages": {
+                "p": {"path": "Foo\u0000Bar", "title": "X", "parent_id": "", "is_folder": False},
+            },
+        }) + "\n")
+
+        p = _make_page("p", "Page")
+        exporter, cache = _make_exporter()
+        _run_export(exporter, cache, [p], tmp_path)
+        assert (tmp_path / "Page" / "Page.md").exists()
+
+
 class TestNestedWorkspacePreserved:
     def test_recursive_workspace_check_preserves_nested_data(self, tmp_path):
         """A parked subtree where the parent's .workspace is empty but a
