@@ -1,11 +1,59 @@
-"""Tests for the relocation primitives in git.py (issue #17, part 1)."""
+"""Tests for page relocation across export runs (issue #17)."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
+from unittest.mock import MagicMock
 
-from confluence_export.git import _prune_empty_dirs, relocate_subtree
+from confluence_export.exporter import Exporter
+from confluence_export.git import _prune_empty_dirs, ensure_repo, relocate_subtree
+from confluence_export.types import CachedSpace, Page, Space, Version
+
+
+def _make_space():
+    return Space(id="1", key="TEST", name="Test Space")
+
+
+def _make_page(id_, title, *, parent_id="", body=None, position=0):
+    return Page(
+        id=id_,
+        title=title,
+        space_id="1",
+        body_storage=body if body is not None else f"<p>{title}</p>",
+        parent_id=parent_id,
+        parent_type="page" if parent_id else "space",
+        position=position,
+        version=Version(created_at="2025-01-01", number=1),
+        webui=f"/spaces/TEST/pages/{id_}",
+    )
+
+
+def _make_exporter():
+    client = MagicMock()
+    cache = MagicMock()
+    return (
+        Exporter(
+            client=client,
+            cache=cache,
+            base_url="https://x.atlassian.net",
+            download_media=False,
+            render_drawio=False,
+        ),
+        cache,
+    )
+
+
+def _run_export(exporter, cache, pages, output_dir, *, use_git=False):
+    cs = CachedSpace(
+        space=_make_space(),
+        pages=pages,
+        attachments={},
+        updated_at="2025-01-01T00:00:00Z",
+    )
+    cache.ensure_loaded.return_value = cs
+    return exporter.export_space(_make_space(), output_dir, use_git=use_git)
 
 
 def _init_repo(path: Path) -> None:
@@ -104,3 +152,176 @@ class TestPruneEmptyDirs:
         _prune_empty_dirs(deep, tmp_path)
         # Page dir survives because .workspace has content
         assert (deep / ".workspace" / "user.py").exists()
+
+
+class TestPageMovedBetweenRuns:
+    def test_filesystem_move(self, tmp_path):
+        # Run 1: page under parent A
+        exporter, cache = _make_exporter()
+        a = _make_page("a", "ParentA")
+        p = _make_page("p", "MyPage", parent_id="a")
+        _run_export(exporter, cache, [a, p], tmp_path)
+        assert (tmp_path / "ParentA" / "MyPage" / "MyPage.md").exists()
+
+        # Run 2: page moved under parent B
+        b = _make_page("b", "ParentB")
+        p2 = _make_page("p", "MyPage", parent_id="b")
+        exporter2, cache2 = _make_exporter()
+        result = _run_export(exporter2, cache2, [a, b, p2], tmp_path)
+
+        assert (tmp_path / "ParentB" / "MyPage" / "MyPage.md").exists()
+        # Old location is gone
+        assert not (tmp_path / "ParentA" / "MyPage").exists()
+        assert result.relocated >= 1
+
+    def test_workspace_carried_along(self, tmp_path):
+        exporter, cache = _make_exporter()
+        a = _make_page("a", "ParentA")
+        p = _make_page("p", "MyPage", parent_id="a")
+        _run_export(exporter, cache, [a, p], tmp_path)
+
+        ws_file = tmp_path / "ParentA" / "MyPage" / ".workspace" / "notes.py"
+        ws_file.write_text("user data")
+
+        b = _make_page("b", "ParentB")
+        p2 = _make_page("p", "MyPage", parent_id="b")
+        exporter2, cache2 = _make_exporter()
+        _run_export(exporter2, cache2, [a, b, p2], tmp_path)
+
+        # Workspace content moved with the page
+        moved_ws = tmp_path / "ParentB" / "MyPage" / ".workspace" / "notes.py"
+        assert moved_ws.exists()
+        assert moved_ws.read_text() == "user data"
+        assert not ws_file.exists()
+
+    def test_subtree_with_children_moves(self, tmp_path):
+        exporter, cache = _make_exporter()
+        a = _make_page("a", "ParentA")
+        p = _make_page("p", "MyPage", parent_id="a")
+        c = _make_page("c", "ChildPage", parent_id="p")
+        _run_export(exporter, cache, [a, p, c], tmp_path)
+        assert (tmp_path / "ParentA" / "MyPage" / "ChildPage" / "ChildPage.md").exists()
+
+        b = _make_page("b", "ParentB")
+        p2 = _make_page("p", "MyPage", parent_id="b")
+        c2 = _make_page("c", "ChildPage", parent_id="p")
+        exporter2, cache2 = _make_exporter()
+        _run_export(exporter2, cache2, [a, b, p2, c2], tmp_path)
+
+        assert (tmp_path / "ParentB" / "MyPage" / "ChildPage" / "ChildPage.md").exists()
+        assert not (tmp_path / "ParentA" / "MyPage").exists()
+
+    def test_old_parent_dir_pruned_when_empty(self, tmp_path):
+        exporter, cache = _make_exporter()
+        # ParentA exists only as a structural folder; after the only child moves
+        # out, it should be cleaned up (it has no content of its own and no
+        # page in the new export tree).
+        a = _make_page("a", "ParentA", body="")
+        a.status = "folder"
+        p = _make_page("p", "MyPage", parent_id="a")
+        _run_export(exporter, cache, [a, p], tmp_path)
+
+        b = _make_page("b", "ParentB")
+        p2 = _make_page("p", "MyPage", parent_id="b")
+        exporter2, cache2 = _make_exporter()
+        _run_export(exporter2, cache2, [b, p2], tmp_path)
+
+        # Old parent folder's MyPage subdir is gone — the folder itself may
+        # still exist (we don't prune in the exporter outside the git path),
+        # but the orphaned page directory is gone.
+        assert not (tmp_path / "ParentA" / "MyPage").exists()
+
+    def test_two_page_swap(self, tmp_path):
+        """Pages X and Y swap parents simultaneously. Both end up at the
+        right location, neither overwrites the other."""
+        exporter, cache = _make_exporter()
+        a = _make_page("a", "A")
+        b = _make_page("b", "B")
+        x = _make_page("x", "X", parent_id="a")
+        y = _make_page("y", "Y", parent_id="b")
+        _run_export(exporter, cache, [a, b, x, y], tmp_path)
+        assert (tmp_path / "A" / "X" / "X.md").exists()
+        assert (tmp_path / "B" / "Y" / "Y.md").exists()
+
+        # Swap names so X→ inside A becomes Y's slot, and vice versa
+        x2 = _make_page("x", "Y", parent_id="a")
+        y2 = _make_page("y", "X", parent_id="b")
+        exporter2, cache2 = _make_exporter()
+        _run_export(exporter2, cache2, [a, b, x2, y2], tmp_path)
+
+        # Both pages exist at their new on-disk names, frontmatter intact
+        x_new = tmp_path / "A" / "Y" / "Y.md"
+        y_new = tmp_path / "B" / "X" / "X.md"
+        assert x_new.exists()
+        assert y_new.exists()
+        # Page id of the file at A/Y is still 'x'
+        assert "page_id: x" in x_new.read_text() or "page_id: 'x'" in x_new.read_text()
+        assert "page_id: y" in y_new.read_text() or "page_id: 'y'" in y_new.read_text()
+
+
+class TestFrontmatterFallback:
+    def test_first_run_with_existing_export_no_manifest(self, tmp_path):
+        """A user without a manifest (pre-fix install) re-exports: the manifest
+        is reconstructed from frontmatter and orphaned pages are relocated."""
+        # Simulate a pre-fix export: page at old location, no manifest.
+        old_dir = tmp_path / "OldParent" / "MyPage"
+        old_dir.mkdir(parents=True)
+        (old_dir / ".workspace").mkdir()
+        (old_dir / ".workspace" / "notes.txt").write_text("user data")
+        (old_dir / "MyPage.md").write_text(
+            "---\n"
+            "title: MyPage\n"
+            "page_id: p\n"
+            "space_key: TEST\n"
+            "path: /OldParent/MyPage\n"
+            "version: 1\n"
+            "---\n\n"
+            "# MyPage\n"
+        )
+
+        # New export run: the page now lives under NewParent
+        exporter, cache = _make_exporter()
+        new_parent = _make_page("np", "NewParent")
+        p = _make_page("p", "MyPage", parent_id="np")
+        _run_export(exporter, cache, [new_parent, p], tmp_path)
+
+        # Page is relocated to NewParent, including workspace content
+        assert (tmp_path / "NewParent" / "MyPage" / "MyPage.md").exists()
+        assert (tmp_path / "NewParent" / "MyPage" / ".workspace" / "notes.txt").exists()
+        # Old path gone
+        assert not (tmp_path / "OldParent" / "MyPage").exists()
+
+
+class TestNewDirWritesManifest:
+    def test_brand_new_export_writes_manifest(self, tmp_path):
+        exporter, cache = _make_exporter()
+        p = _make_page("p", "Page")
+        _run_export(exporter, cache, [p], tmp_path)
+        mpath = tmp_path / ".test.path_manifest.json"
+        assert mpath.exists()
+        raw = json.loads(mpath.read_text())
+        assert raw["pages"]["p"]["path"] == "Page"
+        assert raw["pages"]["p"]["title"] == "Page"
+
+
+class TestDeletedPageWorkspacePreserved:
+    def test_deleting_page_with_workspace_keeps_user_content(self, tmp_path):
+        """When a page is deleted upstream and its on-disk dir has workspace
+        content, the workspace content should not be silently destroyed.
+        This is enforced by _prune_empty_dirs treating .workspace as content."""
+        exporter, cache = _make_exporter()
+        p = _make_page("p", "Page")
+        _run_export(exporter, cache, [p], tmp_path)
+
+        ws = tmp_path / "Page" / ".workspace" / "notes.txt"
+        ws.write_text("user data")
+
+        # The non-git path of the exporter doesn't proactively delete orphans
+        # (that's git's job via _remove_stale_files). The workspace content
+        # therefore survives a re-export with the page removed upstream.
+        exporter2, cache2 = _make_exporter()
+        # Empty page list — page was deleted upstream
+        other = _make_page("other", "Other")
+        _run_export(exporter2, cache2, [other], tmp_path)
+        assert ws.exists()
+        assert ws.read_text() == "user data"

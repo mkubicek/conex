@@ -512,6 +512,7 @@ def _cmd_export(
         no_children=no_children,
         force_refresh=force_refresh,
         include_archived=include_archived,
+        use_git=use_git,
     )
 
     # Git: post-export
@@ -520,7 +521,15 @@ def _cmd_export(
 
         commit_export(out, result.written_files, space_key)
 
-    print(f"\nExported {result.count} page(s) to {out.resolve()}")
+    summary = f"\nExported {result.count} page(s) to {out.resolve()}"
+    extras: list[str] = []
+    if result.relocated:
+        extras.append(f"relocated {result.relocated}")
+    if result.disambiguated:
+        extras.append(f"disambiguated {result.disambiguated}")
+    if extras:
+        summary += f" ({', '.join(extras)})"
+    print(summary)
 
 
 def _cmd_diff(

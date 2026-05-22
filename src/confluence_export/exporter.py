@@ -24,6 +24,7 @@ from confluence_export.drawio import (
     render_drawio_to_png,
     replace_drawio_placeholders,
 )
+from confluence_export.git import relocate_subtree
 from confluence_export.media import download_attachments, ensure_media_dir
 from confluence_export.tree import (
     build_tree,
@@ -61,7 +62,10 @@ class _ExportRun:
     """Mutable state shared across a single export_space invocation."""
 
     output_dir: Path
+    use_git: bool
     manifest: dict[str, _ManifestEntry] = field(default_factory=dict)
+    desired_paths: dict[str, str] = field(default_factory=dict)  # page_id → on-disk path
+    relocated: int = 0
     disambiguated: int = 0
 
 
@@ -140,6 +144,7 @@ class Exporter:
         no_children: bool = False,
         force_refresh: bool = False,
         include_archived: bool = False,
+        use_git: bool = False,
     ) -> ExportResult:
         """Export a space (or subtree) to output_dir."""
         # Ensure cache
@@ -157,6 +162,7 @@ class Exporter:
 
         run = _ExportRun(
             output_dir=output_dir,
+            use_git=use_git,
             manifest=self._load_manifest(output_dir, space.key),
         )
 
@@ -200,11 +206,12 @@ class Exporter:
         run: _ExportRun,
         depth: int,
     ) -> ExportResult:
-        """Export a list of siblings under parent_dir.
+        """Export a list of siblings under parent_dir in three phases.
 
-        Two phases per parent:
-        A. Allocate all names up front (collision-safe).
-        B. Write each page and recurse.
+        A. Allocate all names per parent (collision-safe).
+        B. Pre-write relocate: any sibling whose manifest path differs from
+           its desired path is moved before any new content is written.
+        C. Write + recurse.
         """
         # Phase A — allocate stable names
         taken: set[str] = set()
@@ -237,8 +244,70 @@ class Exporter:
         order = {id(n): i for i, n in enumerate(siblings)}
         allocations.sort(key=lambda pair: order[id(pair[0])])
 
-        # Phase B — write each sibling and recurse into its children.
+        # Phase B — relocate any sibling whose recorded path differs.
         result = ExportResult()
+        for node, name in allocations:
+            page_id = node.page.id
+            new_dir = parent_dir / name
+            new_rel = new_dir.relative_to(run.output_dir).as_posix()
+            run.desired_paths[page_id] = new_rel
+
+            entry = run.manifest.get(page_id)
+            if entry is None or entry.path == new_rel:
+                continue
+            old_dir = run.output_dir / entry.path
+            if not old_dir.exists():
+                # Already gone (manual delete or partial prior run): nothing
+                # to relocate. The write phase will create new_dir fresh.
+                continue
+            if new_dir.exists():
+                # Park the conflicting sibling through a tmp slot. The other
+                # page will park itself the same way before its own move,
+                # so the cycle resolves in two passes.
+                park = run.output_dir / f".__conex_tmp_{page_id}"
+                if not park.exists():
+                    relocate_subtree(
+                        old_dir, park, output_dir=run.output_dir, use_git=run.use_git
+                    )
+                # Update manifest in-memory so the second pass finds it.
+                self._rewrite_manifest_prefix(
+                    run.manifest, entry.path, park.relative_to(run.output_dir).as_posix()
+                )
+                continue
+
+            moved = relocate_subtree(
+                old_dir, new_dir, output_dir=run.output_dir, use_git=run.use_git
+            )
+            if moved:
+                run.relocated += 1
+                # Update in-memory manifest so descendants don't trigger
+                # spurious follow-up relocations.
+                self._rewrite_manifest_prefix(run.manifest, entry.path, new_rel)
+
+        # Second pass: drain any parked entries into their final slots.
+        for node, name in allocations:
+            page_id = node.page.id
+            park = run.output_dir / f".__conex_tmp_{page_id}"
+            if not park.exists():
+                continue
+            new_dir = parent_dir / name
+            if new_dir.exists():
+                print(
+                    f"  Warning: cannot drain parked {park} → {new_dir}: "
+                    f"destination exists",
+                    file=sys.stderr,
+                )
+                continue
+            new_rel = new_dir.relative_to(run.output_dir).as_posix()
+            old_rel = park.relative_to(run.output_dir).as_posix()
+            moved = relocate_subtree(
+                park, new_dir, output_dir=run.output_dir, use_git=run.use_git
+            )
+            if moved:
+                run.relocated += 1
+                self._rewrite_manifest_prefix(run.manifest, old_rel, new_rel)
+
+        # Phase C — write each sibling and recurse into its children.
         for node, name in allocations:
             page = node.page
             page_dir = parent_dir / name
@@ -383,8 +452,28 @@ class Exporter:
         mpath.write_text(text, encoding="utf-8")
         return mpath
 
+    def _rewrite_manifest_prefix(
+        self,
+        manifest: dict[str, _ManifestEntry],
+        old_prefix: str,
+        new_prefix: str,
+    ) -> None:
+        """Rewrite manifest entries whose path starts with old_prefix.
+
+        Used after a subtree relocation so descendants don't trigger spurious
+        follow-up relocations during the same export run.
+        """
+        if old_prefix == new_prefix:
+            return
+        for pid, entry in manifest.items():
+            if entry.path == old_prefix:
+                entry.path = new_prefix
+            elif entry.path.startswith(old_prefix + "/"):
+                entry.path = new_prefix + entry.path[len(old_prefix):]
+
     def _finalize(self, run: _ExportRun, result: ExportResult, space_key: str) -> None:
         """Write manifest, transfer run-level counters onto the result."""
+        result.relocated = run.relocated
         result.disambiguated = run.disambiguated
         if not result.written_files and not run.manifest:
             return
