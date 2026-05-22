@@ -182,10 +182,10 @@ class Exporter:
                 files = self._export_single_page(node.page, output_dir, cs, space.key)
                 result.count += 1 if files else 0
                 result.written_files.extend(files)
-                self._finalize(run, result, space.key)
+                self._finalize(run, result, space.key, cs)
                 return result
             result = self._export_siblings([node], output_dir, cs, space.key, run, depth=0)
-            self._finalize(run, result, space.key)
+            self._finalize(run, result, space.key, cs)
             return result
 
         if no_children:
@@ -194,11 +194,11 @@ class Exporter:
                 files = self._export_single_page(node.page, output_dir, cs, space.key)
                 result.count += 1 if files else 0
                 result.written_files.extend(files)
-            self._finalize(run, result, space.key)
+            self._finalize(run, result, space.key, cs)
             return result
 
         result = self._export_siblings(roots, output_dir, cs, space.key, run, depth=0)
-        self._finalize(run, result, space.key)
+        self._finalize(run, result, space.key, cs)
         return result
 
     # ------------------------------------------------------------------ siblings
@@ -552,10 +552,38 @@ class Exporter:
             file=sys.stderr,
         )
 
-    def _finalize(self, run: _ExportRun, result: ExportResult, space_key: str) -> None:
-        """Write manifest, transfer run-level counters onto the result."""
+    def _finalize(
+        self,
+        run: _ExportRun,
+        result: ExportResult,
+        space_key: str,
+        cs: CachedSpace,
+    ) -> None:
+        """Prune stale manifest entries, transfer run counters, write manifest.
+
+        Two signals decide a prune:
+        - The page id is absent from cs.pages (gone from this run's API view).
+        - Either we had full visibility (include_archived=True, so the
+          absence is definitive) or the on-disk page directory is also
+          gone (no content left to track).
+
+        Conservative when in doubt: an archived page that disappeared from
+        a non-archive-aware run but whose dir still sits on disk keeps
+        its entry, so a later include_archived run still finds it.
+        """
         result.relocated = run.relocated
         result.disambiguated = run.disambiguated
+
+        api_ids = {p.id for p in cs.pages}
+        full_visibility = cs.include_archived
+        for pid in list(run.manifest.keys()):
+            if pid in api_ids:
+                continue
+            entry = run.manifest[pid]
+            page_dir_exists = (run.output_dir / entry.path).is_dir()
+            if full_visibility or not page_dir_exists:
+                del run.manifest[pid]
+
         if not result.written_files and not run.manifest:
             return
         mpath = self._write_manifest(run.output_dir, space_key, run.manifest)

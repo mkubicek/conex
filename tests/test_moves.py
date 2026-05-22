@@ -619,6 +619,87 @@ class TestManifestPathSafety:
         assert (tmp_path / "Page" / "Page.md").exists()
 
 
+class TestManifestPruneStale:
+    def test_prunes_deleted_page_when_dir_also_gone(self, tmp_path):
+        """Page p exported, then re-export with only other (p deleted
+        from API) AND p's on-disk dir is also gone — entry pruned."""
+        exporter, cache = _make_exporter()
+        p = _make_page("p", "Page")
+        other = _make_page("other", "Other")
+        _run_export(exporter, cache, [p, other], tmp_path)
+
+        # Simulate git mode having cleaned the dir for the deleted page
+        import shutil as _sh
+        _sh.rmtree(tmp_path / "Page")
+
+        # Re-run with only other in API
+        exporter2, cache2 = _make_exporter()
+        _run_export(exporter2, cache2, [other], tmp_path)
+
+        manifest = json.loads((tmp_path / ".test.path_manifest.json").read_text())
+        assert "p" not in manifest["pages"]
+        assert "other" in manifest["pages"]
+
+    def test_prunes_deleted_page_with_full_visibility(self, tmp_path):
+        """include_archived=True means the API view is exhaustive. A page
+        absent from cs.pages is truly deleted — prune even if its on-disk
+        dir lingers."""
+        exporter, cache = _make_exporter()
+        p = _make_page("p", "Page")
+        other = _make_page("other", "Other")
+        # Run 1 with archive-aware mode so include_archived persists in CachedSpace
+        cs1 = CachedSpace(
+            space=_make_space(),
+            pages=[p, other],
+            attachments={},
+            updated_at="x",
+            include_archived=True,
+        )
+        cache.ensure_loaded.return_value = cs1
+        exporter.export_space(_make_space(), tmp_path, include_archived=True)
+        assert (tmp_path / "Page" / "Page.md").exists()
+
+        # Re-run with only other; p's dir intentionally NOT cleaned
+        cs2 = CachedSpace(
+            space=_make_space(),
+            pages=[other],
+            attachments={},
+            updated_at="x",
+            include_archived=True,
+        )
+        cache2 = MagicMock()
+        cache2.ensure_loaded.return_value = cs2
+        exporter2 = Exporter(
+            client=MagicMock(), cache=cache2,
+            base_url="https://x.atlassian.net",
+            download_media=False, render_drawio=False,
+        )
+        exporter2.export_space(_make_space(), tmp_path, include_archived=True)
+
+        manifest = json.loads((tmp_path / ".test.path_manifest.json").read_text())
+        # Full visibility + absence from API = pruned even though dir lingers
+        assert "p" not in manifest["pages"]
+        assert (tmp_path / "Page").exists()  # dir itself wasn't touched (non-git mode)
+
+    def test_preserves_entry_when_limited_visibility_and_dir_exists(self, tmp_path):
+        """include_archived=False + page absent from cs.pages + dir still
+        on disk: page might be archived rather than deleted. Conservative
+        rule keeps the entry so a later include_archived run still has it."""
+        exporter, cache = _make_exporter()
+        p = _make_page("p", "Page")
+        other = _make_page("other", "Other")
+        _run_export(exporter, cache, [p, other], tmp_path)
+        assert (tmp_path / "Page" / "Page.md").exists()
+
+        # Re-run with only other, default include_archived=False, p's dir lingers
+        exporter2, cache2 = _make_exporter()
+        _run_export(exporter2, cache2, [other], tmp_path)
+
+        manifest = json.loads((tmp_path / ".test.path_manifest.json").read_text())
+        # Conservative: entry kept (could be archive vs delete; we can't tell)
+        assert "p" in manifest["pages"]
+
+
 class TestCorruptManifestRobustness:
     def test_pages_as_list_does_not_crash(self, tmp_path):
         """Manifest with pages serialized as a list (not dict) must fall
