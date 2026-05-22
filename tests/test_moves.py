@@ -681,6 +681,47 @@ class TestManifestPruneStale:
         assert "p" not in manifest["pages"]
         assert (tmp_path / "Page").exists()  # dir itself wasn't touched (non-git mode)
 
+    def test_empty_cs_pages_does_not_nuke_manifest(self, tmp_path):
+        """An empty cs.pages is more likely a transient API/cache failure
+        than a real 'all pages deleted' event. Pruning would wipe the
+        whole manifest on a hiccup — skip the prune entirely when
+        cs.pages is empty."""
+        exporter, cache = _make_exporter()
+        p = _make_page("p", "Page")
+        other = _make_page("other", "Other")
+        # Even include_archived=True (full visibility) — must not prune
+        cs1 = CachedSpace(
+            space=_make_space(),
+            pages=[p, other],
+            attachments={},
+            updated_at="x",
+            include_archived=True,
+        )
+        cache.ensure_loaded.return_value = cs1
+        exporter.export_space(_make_space(), tmp_path, include_archived=True)
+
+        # Second run: API returns empty (simulating cache/auth failure)
+        cs_empty = CachedSpace(
+            space=_make_space(),
+            pages=[],
+            attachments={},
+            updated_at="x",
+            include_archived=True,
+        )
+        cache2 = MagicMock()
+        cache2.ensure_loaded.return_value = cs_empty
+        exporter2 = Exporter(
+            client=MagicMock(), cache=cache2,
+            base_url="https://x.atlassian.net",
+            download_media=False, render_drawio=False,
+        )
+        exporter2.export_space(_make_space(), tmp_path, include_archived=True)
+
+        # Manifest entries survived the empty-API hiccup
+        manifest = json.loads((tmp_path / ".test.path_manifest.json").read_text())
+        assert "p" in manifest["pages"]
+        assert "other" in manifest["pages"]
+
     def test_preserves_entry_when_limited_visibility_and_dir_exists(self, tmp_path):
         """include_archived=False + page absent from cs.pages + dir still
         on disk: page might be archived rather than deleted. Conservative

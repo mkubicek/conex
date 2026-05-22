@@ -574,15 +574,20 @@ class Exporter:
         result.relocated = run.relocated
         result.disambiguated = run.disambiguated
 
-        api_ids = {p.id for p in cs.pages}
-        full_visibility = cs.include_archived
-        for pid in list(run.manifest.keys()):
-            if pid in api_ids:
-                continue
-            entry = run.manifest[pid]
-            page_dir_exists = (run.output_dir / entry.path).is_dir()
-            if full_visibility or not page_dir_exists:
-                del run.manifest[pid]
+        # An empty cs.pages is far more often a transient API/cache failure
+        # than a real "every page deleted" event. Pruning here would nuke
+        # the entire manifest on a hiccup. Skip the prune entirely; a
+        # later healthy run will trim any stale entries.
+        if cs.pages:
+            api_ids = {p.id for p in cs.pages}
+            full_visibility = cs.include_archived
+            for pid in list(run.manifest.keys()):
+                if pid in api_ids:
+                    continue
+                entry = run.manifest[pid]
+                page_dir_exists = (run.output_dir / entry.path).is_dir()
+                if full_visibility or not page_dir_exists:
+                    del run.manifest[pid]
 
         if not result.written_files and not run.manifest:
             return
