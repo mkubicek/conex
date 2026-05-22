@@ -467,6 +467,98 @@ class TestOrphanParkRecovery:
         assert not park.exists()
 
 
+class TestStrayCleanupSpareUserFiles:
+    def test_user_placed_notes_md_survives_rename(self, tmp_path):
+        """A manually-placed notes.md at the top of a page_dir must NOT be
+        deleted by the stray-basename sweep — only files with our YAML
+        frontmatter (page_id key) get cleaned."""
+        exporter, cache = _make_exporter()
+        p = _make_page("p", "Foo")
+        _run_export(exporter, cache, [p], tmp_path)
+
+        # User adds a freeform notes.md alongside the export
+        user_notes = tmp_path / "Foo" / "notes.md"
+        user_notes.write_text("# my own notes\n\nrandom content")
+
+        # Rename in Confluence
+        p2 = _make_page("p", "Bar")
+        exporter2, cache2 = _make_exporter()
+        _run_export(exporter2, cache2, [p2], tmp_path)
+
+        # User's notes.md survived (still in the relocated dir)
+        assert (tmp_path / "Bar" / "notes.md").exists()
+        assert (tmp_path / "Bar" / "notes.md").read_text() == "# my own notes\n\nrandom content"
+        # And the stale Foo.md was cleaned
+        assert not (tmp_path / "Bar" / "Foo.md").exists()
+
+
+class TestQuarantineDropsManifestEntry:
+    def test_partial_swap_quarantine_does_not_misroute(self, tmp_path):
+        """Aborted two-page swap with .workspace data on the parked page.
+        After sweep quarantines the park, the manifest entry must be
+        dropped so Phase B doesn't relocate q's content thinking it
+        belongs to p. Result: both pages end at their correct desired
+        paths, p's quarantined workspace is preserved, and the git
+        rename audit doesn't lie about which content moved."""
+        # Construct the partial-run-2 state by hand:
+        #   A/X contains q's content (Y.md, page_id=q) — half-completed swap
+        #   .__conex_tmp_p contains p's content with workspace
+        #   manifest still says p→A/X, q→A/Y (pre-crash)
+        manifest_file = tmp_path / ".test.path_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "version": 1,
+            "space_key": "TEST",
+            "pages": {
+                "a": {"path": "A", "title": "A", "parent_id": "", "is_folder": True},
+                "p": {"path": "A/X", "title": "X", "parent_id": "a", "is_folder": False},
+                "q": {"path": "A/Y", "title": "Y", "parent_id": "a", "is_folder": False},
+            },
+        }, indent=2, sort_keys=True) + "\n")
+        a_dir = tmp_path / "A"
+        a_dir.mkdir()
+        (a_dir / ".workspace").mkdir()
+        # q's content sitting in p's old slot (partial swap state)
+        a_x = a_dir / "X"
+        a_x.mkdir()
+        (a_x / ".workspace").mkdir()
+        (a_x / "Y.md").write_text(
+            "---\ntitle: Y\npage_id: q\nspace_key: TEST\nversion: 1\n---\n# Y\n"
+        )
+        # p sitting in its tmp park, with user workspace data
+        park = tmp_path / ".__conex_tmp_p"
+        park.mkdir()
+        park_ws = park / ".workspace"
+        park_ws.mkdir()
+        (park_ws / "important.txt").write_text("MUST NOT LOSE")
+        (park / "X.md").write_text(
+            "---\ntitle: X\npage_id: p\nspace_key: TEST\nversion: 1\n---\n# X\n"
+        )
+
+        # Re-run export. API: p is now titled "Y", q is now titled "X".
+        a = _make_page("a", "A")
+        a.status = "folder"
+        p2 = _make_page("p", "Y", parent_id="a")
+        q2 = _make_page("q", "X", parent_id="a")
+        exporter, cache = _make_exporter()
+        _run_export(exporter, cache, [a, p2, q2], tmp_path)
+
+        # p's workspace data preserved in the orphan dir
+        orphan = tmp_path / ".__conex_orphan_p"
+        assert orphan.exists()
+        assert (orphan / ".workspace" / "important.txt").read_text() == "MUST NOT LOSE"
+
+        # Both pages ended at their correct paths
+        assert (tmp_path / "A" / "Y" / "Y.md").exists()
+        assert (tmp_path / "A" / "X" / "X.md").exists()
+
+        # Frontmatter at A/Y belongs to p (page_id=p), not q
+        a_y_md = (tmp_path / "A" / "Y" / "Y.md").read_text()
+        assert "page_id: p" in a_y_md
+        # And A/X belongs to q
+        a_x_md = (tmp_path / "A" / "X" / "X.md").read_text()
+        assert "page_id: q" in a_x_md
+
+
 class TestGitModeEmptyDirCleanup:
     def test_git_rm_prunes_empty_parent_chain(self, tmp_path):
         """In git mode, when a page is deleted upstream its markdown is
