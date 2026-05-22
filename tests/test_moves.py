@@ -492,6 +492,95 @@ class TestStrayCleanupSpareUserFiles:
         assert not (tmp_path / "Bar" / "Foo.md").exists()
 
 
+class TestNestedWorkspacePreserved:
+    def test_recursive_workspace_check_preserves_nested_data(self, tmp_path):
+        """A parked subtree where the parent's .workspace is empty but a
+        descendant has user data must NOT be rmtree'd — _has_workspace_content
+        has to recurse."""
+        # Pre-stage manifest + a park whose top-level .workspace is empty
+        # but whose child Page C has user data.
+        manifest_file = tmp_path / ".test.path_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "version": 1,
+            "space_key": "TEST",
+            "pages": {
+                "p": {"path": "P", "title": "P", "parent_id": "", "is_folder": False},
+            },
+        }, indent=2, sort_keys=True) + "\n")
+        # Something occupies the target so sweep cannot restore it
+        occupied = tmp_path / "P"
+        occupied.mkdir()
+        (occupied / "P.md").write_text("---\npage_id: other\n---\n")
+
+        park = tmp_path / ".__conex_tmp_p"
+        park.mkdir()
+        (park / ".workspace").mkdir()  # EMPTY at the top
+        (park / "P.md").write_text("---\npage_id: p\n---\n")
+        # Child page with user data nested inside
+        child = park / "C"
+        child.mkdir()
+        child_ws = child / ".workspace"
+        child_ws.mkdir()
+        (child_ws / "keep.txt").write_text("DO NOT LOSE THIS")
+        (child / "C.md").write_text("---\npage_id: c\n---\n")
+
+        # Run export — even a no-op export should sweep the orphan
+        exporter, cache = _make_exporter()
+        # Page "other" stays at P; page p is gone from API (deleted upstream)
+        other = _make_page("other", "P")
+        _run_export(exporter, cache, [other], tmp_path)
+
+        # Park should be quarantined, not destroyed
+        orphan = tmp_path / ".__conex_orphan_p"
+        assert orphan.exists()
+        assert (orphan / "C" / ".workspace" / "keep.txt").read_text() == "DO NOT LOSE THIS"
+        assert not park.exists()
+
+
+class TestUserHtmlSurvivesRename:
+    def test_manual_html_kept_during_rename(self, tmp_path):
+        """A user-authored manual.html alongside the export must survive a
+        rename — only <basename>.html paired with a stale conex <basename>.md
+        gets removed."""
+        client = MagicMock()
+        cache = MagicMock()
+        exporter = Exporter(
+            client=client, cache=cache,
+            base_url="https://x.atlassian.net",
+            download_media=False, render_drawio=False,
+            debug=True,
+        )
+        p = _make_page("p", "Foo")
+        cs = CachedSpace(space=_make_space(), pages=[p], attachments={}, updated_at="x")
+        cache.ensure_loaded.return_value = cs
+        exporter.export_space(_make_space(), tmp_path)
+        assert (tmp_path / "Foo" / "Foo.html").exists()
+
+        # User drops their own HTML reference doc next to the export
+        user_html = tmp_path / "Foo" / "manual.html"
+        user_html.write_text("<html><body>my own notes</body></html>")
+
+        p2 = _make_page("p", "Bar")
+        cs2 = CachedSpace(space=_make_space(), pages=[p2], attachments={}, updated_at="x")
+        cache2 = MagicMock()
+        cache2.ensure_loaded.return_value = cs2
+        exporter2 = Exporter(
+            client=MagicMock(), cache=cache2,
+            base_url="https://x.atlassian.net",
+            download_media=False, render_drawio=False,
+            debug=True,
+        )
+        exporter2.export_space(_make_space(), tmp_path)
+
+        # New export landed
+        assert (tmp_path / "Bar" / "Bar.html").exists()
+        # Stale Foo.html (our own old debug output) cleaned
+        assert not (tmp_path / "Bar" / "Foo.html").exists()
+        # User's manual.html survives
+        assert (tmp_path / "Bar" / "manual.html").exists()
+        assert (tmp_path / "Bar" / "manual.html").read_text() == "<html><body>my own notes</body></html>"
+
+
 class TestQuarantineDropsManifestEntry:
     def test_partial_swap_quarantine_does_not_misroute(self, tmp_path):
         """Aborted two-page swap with .workspace data on the parked page.
