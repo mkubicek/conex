@@ -62,7 +62,6 @@ class ConfluenceClient:
         self.session.headers.update({"Accept": "application/json"})
         self.session.timeout = 30
         self.api_dialect = profile.api_dialect
-        self.api_flavor = "cookie_v1" if profile.api_dialect is ApiDialect.COOKIE_V1 else "v2"
         self._space_key_by_id: dict[str, str] = {}
 
         auth = profile.auth
@@ -84,13 +83,17 @@ class ConfluenceClient:
         if self.verbose:
             print(f"[debug] {msg}", file=sys.stderr)
 
+    @property
+    def api_flavor(self) -> str:
+        """Backward-compatible flavor string derived from the explicit dialect."""
+        return "cookie_v1" if self.api_dialect is ApiDialect.COOKIE_V1 else "v2"
+
     def set_bearer_token(self, token: str) -> None:
         """Replace current credentials with a Bearer token."""
         self.session.auth = None
         self.session.cookies.clear()
         self.session.headers["Authorization"] = f"Bearer {token}"
         self.api_dialect = ApiDialect.CLOUD_V2
-        self.api_flavor = "v2"
 
     def _set_cookie_header(self, cookie_string: str) -> None:
         self.session.auth = None
@@ -106,7 +109,6 @@ class ConfluenceClient:
         """Replace current credentials with browser session cookies."""
         self._set_cookie_header(cookie_string)
         self.api_dialect = ApiDialect.COOKIE_V1
-        self.api_flavor = "cookie_v1"
 
     def verify_auth(self) -> None:
         """Verify current credentials with a minimal request."""

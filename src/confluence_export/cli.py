@@ -337,6 +337,9 @@ def _cmd_configure(local_dir: str | None = None) -> None:
         print("Error: site_url is required.", file=sys.stderr)
         sys.exit(1)
 
+    if not email and is_scoped_token(secret):
+        print("Error: scoped API tokens require an email address.", file=sys.stderr)
+        sys.exit(1)
     if not email and "=" in secret:
         auth = AuthConfig(type=AuthMode.COOKIE, cookie_header=secret)
     elif not email:

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -220,6 +221,8 @@ def _infer_auth_mode(
             return AuthMode.SCOPED_API_TOKEN
         return AuthMode.BASIC_API_TOKEN
     if token:
+        if is_scoped_token(token):
+            return AuthMode.SCOPED_API_TOKEN
         return AuthMode.BEARER_PAT
     if email:
         return AuthMode.BASIC_API_TOKEN
@@ -569,9 +572,20 @@ def save_connection_config(
         cloud_id=cloud_id,
         api_base_url=api_base_url,
     )
-    with open(cp, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{cp.name}.", dir=cp.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, cp)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
     cp.chmod(0o600)
     return cp
 

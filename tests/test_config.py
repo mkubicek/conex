@@ -206,6 +206,15 @@ class TestConnectionProfile:
                 resolve_cloud=lambda url: None,
             )
 
+    def test_scoped_token_without_email_is_not_bearer(self):
+        with pytest.raises(ConnectionProfileError, match="email and API token"):
+            load_connection_profile(
+                site_url="https://x.atlassian.net",
+                api_token="ATATT3x_dummy=ADA123",
+                interactive=False,
+                resolve_cloud=lambda url: "cloud-123",
+            )
+
     def test_legacy_token_profile_resolution(self):
         profile = load_connection_profile(
             site_url="https://x.atlassian.net",

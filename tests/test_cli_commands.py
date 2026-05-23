@@ -380,6 +380,18 @@ class TestConfigureCommand:
         data = json.loads(config_file.read_text())
         assert data["auth"]["type"] == "bearer_pat"
 
+    def test_scoped_token_without_email_exits_before_cookie_classification(self, capsys, tmp_path):
+        config_file = tmp_path / "config.json"
+        inputs = iter(["https://x.atlassian.net", "", "ATATT3xDummy=ADA456abc"])
+        with patch("sys.argv", ["confluence-export", "configure"]), \
+             patch("builtins.input", side_effect=inputs), \
+             patch("confluence_export.cli.config_path", return_value=config_file):
+            with pytest.raises(SystemExit):
+                main()
+
+        assert not config_file.exists()
+        assert "scoped API tokens require an email" in capsys.readouterr().err
+
     def test_configure_local_writes_local_config(self, tmp_path):
         inputs = iter(["https://x.atlassian.net", "", "session=abc"])
         with patch("sys.argv", ["confluence-export", "configure", "--local", str(tmp_path)]), \

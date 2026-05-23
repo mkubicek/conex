@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from confluence_export.git import (
     _chunked_paths,
+    _is_secret_config_relpath,
     commit_export,
     commit_local_changes,
     ensure_repo,
@@ -57,6 +58,17 @@ class TestChunkedPaths:
         # 300 / ~108 → ~2 paths per batch → ~10 batches
         assert len(batches) >= 5
         assert [p for batch in batches for p in batch] == paths
+
+
+class TestSecretConfigPaths:
+    def test_matches_anything_under_conex(self):
+        assert _is_secret_config_relpath(".conex/config.json") is True
+        assert _is_secret_config_relpath(".conex/secrets.yaml") is True
+        assert _is_secret_config_relpath(".conex/profiles/prod.json") is True
+
+    def test_does_not_match_similar_names(self):
+        assert _is_secret_config_relpath("docs/conex/config.json") is False
+        assert _is_secret_config_relpath("docs/.conex-backup/config.json") is False
 
 
 class TestGitAvailable:
@@ -397,8 +409,8 @@ class TestCommitExport:
 
     def test_does_not_stage_local_conex_config(self, tmp_path):
         self._init_repo(tmp_path)
-        secret = tmp_path / ".conex" / "config.json"
-        secret.parent.mkdir()
+        secret = tmp_path / ".conex" / "profiles" / "prod.json"
+        secret.parent.mkdir(parents=True)
         secret.write_text('{"token": "secret"}')
         md = tmp_path / "Page.md"
         md.write_text("# Page")
@@ -407,7 +419,7 @@ class TestCommitExport:
 
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True)
         assert "Page.md" in ls.stdout
-        assert ".conex/config.json" not in ls.stdout
+        assert ".conex/profiles/prod.json" not in ls.stdout
         status = subprocess.run(["git", "status", "--porcelain"], cwd=tmp_path, capture_output=True, text=True)
         assert "?? .conex/" in status.stdout
 

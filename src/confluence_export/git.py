@@ -34,14 +34,8 @@ def _chunked_paths(paths: list[str], max_bytes: int = _MAX_ARGV_BYTES) -> Iterat
 
 
 def _is_secret_config_relpath(path: str) -> bool:
-    """True for direct JSON config files under any .conex directory."""
-    parts = Path(path).parts
-    return any(
-        part == ".conex"
-        and i + 1 == len(parts) - 1
-        and parts[-1].endswith(".json")
-        for i, part in enumerate(parts)
-    )
+    """True for any file inside a local .conex directory."""
+    return ".conex" in Path(path).parts
 
 
 def _is_secret_config_path(output_dir: Path, path: Path) -> bool:
