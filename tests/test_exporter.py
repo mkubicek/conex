@@ -156,6 +156,58 @@ class TestTreeExport:
         assert manifest["pages"]["p2"]["path"] == "Root/Sub"
         assert manifest["pages"]["p3"]["path"] == "Root/Sub/Leaf"
 
+    def test_path_filter_preserves_legacy_top_level_filtered_output(self, tmp_path):
+        exporter, _, cache = _make_exporter()
+        root = _make_page(id="p1", title="Root", body="<p>Root</p>")
+        sub = _make_page(id="p2", title="Sub", body="<p>Sub page</p>",
+                         parent_id="p1", parent_type="page")
+        cache.ensure_loaded.return_value = _make_cached_space(pages=[root, sub])
+
+        exporter.export_space(_make_space(), tmp_path, path_filter="/Root/Sub")
+
+        sub_v2 = _make_page(id="p2", title="Sub", body="<p>Updated sub</p>",
+                            parent_id="p1", parent_type="page")
+        cache.ensure_loaded.return_value = _make_cached_space(pages=[root, sub_v2])
+        result = exporter.export_space(_make_space(), tmp_path, path_filter="/Root/Sub")
+
+        assert result.count == 1
+        assert (tmp_path / "Sub" / "Sub.md").exists()
+        assert "Updated sub" in (tmp_path / "Sub" / "Sub.md").read_text()
+        assert not (tmp_path / "Root").exists()
+
+    def test_path_filter_moves_subtree_inside_full_export_hierarchy(self, tmp_path):
+        exporter, _, cache = _make_exporter()
+        parent_a = _make_page(id="a", title="ParentA", body="<p>A</p>")
+        parent_b = _make_page(id="b", title="ParentB", body="<p>B</p>")
+        sub = _make_page(id="p", title="Sub", body="<p>Sub page</p>",
+                         parent_id="a", parent_type="page")
+        cache.ensure_loaded.return_value = _make_cached_space(
+            pages=[parent_a, parent_b, sub]
+        )
+        exporter.export_space(_make_space(), tmp_path)
+
+        ws = tmp_path / "ParentA" / "Sub" / ".workspace" / "notes.txt"
+        ws.write_text("user data")
+
+        moved_sub = _make_page(id="p", title="Sub", body="<p>Moved sub</p>",
+                               parent_id="b", parent_type="page")
+        cache.ensure_loaded.return_value = _make_cached_space(
+            pages=[parent_a, parent_b, moved_sub]
+        )
+        result = exporter.export_space(
+            _make_space(), tmp_path, path_filter="/ParentB/Sub"
+        )
+
+        assert result.count == 1
+        assert result.relocated == 1
+        assert not (tmp_path / "ParentA" / "Sub").exists()
+        assert (tmp_path / "ParentB" / "Sub" / "Sub.md").exists()
+        assert "Moved sub" in (tmp_path / "ParentB" / "Sub" / "Sub.md").read_text()
+        moved_ws = tmp_path / "ParentB" / "Sub" / ".workspace" / "notes.txt"
+        assert moved_ws.read_text() == "user data"
+        manifest = json.loads((tmp_path / ".test.path_manifest.json").read_text())
+        assert manifest["pages"]["p"]["path"] == "ParentB/Sub"
+
     def test_path_filter_not_found_returns_zero(self, tmp_path, capsys):
         exporter, _, cache = _make_exporter()
         cs = _make_cached_space()

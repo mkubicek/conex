@@ -180,10 +180,9 @@ def relocate_subtree(
       - old_path == new_path
 
     On filesystems, the directory tree (including `.workspace/`) moves as a
-    unit via shutil.move. In a git repo, tracked files are also staged at
-    the new location and removed from the old; rename detection at log/diff
-    time relies on content similarity, so an explicit `git mv` isn't
-    required and handling untracked workspace files uniformly is simpler.
+    unit via shutil.move. In a git repo with tracked content under old_path,
+    git mv performs the working-tree move so history records a rename while
+    untracked workspace files move with the directory.
     """
     if old_path == new_path:
         return False
@@ -202,15 +201,18 @@ def relocate_subtree(
         )
         return False
 
-    # Capture tracked paths under old_path before the move so we can stage
-    # the rename in git afterwards.
+    # In git-managed exports, prefer `git mv` for issue #17's rename
+    # semantics. It moves untracked files in the directory too, so page
+    # workspace content comes along with the tracked markdown/media files.
     tracked_rel: list[str] = []
     if use_git and _has_commits(output_dir):
         try:
             old_rel = old_path.relative_to(output_dir).as_posix()
+            new_rel = new_path.relative_to(output_dir).as_posix()
         except ValueError:
             old_rel = ""
-        if old_rel:
+            new_rel = ""
+        if old_rel and new_rel:
             result = _run_git(
                 output_dir, "ls-files", "-z", "--", old_rel, check=False
             )
@@ -218,6 +220,12 @@ def relocate_subtree(
                 tracked_rel = [
                     p for p in result.stdout.strip("\0").split("\0") if p
                 ]
+        if (
+            tracked_rel
+            and _run_git(output_dir, "mv", "--", old_rel, new_rel) is not None
+        ):
+            _prune_empty_dirs(old_path.parent, output_dir)
+            return True
 
     shutil.move(str(old_path), str(new_path))
 

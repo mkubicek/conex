@@ -171,6 +171,39 @@ class TestDirAndFilenameStaySynced:
         assert (tmp_path / "page-one-2" / "page-one-2.md").exists()
 
 
+class TestCollisionTreeShape:
+    def test_colliding_sibling_children_do_not_merge(self, tmp_path):
+        exporter, cache = _make_exporter()
+        a = _make_page("a", "page one", position=0)
+        b = _make_page("b", "page-one", position=1)
+        child_a = _make_page("ca", "Child A", parent_id="a")
+        child_b = _make_page("cb", "Child B", parent_id="b")
+
+        _run_export(exporter, cache, [a, b, child_a, child_b], tmp_path)
+
+        a_child = tmp_path / "page-one" / "Child-A" / "Child-A.md"
+        b_child = tmp_path / "page-one-2" / "Child-B" / "Child-B.md"
+        assert a_child.exists()
+        assert b_child.exists()
+        assert "page_id: ca" in a_child.read_text()
+        assert "page_id: cb" in b_child.read_text()
+        assert not (tmp_path / "page-one" / "Child-B").exists()
+        assert not (tmp_path / "page-one-2" / "Child-A").exists()
+
+    def test_same_child_name_can_repeat_under_different_parents(self, tmp_path):
+        exporter, cache = _make_exporter()
+        a = _make_page("a", "Parent A", position=0)
+        b = _make_page("b", "Parent B", position=1)
+        child_a = _make_page("ca", "Shared", parent_id="a")
+        child_b = _make_page("cb", "Shared", parent_id="b")
+
+        _run_export(exporter, cache, [a, b, child_a, child_b], tmp_path)
+
+        assert (tmp_path / "Parent-A" / "Shared" / "Shared.md").exists()
+        assert (tmp_path / "Parent-B" / "Shared" / "Shared.md").exists()
+        assert not (tmp_path / "Parent-B" / "Shared-2").exists()
+
+
 class TestManifestStability:
     def test_manifest_written_with_deterministic_keys(self, tmp_path):
         exporter, cache = _make_exporter()

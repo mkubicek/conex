@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -134,6 +135,71 @@ class TestRelocateSubtreePrimitive:
             text=True,
         )
         assert "R" in diff.stdout
+
+    def test_git_mode_uses_git_mv_for_tracked_subtree(self, tmp_path, monkeypatch):
+        old = tmp_path / "Old"
+        old.mkdir()
+        (old / "page.md").write_text("tracked")
+        new = tmp_path / "New"
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run_git(repo_dir, *args, check=True):
+            calls.append(args)
+            if args == ("rev-parse", "HEAD"):
+                return subprocess.CompletedProcess(["git", *args], 0, "", "")
+            if args == ("ls-files", "-z", "--", "Old"):
+                return subprocess.CompletedProcess(
+                    ["git", *args], 0, "Old/page.md\0", ""
+                )
+            if args == ("mv", "--", "Old", "New"):
+                shutil.move(str(old), str(new))
+                return subprocess.CompletedProcess(["git", *args], 0, "", "")
+            raise AssertionError(f"unexpected git call: {args}")
+
+        monkeypatch.setattr("confluence_export.git._run_git", fake_run_git)
+
+        moved = relocate_subtree(old, new, output_dir=tmp_path, use_git=True)
+
+        assert moved is True
+        assert ("mv", "--", "Old", "New") in calls
+        assert not old.exists()
+        assert (new / "page.md").read_text() == "tracked"
+
+    def test_git_move_carries_untracked_workspace(self, tmp_path):
+        _init_repo(tmp_path)
+        exporter, cache = _make_exporter()
+        a = _make_page("a", "ParentA")
+        b = _make_page("b", "ParentB")
+        p = _make_page("p", "MyPage", parent_id="a")
+        first = _run_export(exporter, cache, [a, b, p], tmp_path, use_git=True)
+
+        from confluence_export.git import commit_export
+        assert commit_export(tmp_path, first.written_files, "TEST") is True
+
+        ws = tmp_path / "ParentA" / "MyPage" / ".workspace" / "notes.txt"
+        ws.write_text("user data")
+
+        p2 = _make_page("p", "MyPage", parent_id="b")
+        exporter2, cache2 = _make_exporter()
+        second = _run_export(exporter2, cache2, [a, b, p2], tmp_path, use_git=True)
+
+        assert commit_export(tmp_path, second.written_files, "TEST") is True
+        assert not (tmp_path / "ParentA" / "MyPage").exists()
+        moved_ws = tmp_path / "ParentB" / "MyPage" / ".workspace" / "notes.txt"
+        assert moved_ws.read_text() == "user data"
+
+        log = subprocess.run(
+            [
+                "git", "log", "--follow", "--name-status", "--format=%s",
+                "ParentB/MyPage/MyPage.md",
+            ],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "Export Confluence space TEST" in log.stdout
+        assert "R" in log.stdout
 
 
 class TestPruneEmptyDirs:
@@ -373,6 +439,23 @@ class TestStaleBasenameCleanup:
         exporter2.export_space(_make_space(), tmp_path)
         assert (tmp_path / "Bar" / "Bar.html").exists()
         assert not (tmp_path / "Bar" / "Foo.html").exists()
+
+    def test_renamed_suffixed_collision_moves_to_new_base(self, tmp_path):
+        exporter, cache = _make_exporter()
+        a = _make_page("a", "Page One", position=0)
+        b = _make_page("b", "Page-One", position=1)
+        _run_export(exporter, cache, [a, b], tmp_path)
+        assert (tmp_path / "Page-One-2" / "Page-One-2.md").exists()
+
+        b2 = _make_page("b", "Renamed", position=1)
+        exporter2, cache2 = _make_exporter()
+        _run_export(exporter2, cache2, [a, b2], tmp_path)
+
+        assert (tmp_path / "Renamed" / "Renamed.md").exists()
+        assert "page_id: b" in (tmp_path / "Renamed" / "Renamed.md").read_text()
+        assert not (tmp_path / "Page-One-2").exists()
+        manifest = json.loads((tmp_path / ".test.path_manifest.json").read_text())
+        assert manifest["pages"]["b"]["path"] == "Renamed"
 
 
 class TestOrphanParkRecovery:

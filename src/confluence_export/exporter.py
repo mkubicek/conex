@@ -179,9 +179,9 @@ class Exporter:
                 return ExportResult()
             if no_children:
                 result = ExportResult()
-                page_dir = self._filtered_page_dir(node, output_dir, run)
-                entry = run.manifest.get(node.page.id)
-                name = Path(entry.path).name if entry is not None else None
+                page_dir, name = self._filtered_single_page_target(
+                    roots, node, output_dir, run
+                )
                 files = self._export_single_page(
                     node.page, page_dir, cs, space.key, name=name
                 )
@@ -189,16 +189,12 @@ class Exporter:
                 result.written_files.extend(files)
                 self._finalize(run, result, space.key, cs)
                 return result
-            # If the user passed --path /Root/Sub against an output dir
-            # that already holds a full export with Sub at Root/Sub, the
-            # manifest entry for Sub records the deeper path while this
-            # run normally treats Sub as top-level. Anchor the filtered
-            # export at the recorded parent so Phase B doesn't relocate
-            # Root/Sub to Sub.
-            page_dir = self._filtered_page_dir(node, output_dir, run)
-            parent_dir = page_dir.parent if node.page.id in run.manifest else output_dir
+            siblings, parent_dir, only_page_ids = self._filtered_sibling_scope(
+                roots, node, output_dir, run
+            )
             result = self._export_siblings(
-                [node], parent_dir, cs, space.key, run, depth=0
+                siblings, parent_dir, cs, space.key, run, depth=0,
+                only_page_ids=only_page_ids,
             )
             self._finalize(run, result, space.key, cs)
             return result
@@ -218,38 +214,78 @@ class Exporter:
 
     # ------------------------------------------------------------------ siblings
 
-    def _filtered_page_dir(self, node: PageNode, output_dir: Path, run: _ExportRun) -> Path:
-        """Return the page directory for a filtered export.
+    def _filtered_sibling_scope(
+        self,
+        roots: list[PageNode],
+        node: PageNode,
+        output_dir: Path,
+        run: _ExportRun,
+    ) -> tuple[list[PageNode], Path, set[str] | None]:
+        """Return the sibling list and parent dir for a filtered subtree export.
 
-        Fresh filtered exports keep the legacy behavior of placing the selected
-        subtree at output_dir. When a manifest already records the page, reuse
-        that directory so a partial refresh of a full export does not rewrite
-        the selected page as a new top-level root.
+        Fresh filtered exports keep the legacy behavior of writing the selected
+        subtree at output_dir. If the manifest shows we are refreshing an
+        existing full-hierarchy export, allocate names against the selected
+        page's real siblings and use its current full-tree parent. That keeps
+        collision handling identical to a full export and still lets Phase B
+        perform legitimate page-id relocations inside that hierarchy.
         """
-        entry = run.manifest.get(node.page.id)
-        if entry is None:
-            return output_dir
-        return output_dir / entry.path
+        path = self._allocated_path_to_node(roots, node.page.id, run)
+        if path is None or not self._uses_full_hierarchy(path, run):
+            return [node], output_dir, None
+        parent_dir = output_dir
+        for _, name, _ in path[:-1]:
+            parent_dir = parent_dir / name
+        siblings = roots if len(path) == 1 else path[-2][0].children
+        return siblings, parent_dir, {node.page.id}
 
-    def _export_siblings(
+    def _filtered_single_page_target(
+        self,
+        roots: list[PageNode],
+        node: PageNode,
+        output_dir: Path,
+        run: _ExportRun,
+    ) -> tuple[Path, str | None]:
+        """Return (page_dir, filename stem) for path-filter + no-children."""
+        path = self._allocated_path_to_node(roots, node.page.id, run)
+        if path is None or not self._uses_full_hierarchy(path, run):
+            return output_dir, None
+        page_dir = output_dir
+        for _, name, _ in path:
+            page_dir = page_dir / name
+        return page_dir, path[-1][1]
+
+    def _uses_full_hierarchy(
+        self, allocated_path: list[tuple[PageNode, str, bool]], run: _ExportRun
+    ) -> bool:
+        """Whether a filtered export should preserve full-tree ancestry."""
+        target = allocated_path[-1][0]
+        entry = run.manifest.get(target.page.id)
+        if entry is not None and "/" in entry.path:
+            return True
+        return any(node.page.id in run.manifest for node, _, _ in allocated_path[:-1])
+
+    def _allocated_path_to_node(
         self,
         siblings: list[PageNode],
-        parent_dir: Path,
-        cs: CachedSpace,
-        space_key: str,
+        page_id: str,
         run: _ExportRun,
-        depth: int,
-    ) -> ExportResult:
-        """Export a list of siblings under parent_dir in three phases.
+    ) -> list[tuple[PageNode, str, bool]] | None:
+        """Return the full-tree allocated path to page_id, if present."""
+        for node, name, suffixed in self._allocate_sibling_names(siblings, run):
+            if node.page.id == page_id:
+                return [(node, name, suffixed)]
+            child_path = self._allocated_path_to_node(node.children, page_id, run)
+            if child_path is not None:
+                return [(node, name, suffixed), *child_path]
+        return None
 
-        A. Allocate all names per parent (collision-safe).
-        B. Pre-write relocate: any sibling whose manifest path differs from
-           its desired path is moved before any new content is written.
-        C. Write + recurse.
-        """
-        # Phase A — allocate stable names
+    def _allocate_sibling_names(
+        self, siblings: list[PageNode], run: _ExportRun
+    ) -> list[tuple[PageNode, str, bool]]:
+        """Allocate stable collision-safe names for one sibling group."""
         taken: set[str] = set()
-        allocations: list[tuple[PageNode, str]] = []
+        allocations: list[tuple[PageNode, str, bool]] = []
         preferred_first = sorted(
             siblings,
             key=lambda n: (
@@ -268,19 +304,51 @@ class Exporter:
                 # preferred name. The full path may have changed (move) but
                 # we still want to keep the same leaf if possible.
                 preferred = Path(entry.path).name
-            name, suffixed = self._allocate_name(node.page.title, taken, preferred=preferred)
-            if suffixed:
-                run.disambiguated += 1
+            name, suffixed = self._allocate_name(
+                node.page.title, taken, preferred=preferred
+            )
             taken.add(name.casefold())
-            allocations.append((node, name))
+            allocations.append((node, name, suffixed))
 
         # Restore the natural tree order for actual processing.
         order = {id(n): i for i, n in enumerate(siblings)}
-        allocations.sort(key=lambda pair: order[id(pair[0])])
+        allocations.sort(key=lambda item: order[id(item[0])])
+        return allocations
+
+    def _export_siblings(
+        self,
+        siblings: list[PageNode],
+        parent_dir: Path,
+        cs: CachedSpace,
+        space_key: str,
+        run: _ExportRun,
+        depth: int,
+        only_page_ids: set[str] | None = None,
+    ) -> ExportResult:
+        """Export a list of siblings under parent_dir in three phases.
+
+        A. Allocate all names per parent (collision-safe).
+        B. Pre-write relocate: any sibling whose manifest path differs from
+           its desired path is moved before any new content is written.
+        C. Write + recurse.
+
+        `only_page_ids` limits Phase B/C to selected siblings while still
+        allocating names against the full sibling group. Filtered exports use
+        that to refresh one subtree without losing full-export collision rules.
+        """
+        # Phase A — allocate stable names
+        allocations = self._allocate_sibling_names(siblings, run)
+        active_allocations = [
+            item for item in allocations
+            if only_page_ids is None or item[0].page.id in only_page_ids
+        ]
+        for _, _, suffixed in active_allocations:
+            if suffixed:
+                run.disambiguated += 1
 
         # Phase B — relocate any sibling whose recorded path differs.
         result = ExportResult()
-        for node, name in allocations:
+        for node, name, _ in active_allocations:
             page_id = node.page.id
             new_dir = parent_dir / name
             new_rel = new_dir.relative_to(run.output_dir).as_posix()
@@ -318,7 +386,7 @@ class Exporter:
                 self._rewrite_manifest_prefix(run.manifest, entry.path, new_rel)
 
         # Second pass: drain any parked entries into their final slots.
-        for node, name in allocations:
+        for node, name, _ in active_allocations:
             page_id = node.page.id
             park = run.output_dir / f".__conex_tmp_{page_id}"
             if not park.exists():
@@ -341,7 +409,7 @@ class Exporter:
                 self._rewrite_manifest_prefix(run.manifest, old_rel, new_rel)
 
         # Phase C — write each sibling and recurse into its children.
-        for node, name in allocations:
+        for node, name, _ in active_allocations:
             page = node.page
             page_dir = parent_dir / name
             page_dir.mkdir(parents=True, exist_ok=True)
@@ -393,7 +461,7 @@ class Exporter:
         candidate = truncate_with_suffix(base)
 
         if preferred and preferred.casefold() not in taken:
-            if preferred == candidate or _matches_base_with_suffix(preferred, candidate):
+            if preferred == candidate or _matches_base_with_suffix(preferred, base):
                 return preferred, preferred != candidate
 
         if candidate.casefold() not in taken:
@@ -797,16 +865,16 @@ def _has_workspace_content(page_dir: Path) -> bool:
     return False
 
 
-def _matches_base_with_suffix(candidate: str, base_name: str) -> bool:
+def _matches_base_with_suffix(candidate: str, base: str) -> bool:
     """Decide whether the manifest's previous name is reusable for this title.
 
-    Returns True when `candidate` equals `base_name` exactly or when it has the
-    shape of a disambiguated leaf (`<anything>-<digits>`). The latter case is
-    deliberately loose: the page_id link in the manifest is authoritative, so
-    if a page was previously stored at e.g. `page-one-2` and its title now
-    sanitizes to a different base, we still prefer the stable on-disk name
-    over churning the directory on every re-export.
+    A prior disambiguated leaf like `page-one-2` remains reusable only while it
+    is still the current sanitized base plus that numeric suffix. If the page
+    title changes to a different base, the page-id relocation logic should move
+    it to the new sanitized name instead of pinning it to an unrelated old leaf.
     """
-    if candidate == base_name:
-        return True
-    return re.fullmatch(r".+-\d+", candidate) is not None
+    match = re.fullmatch(r".+(-\d+)", candidate)
+    if match is None:
+        return False
+    expected = truncate_with_suffix(base, match.group(1))
+    return candidate.casefold() == expected.casefold()
