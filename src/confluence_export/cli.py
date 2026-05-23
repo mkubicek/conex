@@ -13,7 +13,10 @@ import requests
 from confluence_export.cache import CacheStore
 from confluence_export.client import AuthenticationError, ConfluenceClient
 from confluence_export.config import (
+    ApiDialect,
+    AuthMode,
     Config,
+    ConnectionProfile,
     config_path,
     gateway_url,
     is_atlassian_site_url,
@@ -97,6 +100,11 @@ def _prompt_browser_credentials(base_url: str, reason: str) -> tuple[str, str]:
 
 
 def _apply_browser_credentials(client: ConfluenceClient, base_url: str, reason: str) -> None:
+    if not sys.stdin.isatty():
+        print("Authentication failed and no interactive prompt is available.", file=sys.stderr)
+        print(f"Reason: {reason}", file=sys.stderr)
+        print("Next step: run `confluence-export configure` or provide --cloud-id / --api-base-url.", file=sys.stderr)
+        sys.exit(1)
     """Prompt for browser credentials, verify with a quick API call, apply to client."""
     cred_type, value = _prompt_browser_credentials(base_url, reason)
     if cred_type == "cookie":
@@ -170,6 +178,43 @@ def _maybe_route_via_gateway(config: Config) -> Config:
     return config
 
 
+
+
+def _connection_profile(config: Config, interactive: bool) -> ConnectionProfile:
+    auth_mode = AuthMode.COOKIE if config.auth_type == "cookie" else (
+        AuthMode.BEARER_PAT if config.use_bearer else (AuthMode.SCOPED_API_TOKEN if is_scoped_token(config.api_token) else AuthMode.BASIC_API_TOKEN)
+    )
+    api_dialect = ApiDialect.COOKIE_V1 if auth_mode == AuthMode.COOKIE else (ApiDialect.GATEWAY_V2 if "api.atlassian.com/ex/confluence" in config.base_url else ApiDialect.CLOUD_V2)
+    return ConnectionProfile(
+        site_url=config.site_url or config.base_url,
+        api_base_url=config.base_url,
+        cloud_id=config.cloud_id,
+        auth_mode=auth_mode,
+        api_dialect=api_dialect,
+        config_source=config.config_source or str(config_path()),
+        interactive=interactive,
+    )
+
+
+def _run_preflight(client: ConfluenceClient, profile: ConnectionProfile, output_dir: str, space_key: str) -> Space:
+    print(f"Using config: {profile.config_source}")
+    print(f"Auth: {profile.auth_mode.value}")
+    print(f"API mode: {profile.api_dialect.value}")
+    print(f"Site: {profile.site_url}")
+    if profile.cloud_id:
+        print(f"Cloud ID: {profile.cloud_id}")
+    print(f"Output: {Path(output_dir).resolve()}\n")
+    print("Preflight:")
+    try:
+        client.verify_auth(); print("  ✓ authenticated")
+        if profile.api_dialect == ApiDialect.GATEWAY_V2: print("  ✓ gateway route resolved")
+        space = _resolve_space(client, space_key); print("  ✓ space resolved")
+        client.get_pages_in_space(space.id, include_archived=False); print("  ✓ page listing available")
+        Path(output_dir).mkdir(parents=True, exist_ok=True); print("  ✓ output directory writable")
+        return space
+    except Exception as exc:
+        print(f"  ✗ preflight failed: {exc}", file=sys.stderr)
+        sys.exit(1)
 def _is_auth_error(exc: Exception) -> int | None:
     """Return the HTTP status code if exc looks like an auth failure, else None.
 
@@ -282,6 +327,7 @@ def main() -> None:
             base_url=args.base_url,
             email=args.email,
             api_token=args.api_token,
+            output_dir=getattr(args, "output", None),
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -294,6 +340,7 @@ def main() -> None:
     client = ConfluenceClient(config, verbose=args.verbose)
 
     if args.cookie:
+        config.auth_type = "cookie"
         client.set_cookies(args.cookie)
         print("Using browser cookies. Verifying credentials...", file=sys.stderr, flush=True)
         try:
@@ -309,6 +356,8 @@ def main() -> None:
 
     cache = CacheStore()
 
+    profile = _connection_profile(config, sys.stdin.isatty())
+
     match args.command:
         case "spaces":
             _with_auth_fallback(lambda: _cmd_spaces(client), client, config)
@@ -321,6 +370,7 @@ def main() -> None:
                 client,
                 cache,
                 config,
+                profile=profile,
                 space_key=args.space_key,
                 path_filter=args.path,
                 output_dir=args.output,
@@ -469,9 +519,12 @@ def _cmd_export(
     include_archived: bool = False,
     no_git: bool = False,
     no_author_lookup: bool = False,
+    profile: ConnectionProfile | None = None,
 ) -> None:
     """Export page tree as LLM-ready markdown."""
-    space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
+    if profile is None:
+        profile = _connection_profile(config, sys.stdin.isatty())
+    space = _run_preflight(client, profile, output_dir, space_key)
 
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
