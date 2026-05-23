@@ -1,4 +1,4 @@
-"""Tests for browser OAuth2 token fallback."""
+"""Tests for auth errors and explicit cookie mode."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import pytest
 import requests
 
 from confluence_export.client import AuthenticationError, ConfluenceClient
-from confluence_export.cli import _prompt_browser_credentials, _with_auth_fallback
+from confluence_export.cli import _with_auth_fallback
 from confluence_export.config import Config
 
 
@@ -113,53 +113,6 @@ class TestNeedsToken:
         assert cfg.needs_token is False
 
 
-# -- _prompt_browser_credentials ---------------------------------------------
-
-
-class TestPromptBrowserCredentials:
-    def test_bearer_strips_prefix(self):
-        with patch("confluence_export.cli._read_hidden_line", return_value="Bearer abc123"):
-            cred_type, value = _prompt_browser_credentials("https://x.atlassian.net", "reason")
-        assert cred_type == "bearer"
-        assert value == "abc123"
-
-    def test_bearer_case_insensitive(self):
-        with patch("confluence_export.cli._read_hidden_line", return_value="bearer ABC"):
-            cred_type, value = _prompt_browser_credentials("https://x.atlassian.net", "reason")
-        assert cred_type == "bearer"
-        assert value == "ABC"
-
-    def test_raw_token_is_bearer(self):
-        with patch("confluence_export.cli._read_hidden_line", return_value="raw-token-value"):
-            cred_type, value = _prompt_browser_credentials("https://x.atlassian.net", "reason")
-        assert cred_type == "bearer"
-        assert value == "raw-token-value"
-
-    def test_cookies_detected(self):
-        cookies = "session=abc123; token=xyz789"
-        with patch("confluence_export.cli._read_hidden_line", return_value=cookies):
-            cred_type, value = _prompt_browser_credentials("https://x.atlassian.net", "reason")
-        assert cred_type == "cookie"
-        assert value == cookies
-
-    def test_single_cookie_detected(self):
-        cookie = "tenant.session.token=eyJhbGciOi..."
-        with patch("confluence_export.cli._read_hidden_line", return_value=cookie):
-            cred_type, value = _prompt_browser_credentials("https://x.atlassian.net", "reason")
-        assert cred_type == "cookie"
-        assert value == cookie
-
-    def test_ctrl_c_exits(self):
-        with patch("confluence_export.cli._read_hidden_line", side_effect=KeyboardInterrupt):
-            with pytest.raises(SystemExit):
-                _prompt_browser_credentials("https://x.atlassian.net", "reason")
-
-    def test_empty_input_exits(self):
-        with patch("confluence_export.cli._read_hidden_line", return_value=""):
-            with pytest.raises(SystemExit):
-                _prompt_browser_credentials("https://x.atlassian.net", "reason")
-
-
 # -- _with_auth_fallback -----------------------------------------------------
 
 
@@ -168,61 +121,43 @@ class TestWithAuthFallback:
         result = _with_auth_fallback(lambda: 42, MagicMock(), MagicMock())
         assert result == 42
 
-    def test_retries_on_auth_error(self):
-        config = Config(base_url="https://x.atlassian.net", email="", api_token="bad")
-        client = ConfluenceClient(config)
-
-        call_count = 0
-
-        def fn():
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise AuthenticationError(401, "https://x.atlassian.net/wiki/api/v2/spaces")
-            return "ok"
-
-        with patch("confluence_export.cli._prompt_browser_credentials", return_value=("bearer", "good-token")), \
-             patch.object(client, "_get", return_value={"results": []}):
-            result = _with_auth_fallback(fn, client, config)
-
-        assert result == "ok"
-        assert call_count == 2
-        assert client.session.headers["Authorization"] == "Bearer good-token"
-
-    def test_exits_on_second_auth_error(self):
+    def test_exits_on_auth_error_without_prompt(self, capsys):
         config = Config(base_url="https://x.atlassian.net", email="", api_token="bad")
         client = ConfluenceClient(config)
 
         def fn():
             raise AuthenticationError(401, "https://x.atlassian.net/wiki/api/v2/spaces")
 
-        with patch("confluence_export.cli._prompt_browser_credentials", return_value=("bearer", "also-bad")), \
-             patch.object(client, "_get", return_value={"results": []}):
+        with pytest.raises(SystemExit):
+            _with_auth_fallback(fn, client, config)
+
+        assert "no interactive prompt" in capsys.readouterr().err
+
+    def test_exits_on_repeated_auth_error(self):
+        config = Config(base_url="https://x.atlassian.net", email="", api_token="bad")
+        client = ConfluenceClient(config)
+
+        def fn():
+            raise AuthenticationError(401, "https://x.atlassian.net/wiki/api/v2/spaces")
+
+        with patch.object(client, "_get", return_value={"results": []}):
             with pytest.raises(SystemExit):
                 _with_auth_fallback(fn, client, config)
 
-    def test_retries_on_http_404(self):
+    def test_exits_on_http_404_without_prompt(self, capsys):
         """Confluence v2 API returns 404 for wrong-instance credentials."""
         config = Config(base_url="https://x.atlassian.net", email="a@b.com", api_token="tok")
         client = ConfluenceClient(config)
 
-        call_count = 0
-
         def fn():
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                resp = MagicMock(spec=requests.Response)
-                resp.status_code = 404
-                raise requests.exceptions.HTTPError(response=resp)
-            return "ok"
+            resp = MagicMock(spec=requests.Response)
+            resp.status_code = 404
+            raise requests.exceptions.HTTPError(response=resp)
 
-        with patch("confluence_export.cli._prompt_browser_credentials", return_value=("bearer", "good-token")), \
-             patch.object(client, "_get", return_value={"results": []}):
-            result = _with_auth_fallback(fn, client, config)
+        with pytest.raises(SystemExit):
+            _with_auth_fallback(fn, client, config)
 
-        assert result == "ok"
-        assert call_count == 2
+        assert "HTTP 404" in capsys.readouterr().err
 
     def test_does_not_catch_other_http_errors(self):
         """Non-auth HTTP errors should propagate, not trigger prompt."""

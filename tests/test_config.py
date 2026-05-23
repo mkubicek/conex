@@ -10,12 +10,19 @@ from unittest.mock import patch
 import pytest
 
 from confluence_export.config import (
+    ApiDialect,
+    AuthConfig,
+    AuthMode,
     Config,
+    ConnectionProfileError,
+    find_local_config,
     gateway_url,
     is_atlassian_site_url,
     is_scoped_token,
+    load_connection_profile,
     load_config,
     save_config,
+    save_connection_config,
 )
 
 
@@ -154,6 +161,141 @@ class TestSaveConfig:
 
         assert path.exists()
         data = json.loads(path.read_text())
-        assert data["base_url"] == "https://x.atlassian.net"
-        assert data["api_token"] == "secret"
+        assert data["version"] == 2
+        assert data["site_url"] == "https://x.atlassian.net"
+        assert data["auth"]["token"] == "secret"
         assert oct(path.stat().st_mode & 0o777) == "0o600"
+
+
+class TestConnectionProfile:
+    def test_cookie_profile_resolution(self):
+        profile = load_connection_profile(
+            site_url="https://x.atlassian.net/",
+            cookie="tenant.session.token=abc",
+            interactive=False,
+        )
+
+        assert profile.site_url == "https://x.atlassian.net"
+        assert profile.api_base_url == "https://x.atlassian.net"
+        assert profile.auth_mode is AuthMode.COOKIE
+        assert profile.api_dialect is ApiDialect.COOKIE_V1
+        assert profile.cloud_id is None
+
+    def test_scoped_token_profile_resolution(self):
+        profile = load_connection_profile(
+            site_url="https://x.atlassian.net",
+            email="a@b.com",
+            api_token="ATATT3x_dummy=ADA123",
+            interactive=False,
+            resolve_cloud=lambda url: "cloud-123",
+        )
+
+        assert profile.site_url == "https://x.atlassian.net"
+        assert profile.cloud_id == "cloud-123"
+        assert profile.api_base_url == gateway_url("cloud-123")
+        assert profile.auth_mode is AuthMode.SCOPED_API_TOKEN
+        assert profile.api_dialect is ApiDialect.GATEWAY_V2
+
+    def test_scoped_token_failure_without_cloud_id(self):
+        with pytest.raises(ConnectionProfileError, match="cloud ID"):
+            load_connection_profile(
+                site_url="https://x.atlassian.net",
+                email="a@b.com",
+                api_token="ATATT3x_dummy=ADA123",
+                interactive=False,
+                resolve_cloud=lambda url: None,
+            )
+
+    def test_legacy_token_profile_resolution(self):
+        profile = load_connection_profile(
+            site_url="https://x.atlassian.net",
+            email="a@b.com",
+            api_token="legacy-token",
+            interactive=False,
+        )
+
+        assert profile.auth_mode is AuthMode.BASIC_API_TOKEN
+        assert profile.api_dialect is ApiDialect.CLOUD_V2
+        assert profile.api_base_url == "https://x.atlassian.net"
+
+    def test_bearer_profile_resolution(self):
+        profile = load_connection_profile(
+            site_url="https://x.atlassian.net",
+            api_token="pat-token",
+            interactive=False,
+        )
+
+        assert profile.auth_mode is AuthMode.BEARER_PAT
+        assert profile.api_dialect is ApiDialect.CLOUD_V2
+
+    def test_v1_config_migration_in_memory(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({
+            "base_url": "https://file.atlassian.net/",
+            "email": "file@test.com",
+            "api_token": "file-token",
+        }))
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: config_file)
+
+        profile = load_connection_profile(interactive=False)
+
+        assert profile.site_url == "https://file.atlassian.net"
+        assert profile.api_base_url == "https://file.atlassian.net"
+        assert profile.auth_mode is AuthMode.BASIC_API_TOKEN
+
+    def test_v2_config_roundtrip(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.json"
+        save_connection_config(
+            site_url="https://x.atlassian.net",
+            auth=AuthConfig(type=AuthMode.COOKIE, cookie_header="session=abc"),
+            path=config_file,
+        )
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: config_file)
+
+        profile = load_connection_profile(interactive=False)
+
+        assert profile.auth_mode is AuthMode.COOKIE
+        assert profile.api_dialect is ApiDialect.COOKIE_V1
+
+    def test_local_config_precedence(self, tmp_path, monkeypatch):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            auth=AuthConfig(type=AuthMode.BEARER_PAT, token="global"),
+            path=global_config,
+        )
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        save_connection_config(
+            site_url="https://local.atlassian.net",
+            auth=AuthConfig(type=AuthMode.COOKIE, cookie_header="session=abc"),
+            path=local_dir / "config.json",
+        )
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        profile = load_connection_profile(start_dir=tmp_path / "docs" / "export", interactive=False)
+
+        assert profile.site_url == "https://local.atlassian.net"
+        assert profile.auth_mode is AuthMode.COOKIE
+        assert profile.config_source.endswith("docs/.conex/config.json")
+
+    def test_global_fallback(self, tmp_path, monkeypatch):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            auth=AuthConfig(type=AuthMode.BEARER_PAT, token="global"),
+            path=global_config,
+        )
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        profile = load_connection_profile(start_dir=tmp_path / "docs", interactive=False)
+
+        assert profile.site_url == "https://global.atlassian.net"
+        assert profile.config_source == str(global_config)
+
+    def test_find_local_config_from_output_upward(self, tmp_path):
+        config_file = tmp_path / "docs" / ".conex" / "config.json"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text("{}")
+
+        assert find_local_config(tmp_path / "docs" / "export") == config_file

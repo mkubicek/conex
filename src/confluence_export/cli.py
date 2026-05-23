@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
-import termios
 from pathlib import Path
 
 import requests
@@ -13,13 +13,21 @@ import requests
 from confluence_export.cache import CacheStore
 from confluence_export.client import AuthenticationError, ConfluenceClient
 from confluence_export.config import (
+    ApiDialect,
+    AuthConfig,
+    AuthMode,
     Config,
+    ConnectionProfile,
+    ConnectionProfileError,
     config_path,
     gateway_url,
+    is_gateway_url,
     is_atlassian_site_url,
     is_scoped_token,
-    load_config,
-    save_config,
+    load_connection_profile,
+    local_config_path,
+    resolve_cloud_id,
+    save_connection_config,
 )
 from confluence_export.diff import compute_diff, format_diff, scan_export_dir
 from confluence_export.tree import (
@@ -34,140 +42,25 @@ from confluence_export.exporter import Exporter
 from confluence_export.types import Space
 
 
-def _read_hidden_line(prompt: str) -> str:
-    """Read a line from the terminal with echo disabled, bypassing the TTY line buffer limit."""
-    print(prompt, end="", file=sys.stderr, flush=True)
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        new = termios.tcgetattr(fd)
-        # Disable echo and canonical mode (removes ~1024 byte line buffer limit)
-        new[3] = new[3] & ~(termios.ECHO | termios.ICANON)
-        new[6][termios.VMIN] = 1
-        new[6][termios.VTIME] = 0
-        termios.tcsetattr(fd, termios.TCSADRAIN, new)
-
-        chars = []
-        while True:
-            ch = os.read(fd, 1)
-            if ch in (b"\r", b"\n", b""):
-                break
-            if ch == b"\x03":  # Ctrl+C
-                raise KeyboardInterrupt
-            chars.append(ch)
-        print(file=sys.stderr)  # newline after hidden input
-        return b"".join(chars).decode("utf-8", errors="replace")
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
-def _prompt_browser_credentials(base_url: str, reason: str) -> tuple[str, str]:
-    """Prompt for browser credentials. Returns (type, value) where type is 'bearer' or 'cookie'."""
-    print(f"\n{reason}", file=sys.stderr)
-    print(
-        f"\nTo authenticate via browser session:\n"
-        f"  1. Open {base_url} in your browser and log in\n"
-        f"  2. Open DevTools (F12) -> Network tab\n"
-        f"  3. Reload the page and click any API request to /wiki/\n"
-        f"  4. Copy the 'Cookie' or 'Authorization' header value\n"
-        f"\n"
-        f"Cookie headers use Confluence's legacy REST read endpoints for this run.\n",
-        file=sys.stderr,
-    )
-    try:
-        value = _read_hidden_line("Paste cookie or token (input hidden): ").strip()
-    except (KeyboardInterrupt, EOFError):
-        print("\nCancelled.", file=sys.stderr)
-        sys.exit(1)
-
-    if not value:
-        print("No credentials provided.", file=sys.stderr)
-        sys.exit(1)
-
-    # Strip accidental "Bearer " prefix
-    if value.lower().startswith("bearer "):
-        return ("bearer", value[len("bearer "):])
-
-    # Cookies: contain "=" (key=value), optionally with ";" separators
-    # Bearer tokens are opaque strings without "="
-    if "=" in value:
-        return ("cookie", value)
-
-    return ("bearer", value)
-
-
-def _apply_browser_credentials(client: ConfluenceClient, base_url: str, reason: str) -> None:
-    """Prompt for browser credentials, verify with a quick API call, apply to client."""
-    cred_type, value = _prompt_browser_credentials(base_url, reason)
-    if cred_type == "cookie":
-        client.set_cookies(value)
-    else:
-        client.set_bearer_token(value)
-
-    # Verify credentials with a minimal request (1 space, fast)
-    print("Verifying credentials...", file=sys.stderr, flush=True)
-    try:
-        client.verify_auth()
-    except AuthenticationError as exc:
-        print(f"Authentication failed (HTTP {exc.status_code}).", file=sys.stderr)
-        sys.exit(1)
-    except requests.exceptions.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "?"
-        print(f"Authentication failed (HTTP {status}).", file=sys.stderr)
-        sys.exit(1)
-    print("Authenticated.", file=sys.stderr, flush=True)
-
-
 def _resolve_cloud_id(site_url: str) -> str | None:
-    """Look up the Confluence cloud ID for a site URL via /_edge/tenant_info.
-
-    The endpoint is unauthenticated and returns `{"cloudId": "<uuid>"}`.
-    Returns None on any failure so callers can fall back to the site URL.
-    """
-    try:
-        resp = requests.get(
-            site_url.rstrip("/") + "/_edge/tenant_info",
-            headers={"Accept": "application/json"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        cloud_id = resp.json().get("cloudId")
-        return cloud_id if isinstance(cloud_id, str) and cloud_id else None
-    except (requests.exceptions.RequestException, ValueError):
-        return None
+    """Compatibility wrapper for tests and older callers."""
+    return resolve_cloud_id(site_url)
 
 
 def _maybe_route_via_gateway(config: Config) -> Config:
-    """Rewrite a site-URL `base_url` to the OAuth gateway when the token is scoped.
-
-    Atlassian scoped API tokens (ATATT…=ADA…) are rejected with 401 against
-    the site URL — they must go through `api.atlassian.com/ex/confluence/{cloudId}`.
-    This is invisible to users: we detect a site URL paired with a scoped token,
-    resolve the cloudId, rewrite the config, and persist so the round-trip
-    happens at most once per token rotation.
-    """
+    """Return a runtime gateway Config for legacy callers without persisting it."""
     if not (is_atlassian_site_url(config.base_url) and is_scoped_token(config.api_token)):
         return config
 
     cloud_id = _resolve_cloud_id(config.base_url)
     if not cloud_id:
-        # Cloud ID lookup failed — leave config alone and let the request fail
-        # with the underlying 401 so the user sees the real error.
         return config
 
-    new_url = gateway_url(cloud_id)
-    print(
-        f"Routing scoped token through OAuth gateway: {new_url}",
-        file=sys.stderr,
+    return Config(
+        base_url=gateway_url(cloud_id),
+        email=config.email,
+        api_token=config.api_token,
     )
-    config.base_url = new_url
-    try:
-        save_config(config)
-    except OSError:
-        # If we can't persist (e.g. read-only filesystem in CI), the rewrite
-        # still applies for this run — next run will redo the lookup.
-        pass
-    return config
 
 
 def _is_auth_error(exc: Exception) -> int | None:
@@ -186,27 +79,31 @@ def _is_auth_error(exc: Exception) -> int | None:
 
 
 def _with_auth_fallback(fn, client: ConfluenceClient, config) -> object:
-    """Call fn(); on auth error, prompt for a browser token and retry once."""
+    """Call fn(); on auth error, fail clearly without interactive fallback."""
     try:
         return fn()
     except Exception as exc:
         status = _is_auth_error(exc)
         if status is None:
             raise
-        reason = f"Authentication failed (HTTP {status}). Browser credentials are needed."
-        _apply_browser_credentials(client, config.base_url, reason)
-        try:
-            return fn()
-        except Exception as exc2:
-            status2 = _is_auth_error(exc2)
-            if status2 is None:
-                raise
-            print(
-                f"\nBrowser credentials also rejected (HTTP {status2}). "
-                f"They may have expired — try again with fresh credentials.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        print(
+            "Authentication failed and no interactive prompt is available.",
+            file=sys.stderr,
+        )
+        print(f"Reason: HTTP {status} from Confluence.", file=sys.stderr)
+        print(
+            "Next step: run `confluence-export configure` or provide explicit credentials.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _config_start_dir(args: argparse.Namespace) -> Path:
+    if args.command == "export":
+        return Path(args.output)
+    if args.command == "diff":
+        return Path(args.export_dir)
+    return Path.cwd()
 
 
 def main() -> None:
@@ -214,7 +111,15 @@ def main() -> None:
         prog="confluence-export",
         description="LLM-ready Confluence page tree exporter",
     )
-    parser.add_argument("--base-url", help="Confluence base URL")
+    parser.add_argument("--site-url", help="Confluence site URL")
+    parser.add_argument("--base-url", help="Alias for --site-url")
+    parser.add_argument("--api-base-url", help="Actual Confluence API base URL")
+    parser.add_argument("--cloud-id", help="Atlassian cloud ID for OAuth gateway routing")
+    parser.add_argument(
+        "--auth-type",
+        choices=[mode.value for mode in AuthMode],
+        help="Authentication mode",
+    )
     parser.add_argument("--email", help="User email for authentication")
     parser.add_argument("--api-token", "--pat", help="API token or PAT for authentication")
     parser.add_argument("--cookie", help="Browser cookie string for authentication")
@@ -223,7 +128,15 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command")
 
     # configure
-    sub.add_parser("configure", help="Interactive credential setup")
+    configure_p = sub.add_parser("configure", help="Interactive credential setup")
+    configure_p.add_argument(
+        "--local",
+        nargs="?",
+        const=".",
+        default=None,
+        metavar="DIR",
+        help="Write DIR/.conex/config.json instead of the global config",
+    )
 
     # spaces
     sub.add_parser("spaces", help="List accessible spaces")
@@ -273,54 +186,41 @@ def main() -> None:
         sys.exit(1)
 
     if args.command == "configure":
-        _cmd_configure()
+        _cmd_configure(local_dir=args.local)
         return
 
-    # All other commands need config + client
+    # All other commands need a resolved profile + client.
     try:
-        config = load_config(
+        profile = load_connection_profile(
+            site_url=args.site_url,
             base_url=args.base_url,
+            api_base_url=args.api_base_url,
+            cloud_id=args.cloud_id,
+            auth_type=args.auth_type,
             email=args.email,
             api_token=args.api_token,
+            cookie=args.cookie,
+            start_dir=_config_start_dir(args),
+            interactive=sys.stdin.isatty(),
         )
-    except ValueError as exc:
+    except ConnectionProfileError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         print(f"\nRun 'confluence-export configure' to set up credentials.", file=sys.stderr)
         sys.exit(1)
 
-    if not args.cookie:
-        config = _maybe_route_via_gateway(config)
-
-    client = ConfluenceClient(config, verbose=args.verbose)
-
-    if args.cookie:
-        client.set_cookies(args.cookie)
-        print("Using browser cookies. Verifying credentials...", file=sys.stderr, flush=True)
-        try:
-            client.verify_auth()
-        except Exception:
-            print("Cookie authentication failed.", file=sys.stderr)
-            sys.exit(1)
-        print("Authenticated.", file=sys.stderr, flush=True)
-    elif config.needs_token:
-        _apply_browser_credentials(
-            client, config.base_url, "No API token configured. Browser credentials are needed."
-        )
-
-    cache = CacheStore()
+    client = ConfluenceClient(profile, verbose=args.verbose)
 
     match args.command:
         case "spaces":
-            _with_auth_fallback(lambda: _cmd_spaces(client), client, config)
+            _with_auth_fallback(lambda: _cmd_spaces(client), client, profile)
         case "tree":
-            _cmd_tree(client, cache, config, args.space_key)
+            _cmd_tree(client, CacheStore(), profile, args.space_key)
         case "find":
-            _cmd_find(client, cache, config, args.space_key, args.query)
+            _cmd_find(client, CacheStore(), profile, args.space_key, args.query)
         case "export":
             _cmd_export(
                 client,
-                cache,
-                config,
+                profile,
                 space_key=args.space_key,
                 path_filter=args.path,
                 output_dir=args.output,
@@ -336,66 +236,132 @@ def main() -> None:
         case "diff":
             _cmd_diff(
                 client,
-                cache,
-                config,
+                CacheStore(),
+                profile,
                 space_key=args.space_key,
                 export_dir=args.export_dir,
                 path_filter=args.path,
                 include_archived=args.include_archived,
             )
         case "refresh":
-            _cmd_refresh(client, cache, config, args.space_key)
+            _cmd_refresh(client, CacheStore(), profile, args.space_key)
 
 
 # -- command implementations -------------------------------------------------
 
 
-def _cmd_configure() -> None:
+def _mask_secret(value: str) -> str:
+    return f"{value[:4]}...{value[-4:]}" if len(value) > 8 else ""
+
+
+def _auth_label(mode: AuthMode) -> str:
+    match mode:
+        case AuthMode.BASIC_API_TOKEN:
+            return "Basic API token"
+        case AuthMode.SCOPED_API_TOKEN:
+            return "scoped API token"
+        case AuthMode.BEARER_PAT:
+            return "Bearer token (PAT)"
+        case AuthMode.COOKIE:
+            return "cookie session"
+
+
+def _api_mode_label(dialect: ApiDialect) -> str:
+    match dialect:
+        case ApiDialect.CLOUD_V2:
+            return "Confluence REST v2"
+        case ApiDialect.GATEWAY_V2:
+            return "OAuth gateway"
+        case ApiDialect.COOKIE_V1:
+            return "Confluence REST v1 compatibility"
+
+
+def _read_existing_config(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
+
+
+def _existing_config_defaults(path: Path) -> tuple[str, str, str]:
+    existing = _read_existing_config(path)
+    if existing.get("version") == 2:
+        auth = existing.get("auth") or {}
+        secret = auth.get("token") or auth.get("cookie_header") or ""
+        return (
+            str(existing.get("site_url", "") or ""),
+            str(auth.get("email", "") or ""),
+            str(secret or ""),
+        )
+
+    base_url = str(existing.get("base_url", "") or "")
+    if is_gateway_url(base_url):
+        print(
+            "Existing config contains an OAuth gateway URL. Enter the Confluence site URL.",
+            file=sys.stderr,
+        )
+        base_url = ""
+    return (
+        base_url,
+        str(existing.get("email", "") or ""),
+        str(existing.get("api_token", "") or ""),
+    )
+
+
+def _cmd_configure(local_dir: str | None = None) -> None:
     """Interactive credential setup."""
+    target = local_config_path(local_dir) if local_dir is not None else config_path()
     print("Confluence Export - Configuration")
-    print(f"Config file: {config_path()}\n")
+    print(f"Config file: {target}\n")
 
-    # Load existing config for defaults
-    existing: dict = {}
-    cp = config_path()
-    if cp.exists():
-        import json
+    existing_site_url, existing_email, existing_secret = _existing_config_defaults(target)
 
-        with open(cp) as f:
-            existing = json.load(f)
+    site_url = input(f"Site URL [{existing_site_url}]: ").strip()
+    if not site_url:
+        site_url = existing_site_url
 
-    base_url = input(f"Base URL [{existing.get('base_url', '')}]: ").strip()
-    if not base_url:
-        base_url = existing.get("base_url", "")
-
-    email = input(f"Email (leave empty for PAT Bearer auth) [{existing.get('email', '')}]: ").strip()
+    email = input(
+        f"Email (leave empty for PAT Bearer auth or cookie session) [{existing_email}]: "
+    ).strip()
     if not email:
-        email = existing.get("email", "")
+        email = existing_email
 
-    # Mask existing token
-    existing_token = existing.get("api_token", "")
-    masked = f"{existing_token[:4]}...{existing_token[-4:]}" if len(existing_token) > 8 else ""
-    token_label = "API Token" if email else "Personal Access Token (PAT)"
-    token = input(f"{token_label} [{masked}]: ").strip()
-    if not token:
-        token = existing_token
+    masked = _mask_secret(existing_secret)
+    secret_label = "API token" if email else "PAT or Cookie header"
+    secret = input(f"{secret_label} [{masked}]: ").strip()
+    if not secret:
+        secret = existing_secret
 
-    if not base_url:
-        print("Error: base_url is required.", file=sys.stderr)
+    if not site_url:
+        print("Error: site_url is required.", file=sys.stderr)
         sys.exit(1)
 
-    if email:
-        print("\nAuth mode: Basic Auth (email + API token)")
+    if not email and "=" in secret:
+        auth = AuthConfig(type=AuthMode.COOKIE, cookie_header=secret)
+    elif not email:
+        auth = AuthConfig(type=AuthMode.BEARER_PAT, token=secret)
+    elif is_scoped_token(secret):
+        auth = AuthConfig(type=AuthMode.SCOPED_API_TOKEN, email=email, token=secret)
     else:
-        print("\nAuth mode: Bearer token (PAT)")
+        auth = AuthConfig(type=AuthMode.BASIC_API_TOKEN, email=email, token=secret)
 
-    cfg = Config(base_url=base_url.rstrip("/"), email=email, api_token=token)
-    path = save_config(cfg)
+    cloud_id = None
+    api_base_url = ""
+    if auth.type is AuthMode.SCOPED_API_TOKEN and not is_gateway_url(site_url):
+        cloud_id = resolve_cloud_id(site_url)
+        if cloud_id:
+            api_base_url = gateway_url(cloud_id)
+
+    print(f"\nAuth mode: {_auth_label(auth.type)}")
+    path = save_connection_config(
+        site_url=site_url.rstrip("/"),
+        auth=auth,
+        path=target,
+        cloud_id=cloud_id,
+        api_base_url=api_base_url,
+    )
     print(f"\nConfiguration saved to {path}")
-    # Scoped tokens must be routed through the OAuth gateway. Resolve the
-    # cloudId now so the user sees the rewrite (and the eventual saved URL)
-    # before they hit the first command.
-    _maybe_route_via_gateway(cfg)
     print(
         "\nIf this is a scoped API token, grant these five read scopes:\n"
         "  read:space:confluence\n"
@@ -424,9 +390,11 @@ def _cmd_spaces(client: ConfluenceClient) -> None:
         print(f"{s.key:<{key_w}}  {s.name:<{name_w}}  {s.type:<8}  {s.status}")
 
 
-def _cmd_tree(client: ConfluenceClient, cache: CacheStore, config: Config, space_key: str) -> None:
+def _cmd_tree(
+    client: ConfluenceClient, cache: CacheStore, profile: ConnectionProfile, space_key: str
+) -> None:
     """Show page hierarchy."""
-    space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
+    space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, profile)
     cs = cache.ensure_loaded(client, space)
 
     roots = build_tree(cs.pages)
@@ -436,10 +404,14 @@ def _cmd_tree(client: ConfluenceClient, cache: CacheStore, config: Config, space
 
 
 def _cmd_find(
-    client: ConfluenceClient, cache: CacheStore, config: Config, space_key: str, query: str
+    client: ConfluenceClient,
+    cache: CacheStore,
+    profile: ConnectionProfile,
+    space_key: str,
+    query: str,
 ) -> None:
     """Search pages by title."""
-    space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
+    space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, profile)
     cs = cache.ensure_loaded(client, space)
 
     results = find_pages(cs.pages, query)
@@ -453,10 +425,124 @@ def _cmd_find(
         print(f"{p.id:<{id_w}}  {path}")
 
 
+def _nearest_existing_parent(path: Path) -> Path:
+    current = path
+    while not current.exists() and current.parent != current:
+        current = current.parent
+    return current
+
+
+def _check_output_writable(output_dir: str) -> None:
+    out = Path(output_dir).expanduser().resolve()
+    if out.exists() and not out.is_dir():
+        raise RuntimeError(f"{out} exists and is not a directory")
+    parent = _nearest_existing_parent(out)
+    if not parent.exists() or not os.access(parent, os.W_OK | os.X_OK):
+        raise RuntimeError(f"{parent} is not writable")
+
+
+def _preflight_error_message(exc: Exception) -> str:
+    if isinstance(exc, AuthenticationError):
+        return f"HTTP {exc.status_code} from {exc.url}"
+    if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
+        return f"HTTP {exc.response.status_code}"
+    return str(exc) or exc.__class__.__name__
+
+
+def _ensure_gateway_route(profile: ConnectionProfile) -> None:
+    if not profile.cloud_id or not is_gateway_url(profile.api_base_url):
+        raise RuntimeError("cloud ID or gateway URL is missing")
+
+
+def _require_space(client: ConfluenceClient, space_key: str) -> Space:
+    space = _find_space(client, space_key)
+    if space is None:
+        raise RuntimeError(f"space '{space_key}' not found")
+    return space
+
+
+def _run_export_preflight(
+    client: ConfluenceClient,
+    profile: ConnectionProfile,
+    *,
+    space_key: str,
+    output_dir: str,
+    no_media: bool,
+    no_git: bool,
+) -> Space:
+    print(f"Using config: {profile.config_source}", file=sys.stderr)
+    print(f"Auth: {_auth_label(profile.auth_mode)}", file=sys.stderr)
+    print(f"API mode: {_api_mode_label(profile.api_dialect)}", file=sys.stderr)
+    print(f"Site: {profile.site_url}", file=sys.stderr)
+    if profile.cloud_id:
+        print(f"Cloud ID: {profile.cloud_id}", file=sys.stderr)
+    print(f"Output: {Path(output_dir).expanduser().resolve()}", file=sys.stderr)
+    print("\nPreflight:", file=sys.stderr)
+
+    failures: list[str] = []
+
+    def step(label: str, fn):
+        try:
+            result = fn()
+            print(f"  ✓ {label}", file=sys.stderr)
+            return result
+        except Exception as exc:
+            reason = _preflight_error_message(exc)
+            failures.append(f"{label}: {reason}")
+            print(f"  ✗ {label}", file=sys.stderr)
+            return None
+
+    step("authenticated", client.verify_auth)
+
+    if profile.api_dialect is ApiDialect.GATEWAY_V2:
+        step("gateway route resolved", lambda: _ensure_gateway_route(profile))
+
+    space = step(
+        "space resolved",
+        lambda: _require_space(client, space_key),
+    )
+
+    sample_page_id = None
+    if space is not None:
+        sample_page_id = step("page listing available", lambda: client.probe_page_listing(space))
+    else:
+        failures.append("page listing available: skipped because space did not resolve")
+        print("  ✗ page listing available", file=sys.stderr)
+
+    if not no_media:
+        if sample_page_id:
+            step("attachment listing available", lambda: client.probe_attachment_listing(sample_page_id))
+        else:
+            print("  ✓ attachment listing skipped (no pages)", file=sys.stderr)
+
+    step("output directory writable", lambda: _check_output_writable(output_dir))
+
+    if no_git:
+        print("  ✓ git skipped", file=sys.stderr)
+    else:
+        from confluence_export.git import git_available
+
+        if git_available():
+            print("  ✓ git available", file=sys.stderr)
+        else:
+            print("  ! git unavailable; export will continue without git", file=sys.stderr)
+
+    if failures:
+        print("\nPreflight failed; export did not start.", file=sys.stderr)
+        for failure in failures:
+            print(f"Reason: {failure}", file=sys.stderr)
+        print(
+            "Next step: run `confluence-export configure` or provide --cloud-id / --api-base-url.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    return space
+
+
 def _cmd_export(
     client: ConfluenceClient,
-    cache: CacheStore,
-    config: Config,
+    profile: ConnectionProfile,
     *,
     space_key: str,
     path_filter: str | None,
@@ -471,10 +557,18 @@ def _cmd_export(
     no_author_lookup: bool = False,
 ) -> None:
     """Export page tree as LLM-ready markdown."""
-    space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
+    space = _run_export_preflight(
+        client,
+        profile,
+        space_key=space_key,
+        output_dir=output_dir,
+        no_media=no_media,
+        no_git=no_git,
+    )
 
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
+    cache = CacheStore()
 
     # TODO(migration): Remove after 2027-01-01
     from confluence_export.media import migrate_media_dirs
@@ -498,7 +592,7 @@ def _cmd_export(
     exporter = Exporter(
         client,
         cache,
-        config.base_url,
+        profile.site_url,
         download_media=not no_media,
         render_drawio=not no_drawio_render,
         debug=debug,
@@ -526,7 +620,7 @@ def _cmd_export(
 def _cmd_diff(
     client: ConfluenceClient,
     cache: CacheStore,
-    config: Config,
+    profile: ConnectionProfile,
     *,
     space_key: str,
     export_dir: str,
@@ -548,9 +642,9 @@ def _cmd_diff(
     if cs is not None:
         space = cs.space
     else:
-        space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
+        space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, profile)
     cs = _with_auth_fallback(
-        lambda: cache.refresh(client, space, include_archived=include_archived), client, config
+        lambda: cache.refresh(client, space, include_archived=include_archived), client, profile
     )
 
     # Filter API pages
@@ -580,9 +674,11 @@ def _cmd_diff(
     print(format_diff(result, cs.pages))
 
 
-def _cmd_refresh(client: ConfluenceClient, cache: CacheStore, config: Config, space_key: str) -> None:
+def _cmd_refresh(
+    client: ConfluenceClient, cache: CacheStore, profile: ConnectionProfile, space_key: str
+) -> None:
     """Force-refresh cache for a space."""
-    space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, config)
+    space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, profile)
     cs = cache.refresh(client, space)
     print(f"Cache refreshed: {len(cs.pages)} pages (updated {cs.updated_at})")
 
@@ -590,9 +686,10 @@ def _cmd_refresh(client: ConfluenceClient, cache: CacheStore, config: Config, sp
 # -- helpers -----------------------------------------------------------------
 
 
-def _resolve_space(client: ConfluenceClient, space_key: str) -> Space:
+def _find_space(client: ConfluenceClient, space_key: str, *, announce: bool = True) -> Space | None:
     """Find a space by key (case-insensitive)."""
-    print(f"Resolving space '{space_key}'...", file=sys.stderr, flush=True)
+    if announce:
+        print(f"Resolving space '{space_key}'...", file=sys.stderr, flush=True)
     # Try server-side filter first — O(1) round trip vs. paging every space.
     space = client.get_space_by_key(space_key)
     if space is not None:
@@ -603,5 +700,13 @@ def _resolve_space(client: ConfluenceClient, space_key: str) -> Space:
     for s in client.get_spaces():
         if s.key.upper() == key_upper:
             return s
+    return None
+
+
+def _resolve_space(client: ConfluenceClient, space_key: str) -> Space:
+    """Find a space by key (case-insensitive), exiting on failure."""
+    space = _find_space(client, space_key)
+    if space is not None:
+        return space
     print(f"Error: space '{space_key}' not found.", file=sys.stderr)
     sys.exit(1)

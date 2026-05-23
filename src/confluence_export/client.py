@@ -9,7 +9,13 @@ from urllib.parse import parse_qs, quote, urlparse
 import requests
 from requests.auth import HTTPBasicAuth
 
-from confluence_export.config import Config
+from confluence_export.config import (
+    ApiDialect,
+    AuthConfig,
+    AuthMode,
+    Config,
+    ConnectionProfile,
+)
 from confluence_export.types import Attachment, Page, Space, Version
 
 
@@ -29,25 +35,46 @@ class ConfluenceClient:
     size is 10, which accommodates the 8-worker thread pools used by callers.
     """
 
-    def __init__(self, config: Config, verbose: bool = False):
-        self.base_url = config.base_url
+    def __init__(self, config: Config | ConnectionProfile, verbose: bool = False):
+        if isinstance(config, ConnectionProfile):
+            profile = config
+        else:
+            profile = ConnectionProfile(
+                site_url=config.base_url,
+                api_base_url=config.base_url,
+                cloud_id=None,
+                auth_mode=AuthMode.BEARER_PAT if config.use_bearer else AuthMode.BASIC_API_TOKEN,
+                api_dialect=ApiDialect.CLOUD_V2,
+                config_source="legacy Config",
+                interactive=True,
+                auth=AuthConfig(
+                    type=AuthMode.BEARER_PAT if config.use_bearer else AuthMode.BASIC_API_TOKEN,
+                    email=config.email,
+                    token=config.api_token,
+                ),
+            )
+
+        self.profile = profile
+        self.base_url = profile.api_base_url
         self.verbose = verbose
 
         self.session = requests.Session()
         self.session.headers.update({"Accept": "application/json"})
         self.session.timeout = 30
-        self.api_flavor = "v2"
+        self.api_dialect = profile.api_dialect
+        self.api_flavor = "cookie_v1" if profile.api_dialect is ApiDialect.COOKIE_V1 else "v2"
         self._space_key_by_id: dict[str, str] = {}
 
-        if config.api_token:
-            if config.use_bearer:
-                # PAT-only: use Bearer token auth
-                self.session.headers["Authorization"] = f"Bearer {config.api_token}"
-                self._log("Using Bearer token auth (PAT)")
-            else:
-                # Email + API token: use Basic Auth
-                self.session.auth = HTTPBasicAuth(config.email, config.api_token)
-                self._log(f"Using Basic Auth with email: {config.email}")
+        auth = profile.auth
+        if profile.auth_mode is AuthMode.COOKIE and auth.cookie_header:
+            self._set_cookie_header(auth.cookie_header)
+            self._log("Using browser cookie auth")
+        elif profile.auth_mode is AuthMode.BEARER_PAT and auth.token:
+            self.session.headers["Authorization"] = f"Bearer {auth.token}"
+            self._log("Using Bearer token auth (PAT)")
+        elif auth.token:
+            self.session.auth = HTTPBasicAuth(auth.email, auth.token)
+            self._log(f"Using Basic Auth with email: {auth.email}")
         else:
             self._log("No credentials configured — browser token required")
 
@@ -62,10 +89,10 @@ class ConfluenceClient:
         self.session.auth = None
         self.session.cookies.clear()
         self.session.headers["Authorization"] = f"Bearer {token}"
+        self.api_dialect = ApiDialect.CLOUD_V2
         self.api_flavor = "v2"
 
-    def set_cookies(self, cookie_string: str) -> None:
-        """Replace current credentials with browser session cookies."""
+    def _set_cookie_header(self, cookie_string: str) -> None:
         self.session.auth = None
         self.session.headers.pop("Authorization", None)
         self.session.cookies.clear()
@@ -74,11 +101,16 @@ class ConfluenceClient:
             if "=" in pair:
                 name, _, value = pair.partition("=")
                 self.session.cookies.set(name.strip(), value.strip())
+
+    def set_cookies(self, cookie_string: str) -> None:
+        """Replace current credentials with browser session cookies."""
+        self._set_cookie_header(cookie_string)
+        self.api_dialect = ApiDialect.COOKIE_V1
         self.api_flavor = "cookie_v1"
 
     def verify_auth(self) -> None:
         """Verify current credentials with a minimal request."""
-        if self.api_flavor == "cookie_v1":
+        if self.api_dialect is ApiDialect.COOKIE_V1:
             self._get("/wiki/rest/api/space", {"limit": "1"})
         else:
             self._get("/wiki/api/v2/spaces", {"limit": "1"})
@@ -91,7 +123,37 @@ class ConfluenceClient:
         the flag is set. Callers (e.g. the cache) use this to label what the server
         actually delivered, not just what the caller asked for.
         """
-        return self.api_flavor != "cookie_v1"
+        return self.api_dialect is not ApiDialect.COOKIE_V1
+
+    def probe_page_listing(self, space: Space) -> str | None:
+        """Verify page listing and return one page ID when available."""
+        if self.api_dialect is ApiDialect.COOKIE_V1:
+            space_key = space.key or self._space_key_for_v1(space.id)
+            data = self._get(
+                "/wiki/rest/api/content",
+                {
+                    "spaceKey": space_key,
+                    "type": "page",
+                    "status": "current",
+                    "limit": "1",
+                },
+            )
+        else:
+            data = self._get(f"/wiki/api/v2/spaces/{space.id}/pages", {"limit": "1"})
+        results = data.get("results", [])
+        if not results:
+            return None
+        return str(results[0].get("id", "") or "") or None
+
+    def probe_attachment_listing(self, page_id: str) -> None:
+        """Verify attachment listing for a page without downloading files."""
+        if self.api_dialect is ApiDialect.COOKIE_V1:
+            self._get(
+                f"/wiki/rest/api/content/{quote(page_id, safe='')}/child/attachment",
+                {"limit": "1"},
+            )
+        else:
+            self._get(f"/wiki/api/v2/pages/{quote(page_id, safe='')}/attachments", {"limit": "1"})
 
     def _get(self, path: str, params: dict | None = None, max_retries: int = 3) -> dict:
         """GET with retry + rate-limit handling."""
@@ -302,7 +364,7 @@ class ConfluenceClient:
     # -- API methods ---------------------------------------------------------
 
     def get_spaces(self) -> list[Space]:
-        if self.api_flavor == "cookie_v1":
+        if self.api_dialect is ApiDialect.COOKIE_V1:
             results = self._paginate_offset("/wiki/rest/api/space", {"limit": "250"})
             return [self._space_from_v1(r) for r in results]
 
@@ -310,7 +372,7 @@ class ConfluenceClient:
         return [self._remember_space(Space.from_api(r)) for r in results]
 
     def get_pages_in_space(self, space_id: str, include_archived: bool = False) -> list[Page]:
-        if self.api_flavor == "cookie_v1":
+        if self.api_dialect is ApiDialect.COOKIE_V1:
             space_key = self._space_key_for_v1(space_id)
             # v1 status is single-valued, so archived pages need a second call.
             statuses = ["current", "archived"] if include_archived else ["current"]
@@ -338,7 +400,7 @@ class ConfluenceClient:
 
     def get_space_by_key(self, key: str) -> Space | None:
         """Look up a single space by key using the server-side `keys` filter."""
-        if self.api_flavor == "cookie_v1":
+        if self.api_dialect is ApiDialect.COOKIE_V1:
             try:
                 data = self._get(f"/wiki/rest/api/space/{quote(key, safe='')}")
             except requests.exceptions.HTTPError as exc:
@@ -354,7 +416,7 @@ class ConfluenceClient:
         return self._remember_space(Space.from_api(results[0]))
 
     def get_page_by_id(self, page_id: str) -> Page:
-        if self.api_flavor == "cookie_v1":
+        if self.api_dialect is ApiDialect.COOKIE_V1:
             data = self._get(
                 f"/wiki/rest/api/content/{quote(page_id, safe='')}",
                 {"expand": "body.storage,version,ancestors,space,history,extensions"},
@@ -367,7 +429,7 @@ class ConfluenceClient:
     def get_folder_by_id(self, folder_id: str) -> dict | None:
         """Fetch a folder by ID. Returns raw API dict or None on failure."""
         try:
-            if self.api_flavor == "cookie_v1":
+            if self.api_dialect is ApiDialect.COOKIE_V1:
                 data = self._get(
                     f"/wiki/rest/api/content/{quote(folder_id, safe='')}",
                     {"expand": "ancestors,space,extensions"},
@@ -378,7 +440,7 @@ class ConfluenceClient:
             return None
 
     def get_attachments(self, page_id: str) -> list[Attachment]:
-        if self.api_flavor == "cookie_v1":
+        if self.api_dialect is ApiDialect.COOKIE_V1:
             path = f"/wiki/rest/api/content/{quote(page_id, safe='')}/child/attachment"
             results = self._paginate_offset(
                 path, {"expand": "version,metadata,extensions,history", "limit": "250"}

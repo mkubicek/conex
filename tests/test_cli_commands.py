@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -15,7 +16,14 @@ from confluence_export.cli import (
     _resolve_space,
     main,
 )
-from confluence_export.config import Config
+from confluence_export.config import (
+    ApiDialect,
+    AuthConfig,
+    AuthMode,
+    Config,
+    ConnectionProfile,
+    ConnectionProfileError,
+)
 from confluence_export.types import CachedSpace, Page, Space, Version
 
 SCOPED_TOKEN = "ATATT3xFfGF0_dummy_payload_TgVilzYuG3Sh8MtCp_8=ADA80198"
@@ -39,6 +47,34 @@ def _cached_space():
 
 def _config(base_url="https://x.atlassian.net", api_token="tok"):
     return Config(base_url=base_url, email="", api_token=api_token)
+
+
+def _profile(
+    site_url="https://x.atlassian.net",
+    api_base_url=None,
+    auth_mode=AuthMode.BEARER_PAT,
+    api_dialect=ApiDialect.CLOUD_V2,
+    cloud_id=None,
+    token="tok",
+    email="",
+    cookie_header="",
+):
+    auth = AuthConfig(
+        type=auth_mode,
+        email=email,
+        token=token,
+        cookie_header=cookie_header,
+    )
+    return ConnectionProfile(
+        site_url=site_url,
+        api_base_url=api_base_url or site_url,
+        cloud_id=cloud_id,
+        auth_mode=auth_mode,
+        api_dialect=api_dialect,
+        config_source="test config",
+        interactive=False,
+        auth=auth,
+    )
 
 
 def _mock_client(spaces=None):
@@ -89,7 +125,7 @@ class TestSpacesCommand:
     def test_lists_spaces_with_columns(self, capsys):
         client = _mock_client()
         with patch("sys.argv", ["confluence-export", "spaces"]), \
-             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client):
             main()
         out = capsys.readouterr().out
@@ -100,7 +136,7 @@ class TestSpacesCommand:
     def test_no_spaces_shows_message(self, capsys):
         client = _mock_client(spaces=[])
         with patch("sys.argv", ["confluence-export", "spaces"]), \
-             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client):
             main()
         assert "No spaces found" in capsys.readouterr().out
@@ -112,7 +148,7 @@ class TestTreeCommand:
         cache = MagicMock()
         cache.ensure_loaded.return_value = _cached_space()
         with patch("sys.argv", ["confluence-export", "tree", "TEST"]), \
-             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client), \
              patch("confluence_export.cli.CacheStore", return_value=cache):
             main()
@@ -128,7 +164,7 @@ class TestFindCommand:
         cache = MagicMock()
         cache.ensure_loaded.return_value = _cached_space()
         with patch("sys.argv", ["confluence-export", "find", "TEST", "Child"]), \
-             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client), \
              patch("confluence_export.cli.CacheStore", return_value=cache):
             main()
@@ -141,7 +177,7 @@ class TestFindCommand:
         cache = MagicMock()
         cache.ensure_loaded.return_value = _cached_space()
         with patch("sys.argv", ["confluence-export", "find", "TEST", "zzz-nonexistent"]), \
-             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client), \
              patch("confluence_export.cli.CacheStore", return_value=cache):
             main()
@@ -155,7 +191,7 @@ class TestExportCommand:
         cache.refresh.return_value = _cached_space()
         out = str(tmp_path / "out")
         with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media", "--no-git"]), \
-             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client), \
              patch("confluence_export.cli.CacheStore", return_value=cache):
             main()
@@ -180,7 +216,7 @@ class TestExportCommand:
         legacy.mkdir(parents=True)
         (legacy / ".versions.json").write_text("{}")
         with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media", "--no-git"]), \
-             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client), \
              patch("confluence_export.cli.CacheStore", return_value=cache):
             main()
@@ -197,7 +233,7 @@ class TestExportCommand:
         cache.refresh.return_value = _cached_space()
         out = str(tmp_path / "out")
         with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media"]), \
-             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client), \
              patch("confluence_export.cli.CacheStore", return_value=cache):
             main()
@@ -229,7 +265,7 @@ class TestExportCommand:
         # Use a relative path from tmp_path
         monkeypatch.chdir(tmp_path)
         with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", "output", "--no-media"]), \
-             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client), \
              patch("confluence_export.cli.CacheStore", return_value=cache):
             main()
@@ -249,7 +285,7 @@ class TestExportCommand:
         cache.refresh.return_value = _cached_space()
         out = str(tmp_path / "out")
         with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media", "--no-git"]), \
-             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client), \
              patch("confluence_export.cli.CacheStore", return_value=cache):
             main()
@@ -266,7 +302,7 @@ class TestExportCommand:
             "-o", out, "--no-media", "--no-git", "--no-author-lookup",
         ]
         with patch("sys.argv", argv), \
-             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client), \
              patch("confluence_export.cli.CacheStore", return_value=cache), \
              patch("confluence_export.cli.Exporter") as exporter_cls:
@@ -277,6 +313,21 @@ class TestExportCommand:
 
         assert exporter_cls.call_args.kwargs["skip_author_lookup"] is True
 
+    def test_preflight_failure_before_writing_output(self, tmp_path, capsys):
+        client = _mock_client()
+        client.verify_auth.side_effect = Exception("auth failed")
+        out = tmp_path / "out"
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", str(out), "--no-media", "--no-git"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore") as cache_cls:
+            with pytest.raises(SystemExit):
+                main()
+
+        assert not out.exists()
+        cache_cls.assert_not_called()
+        assert "Preflight failed" in capsys.readouterr().err
+
 
 class TestRefreshCommand:
     def test_refreshes_and_reports(self, capsys):
@@ -284,7 +335,7 @@ class TestRefreshCommand:
         cache = MagicMock()
         cache.refresh.return_value = _cached_space()
         with patch("sys.argv", ["confluence-export", "refresh", "TEST"]), \
-             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client), \
              patch("confluence_export.cli.CacheStore", return_value=cache):
             main()
@@ -294,67 +345,94 @@ class TestRefreshCommand:
 
 
 class TestConfigureCommand:
-    def test_saves_config(self):
+    def test_saves_config(self, tmp_path):
+        config_file = tmp_path / "config.json"
         inputs = iter(["https://x.atlassian.net", "a@b.com", "my-token"])
         with patch("sys.argv", ["confluence-export", "configure"]), \
              patch("builtins.input", side_effect=inputs), \
-             patch("confluence_export.cli.config_path", return_value=Path("/tmp/nope.json")), \
-             patch("confluence_export.cli.save_config") as mock_save:
+             patch("confluence_export.cli.config_path", return_value=config_file):
             main()
-        cfg = mock_save.call_args[0][0]
-        assert cfg.base_url == "https://x.atlassian.net"
-        assert cfg.email == "a@b.com"
-        assert cfg.api_token == "my-token"
+        data = json.loads(config_file.read_text())
+        assert data["version"] == 2
+        assert data["site_url"] == "https://x.atlassian.net"
+        assert data["auth"]["email"] == "a@b.com"
+        assert data["auth"]["token"] == "my-token"
 
-    def test_missing_base_url_exits(self, capsys):
+    def test_missing_site_url_exits(self, capsys, tmp_path):
         inputs = iter(["", "", "tok"])
+        config_file = tmp_path / "missing.json"
         with patch("sys.argv", ["confluence-export", "configure"]), \
              patch("builtins.input", side_effect=inputs), \
-             patch("confluence_export.cli.config_path", return_value=Path("/tmp/nope.json")):
+             patch("confluence_export.cli.config_path", return_value=config_file):
             with pytest.raises(SystemExit) as exc:
                 main()
             assert exc.value.code == 1
-        assert "base_url" in capsys.readouterr().err
+        assert "site_url" in capsys.readouterr().err
 
-    def test_bearer_mode_when_no_email(self, capsys):
+    def test_bearer_mode_when_no_email(self, capsys, tmp_path):
+        config_file = tmp_path / "config.json"
         inputs = iter(["https://x.atlassian.net", "", "my-pat"])
         with patch("sys.argv", ["confluence-export", "configure"]), \
              patch("builtins.input", side_effect=inputs), \
-             patch("confluence_export.cli.config_path", return_value=Path("/tmp/nope.json")), \
-             patch("confluence_export.cli.save_config"):
+             patch("confluence_export.cli.config_path", return_value=config_file):
             main()
         assert "Bearer token" in capsys.readouterr().out
+        data = json.loads(config_file.read_text())
+        assert data["auth"]["type"] == "bearer_pat"
+
+    def test_configure_local_writes_local_config(self, tmp_path):
+        inputs = iter(["https://x.atlassian.net", "", "session=abc"])
+        with patch("sys.argv", ["confluence-export", "configure", "--local", str(tmp_path)]), \
+             patch("builtins.input", side_effect=inputs):
+            main()
+
+        data = json.loads((tmp_path / ".conex" / "config.json").read_text())
+        assert data["auth"]["type"] == "cookie"
 
 
 # -- Cookie and auth flags ---------------------------------------------------
 
 
 class TestCookieFlag:
-    def test_sets_cookies_and_verifies(self, capsys):
+    def test_cookie_profile_is_first_class(self, capsys):
         client = _mock_client()
+        profile = _profile(
+            auth_mode=AuthMode.COOKIE,
+            api_dialect=ApiDialect.COOKIE_V1,
+            token="",
+            cookie_header="session=abc; tok=xyz",
+        )
         with patch("sys.argv", ["confluence-export", "--cookie", "session=abc; tok=xyz", "spaces"]), \
-             patch("confluence_export.cli.load_config", return_value=_config()), \
+             patch("confluence_export.cli.load_connection_profile", return_value=profile) as mock_load, \
              patch("confluence_export.cli.ConfluenceClient", return_value=client):
             main()
-        client.set_cookies.assert_called_once_with("session=abc; tok=xyz")
-        client.verify_auth.assert_called_once_with()
-        assert "Authenticated" in capsys.readouterr().err
+        assert mock_load.call_args.kwargs["cookie"] == "session=abc; tok=xyz"
+        assert "TEST" in capsys.readouterr().out
 
-    def test_bad_cookie_exits(self, capsys):
+    def test_bad_cookie_export_preflight_exits(self, tmp_path, capsys):
         client = _mock_client()
         client.verify_auth.side_effect = Exception("401")
-        with patch("sys.argv", ["confluence-export", "--cookie", "bad=val", "spaces"]), \
-             patch("confluence_export.cli.load_config", return_value=_config()), \
+        with patch("sys.argv", ["confluence-export", "--cookie", "bad=val", "export", "TEST", "-o", str(tmp_path / "out")]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile(
+                 auth_mode=AuthMode.COOKIE,
+                 api_dialect=ApiDialect.COOKIE_V1,
+                 token="",
+                 cookie_header="bad=val",
+             )), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client):
             with pytest.raises(SystemExit):
                 main()
-        assert "failed" in capsys.readouterr().err
+        assert "Preflight failed" in capsys.readouterr().err
 
     def test_cookie_does_not_route_scoped_token_via_gateway(self):
         client = _mock_client()
-        config = _config(api_token=SCOPED_TOKEN)
         with patch("sys.argv", ["confluence-export", "--cookie", "session=abc", "spaces"]), \
-             patch("confluence_export.cli.load_config", return_value=config), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile(
+                 auth_mode=AuthMode.COOKIE,
+                 api_dialect=ApiDialect.COOKIE_V1,
+                 token="",
+                 cookie_header="session=abc",
+             )), \
              patch("confluence_export.cli.ConfluenceClient", return_value=client), \
              patch("confluence_export.cli._maybe_route_via_gateway") as mock_route:
             main()
@@ -362,14 +440,12 @@ class TestCookieFlag:
 
 
 class TestNeedsToken:
-    def test_prompts_when_no_token_configured(self):
-        client = _mock_client()
+    def test_missing_credentials_fails_without_prompt(self, capsys):
         with patch("sys.argv", ["confluence-export", "spaces"]), \
-             patch("confluence_export.cli.load_config", return_value=_config(api_token="")), \
-             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
-             patch("confluence_export.cli._apply_browser_credentials") as mock_apply:
-            main()
-        mock_apply.assert_called_once()
+             patch("confluence_export.cli.load_connection_profile", side_effect=ConnectionProfileError("authentication credentials are required")):
+            with pytest.raises(SystemExit):
+                main()
+        assert "authentication credentials" in capsys.readouterr().err
 
 
 class TestResolveCloudId:
@@ -390,7 +466,7 @@ class TestResolveCloudId:
 
     def test_happy_path_returns_cloud_id(self):
         resp = self._mock_response(body={"cloudId": "abc-123"})
-        with patch("confluence_export.cli.requests.get", return_value=resp) as mock_get:
+        with patch("confluence_export.config.requests.get", return_value=resp) as mock_get:
             assert _resolve_cloud_id("https://acme.atlassian.net/") == "abc-123"
         # Trailing slash stripped, /_edge/tenant_info appended.
         called_url = mock_get.call_args[0][0]
@@ -398,54 +474,52 @@ class TestResolveCloudId:
 
     def test_network_error_returns_none(self):
         with patch(
-            "confluence_export.cli.requests.get",
+            "confluence_export.config.requests.get",
             side_effect=requests.exceptions.ConnectionError("dns"),
         ):
             assert _resolve_cloud_id("https://acme.atlassian.net") is None
 
     def test_http_error_returns_none(self):
         resp = self._mock_response(status=503)
-        with patch("confluence_export.cli.requests.get", return_value=resp):
+        with patch("confluence_export.config.requests.get", return_value=resp):
             assert _resolve_cloud_id("https://acme.atlassian.net") is None
 
     def test_bad_json_returns_none(self):
         resp = self._mock_response(raise_json=True)
-        with patch("confluence_export.cli.requests.get", return_value=resp):
+        with patch("confluence_export.config.requests.get", return_value=resp):
             assert _resolve_cloud_id("https://acme.atlassian.net") is None
 
     def test_missing_cloud_id_field_returns_none(self):
         resp = self._mock_response(body={"someOther": "value"})
-        with patch("confluence_export.cli.requests.get", return_value=resp):
+        with patch("confluence_export.config.requests.get", return_value=resp):
             assert _resolve_cloud_id("https://acme.atlassian.net") is None
 
     def test_non_string_cloud_id_returns_none(self):
         # Defensive: API contract says string, but guard against future drift.
         resp = self._mock_response(body={"cloudId": 12345})
-        with patch("confluence_export.cli.requests.get", return_value=resp):
+        with patch("confluence_export.config.requests.get", return_value=resp):
             assert _resolve_cloud_id("https://acme.atlassian.net") is None
 
     def test_empty_cloud_id_returns_none(self):
         resp = self._mock_response(body={"cloudId": ""})
-        with patch("confluence_export.cli.requests.get", return_value=resp):
+        with patch("confluence_export.config.requests.get", return_value=resp):
             assert _resolve_cloud_id("https://acme.atlassian.net") is None
 
 
 class TestMaybeRouteViaGateway:
-    """Auto-rewrite of site URL to OAuth gateway for scoped tokens."""
+    """Legacy runtime route helper does not persist gateway URLs."""
 
-    def test_scoped_token_on_site_url_rewrites_and_persists(self):
+    def test_scoped_token_on_site_url_returns_runtime_gateway_config(self):
         cfg = Config(
             base_url="https://acme.atlassian.net",
             email="a@b.com",
             api_token=SCOPED_TOKEN,
         )
-        with patch(
-            "confluence_export.cli._resolve_cloud_id", return_value="cloud-uuid-123"
-        ), patch("confluence_export.cli.save_config") as mock_save:
+        with patch("confluence_export.cli._resolve_cloud_id", return_value="cloud-uuid-123"):
             result = _maybe_route_via_gateway(cfg)
 
         assert result.base_url == "https://api.atlassian.com/ex/confluence/cloud-uuid-123"
-        mock_save.assert_called_once_with(cfg)
+        assert cfg.base_url == "https://acme.atlassian.net"
 
     def test_legacy_token_left_alone(self):
         cfg = Config(
@@ -453,13 +527,10 @@ class TestMaybeRouteViaGateway:
             email="a@b.com",
             api_token=LEGACY_TOKEN,
         )
-        with patch("confluence_export.cli._resolve_cloud_id") as mock_resolve, \
-             patch("confluence_export.cli.save_config") as mock_save:
+        with patch("confluence_export.cli._resolve_cloud_id") as mock_resolve:
             result = _maybe_route_via_gateway(cfg)
 
-        # No network call, no rewrite, no save
         mock_resolve.assert_not_called()
-        mock_save.assert_not_called()
         assert result.base_url == "https://acme.atlassian.net"
 
     def test_already_gateway_url_left_alone(self):
@@ -469,12 +540,10 @@ class TestMaybeRouteViaGateway:
             email="a@b.com",
             api_token=SCOPED_TOKEN,
         )
-        with patch("confluence_export.cli._resolve_cloud_id") as mock_resolve, \
-             patch("confluence_export.cli.save_config") as mock_save:
+        with patch("confluence_export.cli._resolve_cloud_id") as mock_resolve:
             result = _maybe_route_via_gateway(cfg)
 
         mock_resolve.assert_not_called()
-        mock_save.assert_not_called()
         assert result.base_url == cfg.base_url
 
     def test_cloud_id_lookup_failure_leaves_url_intact(self):
@@ -487,35 +556,30 @@ class TestMaybeRouteViaGateway:
         )
         with patch(
             "confluence_export.cli._resolve_cloud_id", return_value=None
-        ), patch("confluence_export.cli.save_config") as mock_save:
+        ):
             result = _maybe_route_via_gateway(cfg)
 
-        mock_save.assert_not_called()
         assert result.base_url == "https://acme.atlassian.net"
 
-    def test_persist_failure_does_not_break_run(self, tmp_path):
-        """A read-only filesystem must not stop the rewrite from applying."""
+    def test_runtime_route_does_not_persist(self, tmp_path):
         cfg = Config(
             base_url="https://acme.atlassian.net",
             email="a@b.com",
             api_token=SCOPED_TOKEN,
         )
-        with patch(
-            "confluence_export.cli._resolve_cloud_id", return_value="cloud-uuid"
-        ), patch(
-            "confluence_export.cli.save_config", side_effect=OSError("read-only fs")
-        ):
+        with patch("confluence_export.cli._resolve_cloud_id", return_value="cloud-uuid"):
             result = _maybe_route_via_gateway(cfg)
 
         assert result.base_url.startswith("https://api.atlassian.com/")
+        assert cfg.base_url == "https://acme.atlassian.net"
 
 
 class TestConfigError:
     def test_missing_config_shows_setup_hint(self, capsys):
         with patch("sys.argv", ["confluence-export", "spaces"]), \
-             patch("confluence_export.cli.load_config", side_effect=ValueError("base_url is required")):
+             patch("confluence_export.cli.load_connection_profile", side_effect=ConnectionProfileError("site_url is required")):
             with pytest.raises(SystemExit):
                 main()
         err = capsys.readouterr().err
-        assert "base_url" in err
+        assert "site_url" in err
         assert "configure" in err  # suggests running configure
