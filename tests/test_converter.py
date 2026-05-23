@@ -1,6 +1,11 @@
 """Tests for HTML to markdown conversion."""
 
-from confluence_export.converter import convert_page, sanitize_filename, _preprocess_html
+from confluence_export.converter import (
+    convert_page,
+    inspect_macros,
+    sanitize_filename,
+    _preprocess_html,
+)
 from confluence_export.types import Attachment, Page, Version
 
 
@@ -99,5 +104,129 @@ def test_preprocess_drawio_placeholder():
         '<ac:parameter ac:name="diagramName">architecture</ac:parameter>'
         "</ac:structured-macro>"
     )
-    result = _preprocess_html(html, [])
-    assert "[drawio:architecture]" in result
+    diagnostics = []
+    result = _preprocess_html(html, [], diagnostics=diagnostics)
+    assert "Draw.io diagram could not be rendered: architecture" in result
+    assert "[drawio:architecture]" not in result
+    assert diagnostics[0].code == "drawio_source_missing"
+
+
+def test_drawio_rendered_before_markdown_handles_underscore(tmp_path):
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">system_arch.drawio</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    page = Page(id="p1", title="Arch", body_storage=html, version=Version(number=1))
+    png = tmp_path / "system_arch.drawio.png"
+    png.write_bytes(b"png")
+    diagnostics = []
+    md = convert_page(
+        page,
+        base_url="",
+        space_key="TEST",
+        path="/Arch",
+        attachments=[Attachment(id="a1", title="system_arch.drawio")],
+        diagnostics=diagnostics,
+        drawio_rendered={"system_arch.drawio": png},
+    )
+
+    assert "system_arch.drawio.png" in md
+    assert "Draw.io source:" in md
+    assert "[drawio:" not in md
+    assert diagnostics == []
+
+
+def test_drawio_render_failure_fallback_warns():
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">arch.drawio</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    page = Page(id="p1", title="Arch", body_storage=html, version=Version(number=1))
+    diagnostics = []
+    md = convert_page(
+        page,
+        base_url="",
+        space_key="TEST",
+        path="/Arch",
+        attachments=[Attachment(id="a1", title="arch.drawio")],
+        diagnostics=diagnostics,
+        drawio_failures={"arch.drawio": "render failed"},
+    )
+
+    assert "Draw.io diagram could not be rendered: arch.drawio" in md
+    assert ".media/arch.drawio" in md
+    assert "[drawio:" not in md
+    assert diagnostics[0].severity == "warning"
+    assert diagnostics[0].code == "drawio_render_failed"
+
+
+def test_profile_macro_preserves_user_details():
+    html = (
+        '<ac:structured-macro ac:name="profile">'
+        '<ri:user ri:account-id="abc"/>'
+        "</ac:structured-macro>"
+    )
+    result = _preprocess_html(
+        html,
+        [],
+        user_resolver=lambda _: {"displayName": "Alice", "email": "alice@example.com"},
+    )
+    assert "<li>Alice (alice@example.com)</li>" in result
+
+
+def test_profile_picture_macro_renders_user_mention():
+    html = (
+        '<ac:structured-macro ac:name="profile-picture">'
+        '<ac:parameter ac:name="User"><ri:user ri:account-id="abc"/></ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [], user_resolver=lambda _: {"displayName": "Alice"})
+    assert "@Alice" in result
+    assert "Confluence dynamic content" not in result
+
+
+def test_unsupported_macro_visible_and_warns():
+    diagnostics = []
+    html = '<ac:structured-macro ac:name="future-widget"></ac:structured-macro>'
+    result = _preprocess_html(html, [], diagnostics=diagnostics)
+    assert "Confluence dynamic content: future-widget" in result
+    assert diagnostics[0].severity == "warning"
+    assert diagnostics[0].code == "unsupported_macro"
+
+
+def test_unsupported_macro_with_body_preserves_body_and_warns():
+    diagnostics = []
+    html = (
+        '<ac:structured-macro ac:name="custom-wrapper">'
+        '<ac:rich-text-body><p>Keep this content</p></ac:rich-text-body>'
+        "</ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [], diagnostics=diagnostics)
+    assert "Keep this content" in result
+    assert "Confluence dynamic content: custom-wrapper" not in result
+    assert diagnostics[0].severity == "warning"
+    assert diagnostics[0].code == "unsupported_macro_body_preserved"
+
+
+def test_drawio_sketch_visible_and_warns():
+    diagnostics = []
+    html = '<ac:structured-macro ac:name="drawio-sketch"></ac:structured-macro>'
+    result = _preprocess_html(html, [], diagnostics=diagnostics)
+    assert "Unsupported drawio-sketch macro preserved as placeholder" in result
+    assert diagnostics[0].severity == "warning"
+    assert diagnostics[0].code == "unsupported_drawio_sketch"
+
+
+def test_inspect_macros_reports_drawio_needs():
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">arch</ac:parameter>'
+        "</ac:structured-macro>"
+        '<ac:structured-macro ac:name="drawio-sketch">'
+        '<ac:parameter ac:name="diagramName">sketch</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    needs = inspect_macros(html, [Attachment(id="a1", title="arch.drawio")])
+    assert needs.drawio_names == {"arch"}

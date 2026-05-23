@@ -178,9 +178,12 @@ class TestBodyFetching:
         client.get_page_by_id.side_effect = Exception("timeout")
         cs = _make_cached_space(pages=[page])
 
-        files = exporter._export_single_page(page, tmp_path, cs, "TEST")
+        diagnostics = []
+        files = exporter._export_single_page(page, tmp_path, cs, "TEST", diagnostics=diagnostics)
         assert files == []
         assert "Warning" in capsys.readouterr().err
+        assert diagnostics[0].severity == "error"
+        assert diagnostics[0].code == "body_fetch_failed"
 
     def test_prefetch_fills_bodies_before_export(self):
         exporter, client, _ = _make_exporter()
@@ -242,6 +245,34 @@ class TestDrawioRendering:
         md = list(tmp_path.glob("*.md"))[0].read_text()
         assert "arch.drawio.png" in md
         assert "arch.drawio" in md
+        assert "[drawio:" not in md
+
+    def test_drawio_render_failure_writes_fallback_and_warning(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=True, render_drawio=True)
+        att = Attachment(id="a1", title="arch.drawio", media_type="application/x-drawio",
+                         file_size=100, page_id="p1",
+                         download_link="/wiki/download/a1")
+        page = _make_page(body=(
+            '<ac:structured-macro ac:name="drawio">'
+            '<ac:parameter ac:name="diagramName">arch.drawio</ac:parameter>'
+            "</ac:structured-macro>"
+        ))
+        cs = _make_cached_space(attachments={"p1": [att]})
+
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "arch.drawio").write_text("<xml/>")
+
+        diagnostics = []
+        with patch("confluence_export.exporter.download_attachments", return_value=[]), \
+             patch("confluence_export.exporter.render_drawio_to_png", return_value=None):
+            exporter._export_single_page(page, tmp_path, cs, "TEST", diagnostics=diagnostics)
+
+        md = list(tmp_path.glob("*.md"))[0].read_text()
+        assert "Draw.io diagram could not be rendered: arch.drawio" in md
+        assert ".media/arch.drawio" in md
+        assert "[drawio:" not in md
+        assert any(d.code == "drawio_render_failed" for d in diagnostics)
 
 
 class TestUserResolution:

@@ -1,4 +1,4 @@
-"""Tests for draw.io detection, rendering, and placeholder replacement."""
+"""Tests for draw.io detection, storage inspection, and rendering."""
 
 from __future__ import annotations
 
@@ -7,10 +7,11 @@ from unittest.mock import MagicMock, patch
 
 from confluence_export.drawio import (
     detect_drawio_macros,
+    find_drawio_attachment,
     find_drawio_attachments,
     find_drawio_cli,
+    find_drawio_macro_refs,
     render_drawio_to_png,
-    replace_drawio_placeholders,
 )
 from confluence_export.types import Attachment
 
@@ -46,6 +47,33 @@ class TestDetectDrawioMacros:
 
     def test_no_macros(self):
         assert detect_drawio_macros("<p>no diagrams</p>") == []
+
+    def test_finds_inc_drawio_names(self):
+        html = (
+            '<ac:structured-macro ac:name="inc-drawio">'
+            '<ac:parameter ac:name="diagramName">included_arch</ac:parameter>'
+            '</ac:structured-macro>'
+        )
+        assert detect_drawio_macros(html) == ["included_arch"]
+
+    def test_macro_refs_preserve_macro_name(self):
+        html = (
+            '<ac:structured-macro ac:name="drawio">'
+            '<ac:parameter ac:name="diagramName">arch</ac:parameter>'
+            '</ac:structured-macro>'
+            '<ac:structured-macro ac:name="drawio-sketch">'
+            '<ac:parameter ac:name="diagramName">sketch</ac:parameter>'
+            '</ac:structured-macro>'
+        )
+        refs = find_drawio_macro_refs(html)
+        assert [(r.macro_name, r.diagram_name) for r in refs] == [
+            ("drawio", "arch"),
+            ("drawio-sketch", "sketch"),
+        ]
+
+    def test_find_attachment_from_macro_name_without_extension(self):
+        attachments = [Attachment(id="1", title="arch.drawio", media_type="")]
+        assert find_drawio_attachment(attachments, "arch") == attachments[0]
 
 
 class TestFindDrawioCli:
@@ -211,24 +239,3 @@ class TestRenderDrawioToPng:
              patch("confluence_export.drawio.time.sleep"):
             result = render_drawio_to_png(drawio)
             assert result == expected_png
-
-
-class TestReplaceDrawioPlaceholders:
-    def test_replace_with_extension(self):
-        md = "# Diagram\n\n[drawio:arch.drawio]\n\nMore text"
-        rendered = {"arch.drawio": Path(".media/arch.drawio.png")}
-        result = replace_drawio_placeholders(md, rendered)
-        assert "![arch](.media/arch.drawio.png)" in result
-        assert "arch.drawio" in result  # source link
-
-    def test_replace_without_extension(self):
-        md = "# Diagram\n\n[drawio:arch]\n\nMore text"
-        rendered = {"arch.drawio": Path(".media/arch.drawio.png")}
-        result = replace_drawio_placeholders(md, rendered)
-        assert "![arch](.media/arch.drawio.png)" in result
-
-    def test_no_matching_placeholder(self):
-        md = "# No diagrams here"
-        rendered = {"other.drawio": Path(".media/other.drawio.png")}
-        result = replace_drawio_placeholders(md, rendered)
-        assert result == md

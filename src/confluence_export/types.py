@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
 
 
 @dataclass
@@ -231,3 +233,58 @@ class CachedSpace:
             updated_at=data.get("updated_at", ""),
             include_archived=bool(data.get("include_archived", False)),
         )
+
+
+@dataclass
+class ExportDiagnostic:
+    """Structured export diagnostic for conversion and validation issues."""
+
+    severity: Literal["info", "warning", "error"]
+    page_id: str | None
+    page_title: str | None
+    code: str
+    message: str
+    path: Path | None = None
+
+
+@dataclass
+class ExportReport:
+    """Result of an export operation, including written files and diagnostics."""
+
+    pages_written: int = 0
+    files_written: int = 0
+    diagnostics: list[ExportDiagnostic] = field(default_factory=list)
+    written_files: list[Path] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.written_files and not self.files_written:
+            self.files_written = len(self.written_files)
+
+    @property
+    def count(self) -> int:
+        """Backward-compatible page count alias."""
+        return self.pages_written
+
+    @count.setter
+    def count(self, value: int) -> None:
+        self.pages_written = value
+
+    @property
+    def has_errors(self) -> bool:
+        return any(d.severity == "error" for d in self.diagnostics)
+
+    @property
+    def has_warnings(self) -> bool:
+        return any(d.severity == "warning" for d in self.diagnostics)
+
+    def add_files(self, files: list[Path], *, page_written: bool = False) -> None:
+        if page_written:
+            self.pages_written += 1
+        self.written_files.extend(files)
+        self.files_written = len(self.written_files)
+
+    def extend(self, other: ExportReport) -> None:
+        self.pages_written += other.pages_written
+        self.written_files.extend(other.written_files)
+        self.files_written = len(self.written_files)
+        self.diagnostics.extend(other.diagnostics)

@@ -10,7 +10,7 @@ import pytest
 
 import requests
 
-from confluence_export.cli import _resolve_space, main
+from confluence_export.cli import _diagnostic_lines, _resolve_space, main
 from confluence_export.config import (
     ApiDialect,
     AuthConfig,
@@ -19,7 +19,7 @@ from confluence_export.config import (
     ConnectionProfileError,
     resolve_cloud_id,
 )
-from confluence_export.types import CachedSpace, Page, Space, Version
+from confluence_export.types import CachedSpace, ExportDiagnostic, Page, Space, Version
 
 def _space(key="TEST", name="Test Space"):
     return Space(id="1", key=key, name=name, type="global", status="current")
@@ -225,6 +225,8 @@ class TestExportCommand:
              patch("confluence_export.cli.CacheStore", return_value=cache):
             main()
 
+        assert "Git: committed" in capsys.readouterr().out
+
         # Verify git repo was created and export was committed
         log = subprocess.run(
             ["git", "log", "--oneline"], cwd=out, capture_output=True, text=True
@@ -314,6 +316,106 @@ class TestExportCommand:
         assert not out.exists()
         cache_cls.assert_not_called()
         assert "Preflight failed" in capsys.readouterr().err
+
+    def test_non_strict_warnings_allowed(self, tmp_path, capsys):
+        client = _mock_client()
+        cache = MagicMock()
+        cs = _cached_space()
+        cs.pages = [
+            Page(
+                id="p1",
+                title="Root",
+                space_id="1",
+                parent_type="space",
+                version=Version(number=1),
+                body_storage='<ac:structured-macro ac:name="toc"></ac:structured-macro>',
+            )
+        ]
+        cache.refresh.return_value = cs
+        out = str(tmp_path / "out")
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media", "--no-git"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
+            main()
+
+        stdout = capsys.readouterr().out
+        assert "Diagnostics: 0 error(s), 1 warning(s)" in stdout
+        assert "Confluence dynamic content: toc" in Path(out, "Root", "Root.md").read_text()
+
+    def test_strict_warnings_exit_nonzero(self, tmp_path, capsys):
+        client = _mock_client()
+        cache = MagicMock()
+        cs = _cached_space()
+        cs.pages = [
+            Page(
+                id="p1",
+                title="Root",
+                space_id="1",
+                parent_type="space",
+                version=Version(number=1),
+                body_storage='<ac:structured-macro ac:name="toc"></ac:structured-macro>',
+            )
+        ]
+        cache.refresh.return_value = cs
+        out = str(tmp_path / "out")
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media", "--no-git", "--strict"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
+            with pytest.raises(SystemExit) as exc:
+                main()
+
+        assert exc.value.code == 1
+        stdout = capsys.readouterr().out
+        assert "Export validation failed: 0 error(s), 1 warning(s)" in stdout
+
+    def test_git_commit_skipped_on_validation_error(self, tmp_path, capsys):
+        import subprocess
+
+        client = _mock_client()
+        cache = MagicMock()
+        cs = _cached_space()
+        cs.pages = [
+            Page(
+                id="p1",
+                title="Root",
+                space_id="1",
+                parent_type="space",
+                version=Version(number=1),
+                body_storage="<p>[drawio:leaked]</p>",
+            )
+        ]
+        cache.refresh.return_value = cs
+        out = str(tmp_path / "out")
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
+            with pytest.raises(SystemExit) as exc:
+                main()
+
+        assert exc.value.code == 1
+        assert "Git: not committed" in capsys.readouterr().out
+        log = subprocess.run(
+            ["git", "log", "--oneline"], cwd=out, capture_output=True, text=True
+        )
+        assert "Export Confluence space TEST" not in log.stdout
+
+    def test_page_level_diagnostics_formatting(self, tmp_path):
+        lines = _diagnostic_lines([
+            ExportDiagnostic(
+                severity="error",
+                page_id="p1",
+                page_title="Architecture",
+                code="drawio_sentinel_leaked",
+                message="unresolved internal draw.io sentinel leaked into markdown",
+                path=tmp_path / "Architecture.md",
+            )
+        ])
+        assert lines == [
+            f'Page "Architecture": unresolved internal draw.io sentinel leaked into markdown ({tmp_path / "Architecture.md"})'
+        ]
 
 
 class TestRefreshCommand:

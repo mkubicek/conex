@@ -5,17 +5,89 @@ from __future__ import annotations
 import re
 
 import yaml
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, Tag
+from dataclasses import dataclass, field
 from markdownify import markdownify as md
+from pathlib import Path
 
+from confluence_export.drawio import drawio_name_candidates, find_drawio_attachment
 from confluence_export.media import MEDIA_DIR_NAME
 
 from typing import Callable
 
-from confluence_export.types import Attachment, Page
+from confluence_export.types import Attachment, ExportDiagnostic, Page
 
 # Optional callback: account_id -> {"displayName": ..., "email": ...} or None
 UserResolver = Callable[[str], dict | None] | None
+
+
+@dataclass
+class MacroNeeds:
+    """Resources a macro may need before rendering."""
+
+    drawio_names: set[str] = field(default_factory=set)
+
+
+@dataclass
+class ConversionContext:
+    """State shared by macro handlers during one page conversion."""
+
+    page: Page | None
+    attachments: list[Attachment]
+    user_resolver: UserResolver = None
+    diagnostics: list[ExportDiagnostic] = field(default_factory=list)
+    drawio_rendered: dict[str, Path] = field(default_factory=dict)
+    drawio_failures: dict[str, str] = field(default_factory=dict)
+    render_drawio: bool = True
+    download_media: bool = True
+
+    def add_diagnostic(
+        self,
+        severity: str,
+        code: str,
+        message: str,
+        path: Path | None = None,
+    ) -> None:
+        self.diagnostics.append(
+            ExportDiagnostic(
+                severity=severity,  # type: ignore[arg-type]
+                page_id=self.page.id if self.page else None,
+                page_title=self.page.title if self.page else None,
+                code=code,
+                message=message,
+                path=path,
+            )
+        )
+
+    def drawio_png_for(self, diagram_name: str) -> Path | None:
+        for candidate in drawio_name_candidates(diagram_name):
+            if candidate in self.drawio_rendered:
+                return self.drawio_rendered[candidate]
+        return None
+
+    def drawio_failure_for(self, diagram_name: str) -> str | None:
+        for candidate in drawio_name_candidates(diagram_name):
+            if candidate in self.drawio_failures:
+                return self.drawio_failures[candidate]
+        return None
+
+    def drawio_source_for(self, diagram_name: str) -> Attachment | None:
+        return find_drawio_attachment(self.attachments, diagram_name)
+
+
+class MacroHandler:
+    """Base class for Confluence structured macro handlers."""
+
+    names: set[str] = set()
+
+    def inspect(self, macro: Tag, context: ConversionContext) -> MacroNeeds:
+        return MacroNeeds()
+
+    def render(
+        self, soup: BeautifulSoup, macro: Tag, context: ConversionContext
+    ) -> None:
+        raise NotImplementedError
+
 
 # Confluence emoticon name -> Unicode emoji
 _EMOTICON_MAP = {
@@ -65,12 +137,27 @@ def convert_page(
     path: str,
     attachments: list[Attachment] | None = None,
     user_resolver: UserResolver = None,
+    diagnostics: list[ExportDiagnostic] | None = None,
+    drawio_rendered: dict[str, Path] | None = None,
+    drawio_failures: dict[str, str] | None = None,
+    render_drawio: bool = True,
+    download_media: bool = True,
 ) -> str:
     """Convert a Confluence page to markdown with YAML frontmatter."""
     html = page.body_storage
 
     # Pre-process Confluence-specific HTML
-    html = _preprocess_html(html, attachments or [], user_resolver=user_resolver)
+    html = _preprocess_html(
+        html,
+        attachments or [],
+        user_resolver=user_resolver,
+        page=page,
+        diagnostics=diagnostics,
+        drawio_rendered=drawio_rendered,
+        drawio_failures=drawio_failures,
+        render_drawio=render_drawio,
+        download_media=download_media,
+    )
 
     # Convert to markdown using markdownify
     markdown = md(
@@ -135,9 +222,26 @@ def _preprocess_html(
     html: str,
     attachments: list[Attachment],
     user_resolver: UserResolver = None,
+    *,
+    page: Page | None = None,
+    diagnostics: list[ExportDiagnostic] | None = None,
+    drawio_rendered: dict[str, Path] | None = None,
+    drawio_failures: dict[str, str] | None = None,
+    render_drawio: bool = True,
+    download_media: bool = True,
 ) -> str:
     """Pre-process Confluence storage HTML before markdownify."""
     soup = BeautifulSoup(html, "html.parser")
+    context = ConversionContext(
+        page=page,
+        attachments=attachments,
+        user_resolver=user_resolver,
+        diagnostics=diagnostics if diagnostics is not None else [],
+        drawio_rendered=drawio_rendered or {},
+        drawio_failures=drawio_failures or {},
+        render_drawio=render_drawio,
+        download_media=download_media,
+    )
 
     # Build attachment lookup
     attach_map = {a.title: a for a in attachments}
@@ -208,23 +312,6 @@ def _preprocess_html(
         else:
             tag.decompose()
 
-    # --- User mentions (ri:user inside ac:link or standalone) ---
-    for user_tag in list(soup.find_all("ri:user")):
-        account_id = user_tag.get("ri:account-id", "")
-        parent_link = user_tag.find_parent("ac:link")
-        display_name = None
-        if account_id and user_resolver:
-            info = user_resolver(account_id)
-            if info:
-                display_name = info.get("displayName")
-        name = display_name or account_id
-        if parent_link:
-            span = soup.new_tag("span")
-            span.string = f"@{name}"
-            parent_link.replace_with(span)
-        else:
-            user_tag.replace_with(f"@{name}")
-
     # --- ac:image ---
     for img_tag in list(soup.find_all("ac:image")):
         _replace_ac_image(soup, img_tag, attach_map)
@@ -234,41 +321,11 @@ def _preprocess_html(
         _replace_ac_link(soup, link_tag, attach_map)
 
     # --- Structured macros ---
-    for macro in list(soup.find_all("ac:structured-macro")):
-        macro_name = macro.get("ac:name", "")
-        if macro_name in ("info", "tip", "note", "warning", "panel"):
-            _convert_panel(soup, macro, macro_name)
-        elif macro_name == "code":
-            _convert_code_block(soup, macro)
-        elif macro_name in ("drawio", "inc-drawio"):
-            _convert_drawio_placeholder(soup, macro)
-        elif macro_name == "profile":
-            _convert_profile(soup, macro, user_resolver)
-        elif macro_name == "status":
-            _convert_status(soup, macro)
-        elif macro_name == "expand":
-            _convert_expand(soup, macro)
-        elif macro_name == "jira":
-            _convert_jira(soup, macro)
-        elif macro_name == "view-file":
-            _convert_view_file(soup, macro)
-        elif macro_name in ("excerpt", "section", "column"):
-            # Pure layout/wrapper — keep body, drop wrapper, no placeholder
-            body = macro.find("ac:rich-text-body")
-            if body:
-                body.unwrap()
-            macro.unwrap()
-        else:
-            # Default: if body content exists, preserve it. Otherwise the
-            # macro is dynamic/widget-like (toc, children, recently-updated,
-            # include, future Confluence additions) — emit a visible
-            # placeholder so the reader knows something was there instead
-            # of silently dropping it.
-            body = macro.find("ac:rich-text-body")
-            if body and body.get_text(strip=True):
-                macro.replace_with(*list(body.children))
-            else:
-                _convert_dynamic_macro_placeholder(soup, macro, macro_name)
+    _handle_structured_macros(soup, context)
+
+    # --- User mentions (ri:user inside ac:link or standalone) ---
+    for user_tag in list(soup.find_all("ri:user")):
+        _replace_user_mention(soup, user_tag, user_resolver)
 
     # --- Inline comment markers: just unwrap ---
     for tag in list(soup.find_all("ac:inline-comment-marker")):
@@ -283,6 +340,20 @@ def _preprocess_html(
         tag.unwrap()
 
     return str(soup)
+
+
+def inspect_macros(html: str, attachments: list[Attachment]) -> MacroNeeds:
+    """Inspect structured macros for resources needed before conversion."""
+    soup = BeautifulSoup(html, "html.parser")
+    context = ConversionContext(page=None, attachments=attachments)
+    result = MacroNeeds()
+    handlers = _macro_handler_registry()
+    fallback = DynamicPlaceholderHandler()
+    for macro in list(soup.find_all("ac:structured-macro")):
+        handler = handlers.get(macro.get("ac:name", ""), fallback)
+        needs = handler.inspect(macro, context)
+        result.drawio_names.update(needs.drawio_names)
+    return result
 
 
 def _replace_ac_image(soup: BeautifulSoup, tag: Tag, attach_map: dict[str, Attachment]) -> None:
@@ -339,6 +410,315 @@ def _replace_ac_link(soup: BeautifulSoup, tag: Tag, attach_map: dict[str, Attach
     tag.decompose()
 
 
+def _replace_user_mention(
+    soup: BeautifulSoup, user_tag: Tag, user_resolver: UserResolver
+) -> None:
+    """Replace a Confluence user reference with a stable text mention."""
+    account_id = user_tag.get("ri:account-id", "")
+    parent_link = user_tag.find_parent("ac:link")
+    mention = _resolve_mention_text(account_id, user_resolver)
+    span = soup.new_tag("span")
+    span.string = mention
+    if parent_link:
+        parent_link.replace_with(span)
+    else:
+        user_tag.replace_with(span)
+
+
+def _resolve_mention_text(account_id: str, user_resolver: UserResolver) -> str:
+    display_name = None
+    if account_id and user_resolver:
+        info = user_resolver(account_id)
+        if info:
+            display_name = info.get("displayName")
+    name = display_name or account_id
+    return f"@{name}" if name else "@unknown"
+
+
+def _handle_structured_macros(
+    soup: BeautifulSoup, context: ConversionContext
+) -> None:
+    handlers = _macro_handler_registry()
+    fallback = DynamicPlaceholderHandler()
+    for macro in list(soup.find_all("ac:structured-macro")):
+        if macro.parent is None:
+            continue
+        macro_name = macro.get("ac:name", "")
+        handler = handlers.get(macro_name, fallback)
+        handler.render(soup, macro, context)
+
+
+def _macro_handler_registry() -> dict[str, MacroHandler]:
+    return _MACRO_HANDLER_REGISTRY
+
+
+class ProfileHandler(MacroHandler):
+    names = {"profile", "profile-picture"}
+
+    def render(
+        self, soup: BeautifulSoup, macro: Tag, context: ConversionContext
+    ) -> None:
+        user_tag = macro.find("ri:user")
+        account_id = user_tag.get("ri:account-id", "") if user_tag else ""
+
+        if macro.get("ac:name", "") == "profile-picture":
+            span = soup.new_tag("span")
+            span.string = _resolve_mention_text(account_id, context.user_resolver)
+            macro.replace_with(span)
+            return
+
+        user_info = (
+            context.user_resolver(account_id)
+            if account_id and context.user_resolver
+            else None
+        )
+        li = soup.new_tag("li")
+        if user_info:
+            name = user_info.get("displayName", account_id)
+            email = user_info.get("email")
+            li.string = f"{name} ({email})" if email else name
+        elif account_id:
+            li.string = f"user:{account_id}"
+        else:
+            li.string = "Unknown user"
+
+        macro.replace_with(li)
+
+
+class DrawioHandler(MacroHandler):
+    names = {"drawio", "inc-drawio"}
+
+    def inspect(self, macro: Tag, context: ConversionContext) -> MacroNeeds:
+        diagram_name = _macro_parameter_text(macro, "diagramName") or "diagram"
+        return MacroNeeds(drawio_names={diagram_name})
+
+    def render(
+        self, soup: BeautifulSoup, macro: Tag, context: ConversionContext
+    ) -> None:
+        diagram_name = _macro_parameter_text(macro, "diagramName") or "diagram"
+        source = context.drawio_source_for(diagram_name)
+        source_name = source.title if source else _drawio_source_name(diagram_name)
+        png_path = context.drawio_png_for(diagram_name)
+
+        if png_path:
+            nodes = _drawio_image_nodes(soup, diagram_name, source_name, png_path)
+            macro.replace_with(*nodes)
+            return
+
+        reason = context.drawio_failure_for(diagram_name)
+        severity = "warning"
+        code = "drawio_render_failed"
+        if not context.render_drawio:
+            severity = "info"
+            code = "drawio_render_disabled"
+            reason = "draw.io rendering disabled"
+        elif not context.download_media:
+            severity = "info"
+            code = "drawio_media_disabled"
+            reason = "media download disabled"
+        elif not source:
+            code = "drawio_source_missing"
+            reason = "source attachment not found"
+        else:
+            reason = reason or "render failed"
+
+        context.add_diagnostic(
+            severity,
+            code,
+            f"Draw.io diagram could not be rendered: {diagram_name} ({reason})",
+        )
+        node = _drawio_fallback_node(soup, diagram_name, source_name, source is not None)
+        macro.replace_with(node)
+
+
+class DrawioSketchHandler(MacroHandler):
+    names = {"drawio-sketch"}
+
+    def render(
+        self, soup: BeautifulSoup, macro: Tag, context: ConversionContext
+    ) -> None:
+        context.add_diagnostic(
+            "warning",
+            "unsupported_drawio_sketch",
+            "Unsupported drawio-sketch macro preserved as placeholder.",
+        )
+        node = _placeholder_node(
+            soup,
+            "Unsupported drawio-sketch macro preserved as placeholder.",
+        )
+        macro.replace_with(node)
+
+
+class PanelHandler(MacroHandler):
+    names = {"info", "tip", "note", "warning", "panel"}
+
+    def render(
+        self, soup: BeautifulSoup, macro: Tag, context: ConversionContext
+    ) -> None:
+        _convert_panel(soup, macro, macro.get("ac:name", "panel"))
+
+
+class CodeHandler(MacroHandler):
+    names = {"code"}
+
+    def render(
+        self, soup: BeautifulSoup, macro: Tag, context: ConversionContext
+    ) -> None:
+        _convert_code_block(soup, macro)
+
+
+class StatusHandler(MacroHandler):
+    names = {"status"}
+
+    def render(
+        self, soup: BeautifulSoup, macro: Tag, context: ConversionContext
+    ) -> None:
+        _convert_status(soup, macro)
+
+
+class ExpandHandler(MacroHandler):
+    names = {"expand"}
+
+    def render(
+        self, soup: BeautifulSoup, macro: Tag, context: ConversionContext
+    ) -> None:
+        _convert_expand(soup, macro)
+
+
+class JiraHandler(MacroHandler):
+    names = {"jira"}
+
+    def render(
+        self, soup: BeautifulSoup, macro: Tag, context: ConversionContext
+    ) -> None:
+        _convert_jira(soup, macro)
+
+
+class ViewFileHandler(MacroHandler):
+    names = {"view-file"}
+
+    def render(
+        self, soup: BeautifulSoup, macro: Tag, context: ConversionContext
+    ) -> None:
+        _convert_view_file(soup, macro)
+
+
+class LayoutWrapperHandler(MacroHandler):
+    names = {"excerpt", "section", "column"}
+
+    def render(
+        self, soup: BeautifulSoup, macro: Tag, context: ConversionContext
+    ) -> None:
+        body = macro.find("ac:rich-text-body")
+        if body:
+            body.unwrap()
+        macro.unwrap()
+
+
+_MACRO_HANDLER_REGISTRY: dict[str, MacroHandler] = {
+    name: handler
+    for handler in (
+        ProfileHandler(),
+        DrawioHandler(),
+        DrawioSketchHandler(),
+        PanelHandler(),
+        CodeHandler(),
+        StatusHandler(),
+        ExpandHandler(),
+        JiraHandler(),
+        ViewFileHandler(),
+        LayoutWrapperHandler(),
+    )
+    for name in handler.names
+}
+
+
+class DynamicPlaceholderHandler(MacroHandler):
+    names: set[str] = set()
+
+    def render(
+        self, soup: BeautifulSoup, macro: Tag, context: ConversionContext
+    ) -> None:
+        macro_name = macro.get("ac:name", "")
+        body = macro.find("ac:rich-text-body")
+        if body and body.get_text(strip=True):
+            context.add_diagnostic(
+                "warning",
+                "unsupported_macro_body_preserved",
+                f"Unsupported Confluence macro body preserved visibly: {macro_name or 'unnamed'}",
+            )
+            macro.replace_with(*list(body.children))
+            return
+
+        context.add_diagnostic(
+            "warning",
+            "unsupported_macro",
+            f"Unsupported Confluence macro preserved visibly: {macro_name or 'unnamed'}",
+        )
+        _convert_dynamic_macro_placeholder(soup, macro, macro_name)
+
+
+def _macro_parameter_text(macro: Tag, name: str) -> str:
+    param = macro.find("ac:parameter", attrs={"ac:name": name})
+    return param.get_text().strip() if param else ""
+
+
+def _drawio_source_name(diagram_name: str) -> str:
+    candidates = drawio_name_candidates(diagram_name)
+    for candidate in candidates:
+        if candidate.endswith(".drawio"):
+            return candidate
+    return f"{diagram_name}.drawio"
+
+
+def _drawio_image_nodes(
+    soup: BeautifulSoup, diagram_name: str, source_name: str, png_path: Path
+) -> list[Tag]:
+    img = soup.new_tag(
+        "img",
+        src=f"{MEDIA_DIR_NAME}/{png_path.name}",
+        alt=source_name or diagram_name,
+    )
+    p = soup.new_tag("p")
+    em = soup.new_tag("em")
+    em.append("Draw.io source: ")
+    a = soup.new_tag("a", href=f"{MEDIA_DIR_NAME}/{source_name}")
+    a.string = source_name
+    em.append(a)
+    p.append(em)
+    return [img, p]
+
+
+def _drawio_fallback_node(
+    soup: BeautifulSoup,
+    diagram_name: str,
+    source_name: str,
+    has_source: bool,
+) -> Tag:
+    if has_source:
+        text = f"Draw.io diagram could not be rendered: {diagram_name} - source attachment preserved at "
+        p = soup.new_tag("p")
+        em = soup.new_tag("em")
+        em.append(text)
+        a = soup.new_tag("a", href=f"{MEDIA_DIR_NAME}/{source_name}")
+        a.string = f"{MEDIA_DIR_NAME}/{source_name}"
+        em.append(a)
+        p.append(em)
+        return p
+    return _placeholder_node(
+        soup,
+        f"Draw.io diagram could not be rendered: {diagram_name} - source attachment not found.",
+    )
+
+
+def _placeholder_node(soup: BeautifulSoup, message: str) -> Tag:
+    em = soup.new_tag("em")
+    em.string = f"[{message}]"
+    p = soup.new_tag("p")
+    p.append(em)
+    return p
+
+
 def _convert_panel(soup: BeautifulSoup, macro: Tag, macro_name: str) -> None:
     """Convert info/tip/note/warning/panel to blockquotes."""
     title_param = macro.find("ac:parameter", attrs={"ac:name": "title"})
@@ -360,28 +740,6 @@ def _convert_panel(soup: BeautifulSoup, macro: Tag, macro_name: str) -> None:
             blockquote.append(element)
 
     macro.replace_with(blockquote)
-
-
-def _convert_profile(soup: BeautifulSoup, macro: Tag, user_resolver: UserResolver) -> None:
-    """Convert profile macro to a user mention as a list item."""
-    user_tag = macro.find("ri:user")
-    account_id = user_tag.get("ri:account-id", "") if user_tag else ""
-
-    user_info = None
-    if account_id and user_resolver:
-        user_info = user_resolver(account_id)
-
-    li = soup.new_tag("li")
-    if user_info:
-        name = user_info.get("displayName", account_id)
-        email = user_info.get("email")
-        if email:
-            li.string = f"{name} ({email})"
-        else:
-            li.string = name
-    else:
-        li.string = f"user:{account_id}" if account_id else "Unknown user"
-    macro.replace_with(li)
 
 
 def _convert_status(soup: BeautifulSoup, macro: Tag) -> None:
@@ -474,20 +832,10 @@ def _convert_view_file(soup: BeautifulSoup, macro: Tag) -> None:
         macro.decompose()
 
 
-def _convert_drawio_placeholder(soup: BeautifulSoup, macro: Tag) -> None:
-    """Replace drawio/inc-drawio macro with a placeholder."""
-    name_param = macro.find("ac:parameter", attrs={"ac:name": "diagramName"})
-    diagram_name = name_param.get_text().strip() if name_param else "diagram"
-
-    placeholder = soup.new_tag("p")
-    placeholder.string = f"[drawio:{diagram_name}]"
-    macro.replace_with(placeholder)
-
-
 def _convert_dynamic_macro_placeholder(
     soup: BeautifulSoup, macro: Tag, macro_name: str
 ) -> None:
-    """Emit a visible italic placeholder for content-less macros.
+    """Emit a visible italic placeholder for unsupported dynamic macros.
 
     Captures the macro name plus any non-default parameters (resolving page
     references) so the reader sees what was there without the export trying
@@ -510,4 +858,10 @@ def _convert_dynamic_macro_placeholder(
     em.string = f"[Confluence dynamic content: {macro_name or 'unnamed'}{suffix}]"
     p = soup.new_tag("p")
     p.append(em)
+    body = macro.find("ac:rich-text-body")
+    if body and list(body.children):
+        children = list(body.children)
+        macro.replace_with(p, *children)
+        return
+
     macro.replace_with(p)

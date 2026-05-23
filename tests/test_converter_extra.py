@@ -81,7 +81,12 @@ PREPROCESS_CASES = [
     ("view-file via ri:attachment", '<ac:structured-macro ac:name="view-file"><ri:attachment ri:filename="report.pdf"/></ac:structured-macro>', [".media/report.pdf"], []),
     ("view-file via name param", '<ac:structured-macro ac:name="view-file"><ac:parameter ac:name="name">doc.pdf</ac:parameter></ac:structured-macro>', [".media/doc.pdf"], []),
     ("view-file empty", '<ac:structured-macro ac:name="view-file"></ac:structured-macro>', [], ["ac:structured-macro"]),
-    ("drawio placeholder", '<ac:structured-macro ac:name="drawio"><ac:parameter ac:name="diagramName">arch</ac:parameter></ac:structured-macro>', ["[drawio:arch]"], []),
+    (
+        "drawio placeholder",
+        '<ac:structured-macro ac:name="drawio"><ac:parameter ac:name="diagramName">arch</ac:parameter></ac:structured-macro>',
+        ["Draw.io diagram could not be rendered: arch"],
+        ["[drawio:arch]"],
+    ),
 
     # Structural macros
     ("toc placeholder", '<ac:structured-macro ac:name="toc"></ac:structured-macro>', ["[Confluence dynamic content: toc]"], ["ac:structured-macro"]),

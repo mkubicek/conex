@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
-import re
 import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
-from confluence_export.media import MEDIA_DIR_NAME
+from bs4 import BeautifulSoup
 
 from confluence_export.types import Attachment
+
+
+@dataclass(frozen=True)
+class DrawioMacroRef:
+    """Draw.io-like macro reference discovered in Confluence storage HTML."""
+
+    macro_name: str
+    diagram_name: str
 
 
 def find_drawio_attachments(attachments: list[Attachment]) -> list[Attachment]:
@@ -25,14 +33,52 @@ def find_drawio_attachments(attachments: list[Attachment]) -> list[Attachment]:
     ]
 
 
+def find_drawio_macro_refs(html: str) -> list[DrawioMacroRef]:
+    """Extract draw.io macro references from Confluence storage HTML."""
+    soup = BeautifulSoup(html, "html.parser")
+    refs: list[DrawioMacroRef] = []
+    for macro in soup.find_all("ac:structured-macro"):
+        macro_name = macro.get("ac:name", "")
+        if macro_name not in {"drawio", "inc-drawio", "drawio-sketch"}:
+            continue
+        name_param = macro.find("ac:parameter", attrs={"ac:name": "diagramName"})
+        diagram_name = name_param.get_text().strip() if name_param else macro_name
+        refs.append(DrawioMacroRef(macro_name=macro_name, diagram_name=diagram_name))
+    return refs
+
+
 def detect_drawio_macros(html: str) -> list[str]:
     """Extract diagramName values from drawio structured macros in HTML."""
-    pattern = re.compile(
-        r'<ac:structured-macro[^>]*ac:name="drawio"[^>]*>.*?'
-        r'<ac:parameter\s+ac:name="diagramName"[^>]*>([^<]+)</ac:parameter>',
-        re.DOTALL,
-    )
-    return pattern.findall(html)
+    return [
+        ref.diagram_name
+        for ref in find_drawio_macro_refs(html)
+        if ref.macro_name in {"drawio", "inc-drawio"}
+    ]
+
+
+def drawio_name_candidates(diagram_name: str) -> list[str]:
+    """Return likely attachment names for a draw.io macro diagram name."""
+    name = diagram_name.strip()
+    if not name:
+        return []
+    candidates = [name]
+    if name.endswith(".drawio"):
+        candidates.append(name.removesuffix(".drawio"))
+    else:
+        candidates.append(f"{name}.drawio")
+    return list(dict.fromkeys(candidates))
+
+
+def find_drawio_attachment(
+    attachments: list[Attachment], diagram_name: str
+) -> Attachment | None:
+    """Find the source attachment referenced by a draw.io macro."""
+    drawio_attachments = find_drawio_attachments(attachments)
+    for candidate in drawio_name_candidates(diagram_name):
+        for att in drawio_attachments:
+            if att.title == candidate:
+                return att
+    return None
 
 
 def find_drawio_cli() -> str | None:
@@ -111,30 +157,3 @@ def render_drawio_to_png(drawio_path: Path, output_path: Path | None = None) -> 
 
     print(f"  Warning: draw.io produced no output for {drawio_path.name}", file=sys.stderr)
     return None
-
-
-def replace_drawio_placeholders(
-    markdown: str,
-    rendered_diagrams: dict[str, Path],
-    media_dir_name: str = MEDIA_DIR_NAME,
-) -> str:
-    """Replace [drawio:name] placeholders in markdown with image + source link."""
-    for diagram_name, png_path in rendered_diagrams.items():
-        bare_name = diagram_name.removesuffix(".drawio")
-        placeholder = f"[drawio:{diagram_name}]"
-        if placeholder not in markdown:
-            placeholder = f"[drawio:{bare_name}]"
-            if placeholder not in markdown:
-                continue
-
-        drawio_filename = diagram_name if diagram_name.endswith(".drawio") else f"{diagram_name}.drawio"
-        png_filename = png_path.name
-
-        replacement = (
-            f"![{bare_name}]"
-            f"({media_dir_name}/{png_filename})\n"
-            f"*Draw.io source: [{drawio_filename}]({media_dir_name}/{drawio_filename})*"
-        )
-        markdown = markdown.replace(placeholder, replacement)
-
-    return markdown

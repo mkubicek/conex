@@ -1,11 +1,11 @@
 """Tests for draw.io diagram detection and processing."""
 
-from pathlib import Path
-
 from confluence_export.drawio import (
     detect_drawio_macros,
+    drawio_name_candidates,
+    find_drawio_attachment,
     find_drawio_attachments,
-    replace_drawio_placeholders,
+    find_drawio_macro_refs,
 )
 from confluence_export.types import Attachment
 
@@ -48,34 +48,44 @@ def test_detect_drawio_macros_none():
     assert detect_drawio_macros(html) == []
 
 
-def test_replace_drawio_placeholders(tmp_path):
-    markdown = (
-        "# Page\n\n"
-        "Some text\n\n"
-        "[drawio:architecture]\n\n"
-        "More text\n"
+def test_find_drawio_macro_refs_includes_inc_and_sketch():
+    html = (
+        '<ac:structured-macro ac:name="inc-drawio">'
+        '<ac:parameter ac:name="diagramName">arch.drawio</ac:parameter>'
+        '</ac:structured-macro>'
+        '<ac:structured-macro ac:name="drawio-sketch">'
+        '<ac:parameter ac:name="diagramName">sketch</ac:parameter>'
+        '</ac:structured-macro>'
     )
-    png = tmp_path / "architecture.drawio.png"
-    png.touch()
-
-    result = replace_drawio_placeholders(
-        markdown,
-        {"architecture": png},
-    )
-    assert "![architecture](.media/architecture.drawio.png)" in result
-    assert "Draw.io source:" in result
-    assert "architecture.drawio" in result
-    assert "[drawio:" not in result
+    refs = find_drawio_macro_refs(html)
+    assert [(r.macro_name, r.diagram_name) for r in refs] == [
+        ("inc-drawio", "arch.drawio"),
+        ("drawio-sketch", "sketch"),
+    ]
 
 
-def test_replace_drawio_placeholders_with_extension(tmp_path):
-    markdown = "Some [drawio:arch.drawio] diagram\n"
-    png = tmp_path / "arch.drawio.png"
-    png.touch()
+def test_drawio_name_candidates():
+    assert drawio_name_candidates("arch") == ["arch", "arch.drawio"]
+    assert drawio_name_candidates("arch.drawio") == ["arch.drawio", "arch"]
 
-    result = replace_drawio_placeholders(
-        markdown,
-        {"arch.drawio": png},
-    )
-    assert "arch.drawio.png" in result
-    assert "[drawio:" not in result
+
+def test_find_drawio_attachment_by_macro_name():
+    attachments = [Attachment(id="1", title="arch.drawio", media_type="")]
+    assert find_drawio_attachment(attachments, "arch") == attachments[0]
+
+
+def test_find_drawio_attachment_prefers_exact_drawio_source_over_bare_collision():
+    bare = Attachment(id="1", title="arch", media_type="application/x-drawio")
+    exact = Attachment(id="2", title="arch.drawio", media_type="application/x-drawio")
+    assert find_drawio_attachment([bare, exact], "arch.drawio") == exact
+
+
+def test_find_drawio_attachment_ignores_non_drawio_bare_collision():
+    bare = Attachment(id="1", title="arch", media_type="application/octet-stream")
+    exact = Attachment(id="2", title="arch.drawio", media_type="application/x-drawio")
+    assert find_drawio_attachment([bare, exact], "arch.drawio") == exact
+
+
+def test_find_drawio_attachment_does_not_guess_wrong_single_attachment():
+    attachments = [Attachment(id="1", title="other.drawio", media_type="application/x-drawio")]
+    assert find_drawio_attachment(attachments, "arch") is None

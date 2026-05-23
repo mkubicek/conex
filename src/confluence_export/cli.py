@@ -37,7 +37,7 @@ from confluence_export.tree import (
     page_path,
 )
 from confluence_export.exporter import Exporter
-from confluence_export.types import Space
+from confluence_export.types import ExportDiagnostic, Space
 
 
 def _is_auth_error(exc: Exception) -> int | None:
@@ -139,6 +139,7 @@ def main() -> None:
     export_p.add_argument("--include-html", action="store_true", help="Save raw HTML alongside markdown")
     export_p.add_argument("--include-archived", action="store_true", help="Include archived pages (skipped by default)")
     export_p.add_argument("--no-git", action="store_true", help="Skip automatic git versioning")
+    export_p.add_argument("--strict", action="store_true", help="Fail when export diagnostics include warnings")
     export_p.add_argument(
         "--no-author-lookup",
         action="store_true",
@@ -208,6 +209,7 @@ def main() -> None:
                 debug=args.include_html,
                 include_archived=args.include_archived,
                 no_git=args.no_git,
+                strict=args.strict,
                 no_author_lookup=args.no_author_lookup,
             )
         case "diff":
@@ -559,6 +561,7 @@ def _cmd_export(
     debug: bool = False,
     include_archived: bool = False,
     no_git: bool = False,
+    strict: bool = False,
     no_author_lookup: bool = False,
 ) -> None:
     """Export page tree as LLM-ready markdown."""
@@ -613,13 +616,86 @@ def _cmd_export(
         include_archived=include_archived,
     )
 
+    diagnostics = getattr(result, "diagnostics", [])
+    has_errors = any(d.severity == "error" for d in diagnostics)
+    has_warnings = any(d.severity == "warning" for d in diagnostics)
+    blocking_diagnostics = has_errors or (strict and has_warnings)
+
     # Git: post-export
-    if use_git and result.written_files:
+    git_committed = False
+    if use_git and result.written_files and not blocking_diagnostics:
         from confluence_export.git import commit_export
 
-        commit_export(out, result.written_files, space_key)
+        git_committed = commit_export(out, result.written_files, space_key)
 
-    print(f"\nExported {result.count} page(s) to {out.resolve()}")
+    _print_export_summary(
+        pages_written=result.count,
+        output_dir=out.resolve(),
+        diagnostics=diagnostics,
+        git_enabled=use_git,
+        git_committed=git_committed,
+        git_blocked=bool(use_git and blocking_diagnostics),
+        validation_failed=blocking_diagnostics,
+    )
+    if blocking_diagnostics:
+        sys.exit(1)
+
+
+def _print_export_summary(
+    *,
+    pages_written: int,
+    output_dir: Path,
+    diagnostics: list[ExportDiagnostic],
+    git_enabled: bool,
+    git_committed: bool,
+    git_blocked: bool,
+    validation_failed: bool,
+) -> None:
+    errors = [d for d in diagnostics if d.severity == "error"]
+    warnings = [d for d in diagnostics if d.severity == "warning"]
+    infos = [d for d in diagnostics if d.severity == "info"]
+
+    if validation_failed:
+        print(
+            f"\nExport validation failed: {len(errors)} error(s), "
+            f"{len(warnings)} warning(s)"
+        )
+    else:
+        print(f"\nExported {pages_written} page(s) to {output_dir}")
+        print(f"Diagnostics: {len(errors)} error(s), {len(warnings)} warning(s)")
+        if infos:
+            print(f"Info: {len(infos)} informational diagnostic(s)")
+
+    if git_enabled:
+        if git_blocked:
+            print("Git: not committed")
+        elif git_committed:
+            print("Git: committed")
+        else:
+            print("Git: no changes")
+    else:
+        print("Git: skipped")
+
+    if errors:
+        print("\nErrors:")
+        for line in _diagnostic_lines(errors):
+            print(f"  - {line}")
+    if warnings:
+        print("\nWarnings:")
+        for line in _diagnostic_lines(warnings):
+            print(f"  - {line}")
+
+
+def _diagnostic_lines(diagnostics: list[ExportDiagnostic], limit: int = 8) -> list[str]:
+    lines = []
+    for diagnostic in diagnostics[:limit]:
+        page = f'Page "{diagnostic.page_title}": ' if diagnostic.page_title else ""
+        path = f" ({diagnostic.path})" if diagnostic.path else ""
+        lines.append(f"{page}{diagnostic.message}{path}")
+    remaining = len(diagnostics) - limit
+    if remaining > 0:
+        lines.append(f"... {remaining} more")
+    return lines
 
 
 def _cmd_diff(
