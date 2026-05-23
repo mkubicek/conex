@@ -16,13 +16,11 @@ from confluence_export.config import (
     ApiDialect,
     AuthConfig,
     AuthMode,
-    Config,
     ConnectionProfile,
     ConnectionProfileError,
     config_path,
     gateway_url,
     is_gateway_url,
-    is_atlassian_site_url,
     is_scoped_token,
     load_connection_profile,
     local_config_path,
@@ -42,27 +40,6 @@ from confluence_export.exporter import Exporter
 from confluence_export.types import Space
 
 
-def _resolve_cloud_id(site_url: str) -> str | None:
-    """Compatibility wrapper for tests and older callers."""
-    return resolve_cloud_id(site_url)
-
-
-def _maybe_route_via_gateway(config: Config) -> Config:
-    """Return a runtime gateway Config for legacy callers without persisting it."""
-    if not (is_atlassian_site_url(config.base_url) and is_scoped_token(config.api_token)):
-        return config
-
-    cloud_id = _resolve_cloud_id(config.base_url)
-    if not cloud_id:
-        return config
-
-    return Config(
-        base_url=gateway_url(cloud_id),
-        email=config.email,
-        api_token=config.api_token,
-    )
-
-
 def _is_auth_error(exc: Exception) -> int | None:
     """Return the HTTP status code if exc looks like an auth failure, else None.
 
@@ -78,8 +55,8 @@ def _is_auth_error(exc: Exception) -> int | None:
     return None
 
 
-def _with_auth_fallback(fn, client: ConfluenceClient, config) -> object:
-    """Call fn(); on auth error, fail clearly without interactive fallback."""
+def _exit_on_auth_error(fn) -> object:
+    """Call fn(); on auth error, fail clearly without prompting."""
     try:
         return fn()
     except Exception as exc:
@@ -212,7 +189,7 @@ def main() -> None:
 
     match args.command:
         case "spaces":
-            _with_auth_fallback(lambda: _cmd_spaces(client), client, profile)
+            _exit_on_auth_error(lambda: _cmd_spaces(client))
         case "tree":
             _cmd_tree(client, CacheStore(), profile, args.space_key)
         case "find":
@@ -264,6 +241,8 @@ def _auth_label(mode: AuthMode) -> str:
             return "Bearer token (PAT)"
         case AuthMode.COOKIE:
             return "cookie session"
+        case _:
+            raise AssertionError(f"Unhandled auth mode: {mode}")
 
 
 def _api_mode_label(dialect: ApiDialect) -> str:
@@ -274,6 +253,8 @@ def _api_mode_label(dialect: ApiDialect) -> str:
             return "OAuth gateway"
         case ApiDialect.COOKIE_V1:
             return "Confluence REST v1 compatibility"
+        case _:
+            raise AssertionError(f"Unhandled API dialect: {dialect}")
 
 
 def _read_existing_config(path: Path) -> dict:
@@ -309,6 +290,21 @@ def _existing_config_defaults(path: Path) -> tuple[str, str, str]:
     )
 
 
+def _looks_like_cookie_header(secret: str) -> bool:
+    if "=" not in secret:
+        return False
+    name, _, value = secret.partition("=")
+    if not name.strip() or not value.strip():
+        return False
+    name_lower = name.strip().lower()
+    return ";" in secret or "." in name_lower or name_lower in {
+        "session",
+        "jsessionid",
+        "cloud.session.token",
+        "tenant.session.token",
+    }
+
+
 def _cmd_configure(local_dir: str | None = None) -> None:
     """Interactive credential setup."""
     target = local_config_path(local_dir) if local_dir is not None else config_path()
@@ -336,11 +332,17 @@ def _cmd_configure(local_dir: str | None = None) -> None:
     if not site_url:
         print("Error: site_url is required.", file=sys.stderr)
         sys.exit(1)
+    if is_gateway_url(site_url):
+        print(
+            "Error: site_url must be the Confluence site URL, not the OAuth gateway URL.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if not email and is_scoped_token(secret):
         print("Error: scoped API tokens require an email address.", file=sys.stderr)
         sys.exit(1)
-    if not email and "=" in secret:
+    if not email and _looks_like_cookie_header(secret):
         auth = AuthConfig(type=AuthMode.COOKIE, cookie_header=secret)
     elif not email:
         auth = AuthConfig(type=AuthMode.BEARER_PAT, token=secret)
@@ -397,7 +399,7 @@ def _cmd_tree(
     client: ConfluenceClient, cache: CacheStore, profile: ConnectionProfile, space_key: str
 ) -> None:
     """Show page hierarchy."""
-    space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, profile)
+    space = _exit_on_auth_error(lambda: _resolve_space(client, space_key))
     cs = cache.ensure_loaded(client, space)
 
     roots = build_tree(cs.pages)
@@ -414,7 +416,7 @@ def _cmd_find(
     query: str,
 ) -> None:
     """Search pages by title."""
-    space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, profile)
+    space = _exit_on_auth_error(lambda: _resolve_space(client, space_key))
     cs = cache.ensure_loaded(client, space)
 
     results = find_pages(cs.pages, query)
@@ -645,9 +647,9 @@ def _cmd_diff(
     if cs is not None:
         space = cs.space
     else:
-        space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, profile)
-    cs = _with_auth_fallback(
-        lambda: cache.refresh(client, space, include_archived=include_archived), client, profile
+        space = _exit_on_auth_error(lambda: _resolve_space(client, space_key))
+    cs = _exit_on_auth_error(
+        lambda: cache.refresh(client, space, include_archived=include_archived)
     )
 
     # Filter API pages
@@ -681,7 +683,7 @@ def _cmd_refresh(
     client: ConfluenceClient, cache: CacheStore, profile: ConnectionProfile, space_key: str
 ) -> None:
     """Force-refresh cache for a space."""
-    space = _with_auth_fallback(lambda: _resolve_space(client, space_key), client, profile)
+    space = _exit_on_auth_error(lambda: _resolve_space(client, space_key))
     cs = cache.refresh(client, space)
     print(f"Cache refreshed: {len(cs.pages)} pages (updated {cs.updated_at})")
 

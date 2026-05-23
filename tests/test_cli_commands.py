@@ -10,25 +10,16 @@ import pytest
 
 import requests
 
-from confluence_export.cli import (
-    _maybe_route_via_gateway,
-    _resolve_cloud_id,
-    _resolve_space,
-    main,
-)
+from confluence_export.cli import _resolve_space, main
 from confluence_export.config import (
     ApiDialect,
     AuthConfig,
     AuthMode,
-    Config,
     ConnectionProfile,
     ConnectionProfileError,
+    resolve_cloud_id,
 )
 from confluence_export.types import CachedSpace, Page, Space, Version
-
-SCOPED_TOKEN = "ATATT3xFfGF0_dummy_payload_TgVilzYuG3Sh8MtCp_8=ADA80198"
-LEGACY_TOKEN = "ATATT3xFfGF0_dummy_no_scope_marker_here"
-
 
 def _space(key="TEST", name="Test Space"):
     return Space(id="1", key=key, name=name, type="global", status="current")
@@ -43,10 +34,6 @@ def _cached_space():
     ]
     return CachedSpace(space=_space(), pages=pages, attachments={},
                        updated_at="2025-01-01T00:00:00Z")
-
-
-def _config(base_url="https://x.atlassian.net", api_token="tok"):
-    return Config(base_url=base_url, email="", api_token=api_token)
 
 
 def _profile(
@@ -369,6 +356,18 @@ class TestConfigureCommand:
             assert exc.value.code == 1
         assert "site_url" in capsys.readouterr().err
 
+    def test_gateway_site_url_exits(self, capsys, tmp_path):
+        inputs = iter(["https://api.atlassian.com/ex/confluence/cloud-123", "", "tok"])
+        config_file = tmp_path / "config.json"
+        with patch("sys.argv", ["confluence-export", "configure"]), \
+             patch("builtins.input", side_effect=inputs), \
+             patch("confluence_export.cli.config_path", return_value=config_file):
+            with pytest.raises(SystemExit):
+                main()
+
+        assert not config_file.exists()
+        assert "OAuth gateway" in capsys.readouterr().err
+
     def test_bearer_mode_when_no_email(self, capsys, tmp_path):
         config_file = tmp_path / "config.json"
         inputs = iter(["https://x.atlassian.net", "", "my-pat"])
@@ -379,6 +378,18 @@ class TestConfigureCommand:
         assert "Bearer token" in capsys.readouterr().out
         data = json.loads(config_file.read_text())
         assert data["auth"]["type"] == "bearer_pat"
+
+    def test_padded_pat_without_email_is_not_cookie(self, tmp_path):
+        config_file = tmp_path / "config.json"
+        inputs = iter(["https://x.atlassian.net", "", "abc123=="])
+        with patch("sys.argv", ["confluence-export", "configure"]), \
+             patch("builtins.input", side_effect=inputs), \
+             patch("confluence_export.cli.config_path", return_value=config_file):
+            main()
+
+        data = json.loads(config_file.read_text())
+        assert data["auth"]["type"] == "bearer_pat"
+        assert data["auth"]["token"] == "abc123=="
 
     def test_scoped_token_without_email_exits_before_cookie_classification(self, capsys, tmp_path):
         config_file = tmp_path / "config.json"
@@ -445,10 +456,9 @@ class TestCookieFlag:
                  token="",
                  cookie_header="session=abc",
              )), \
-             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
-             patch("confluence_export.cli._maybe_route_via_gateway") as mock_route:
+             patch("confluence_export.cli.ConfluenceClient", return_value=client):
             main()
-        mock_route.assert_not_called()
+        client.get_spaces.assert_called_once()
 
 
 class TestNeedsToken:
@@ -479,7 +489,7 @@ class TestResolveCloudId:
     def test_happy_path_returns_cloud_id(self):
         resp = self._mock_response(body={"cloudId": "abc-123"})
         with patch("confluence_export.config.requests.get", return_value=resp) as mock_get:
-            assert _resolve_cloud_id("https://acme.atlassian.net/") == "abc-123"
+            assert resolve_cloud_id("https://acme.atlassian.net/") == "abc-123"
         # Trailing slash stripped, /_edge/tenant_info appended.
         called_url = mock_get.call_args[0][0]
         assert called_url == "https://acme.atlassian.net/_edge/tenant_info"
@@ -489,101 +499,33 @@ class TestResolveCloudId:
             "confluence_export.config.requests.get",
             side_effect=requests.exceptions.ConnectionError("dns"),
         ):
-            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+            assert resolve_cloud_id("https://acme.atlassian.net") is None
 
     def test_http_error_returns_none(self):
         resp = self._mock_response(status=503)
         with patch("confluence_export.config.requests.get", return_value=resp):
-            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+            assert resolve_cloud_id("https://acme.atlassian.net") is None
 
     def test_bad_json_returns_none(self):
         resp = self._mock_response(raise_json=True)
         with patch("confluence_export.config.requests.get", return_value=resp):
-            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+            assert resolve_cloud_id("https://acme.atlassian.net") is None
 
     def test_missing_cloud_id_field_returns_none(self):
         resp = self._mock_response(body={"someOther": "value"})
         with patch("confluence_export.config.requests.get", return_value=resp):
-            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+            assert resolve_cloud_id("https://acme.atlassian.net") is None
 
     def test_non_string_cloud_id_returns_none(self):
         # Defensive: API contract says string, but guard against future drift.
         resp = self._mock_response(body={"cloudId": 12345})
         with patch("confluence_export.config.requests.get", return_value=resp):
-            assert _resolve_cloud_id("https://acme.atlassian.net") is None
+            assert resolve_cloud_id("https://acme.atlassian.net") is None
 
     def test_empty_cloud_id_returns_none(self):
         resp = self._mock_response(body={"cloudId": ""})
         with patch("confluence_export.config.requests.get", return_value=resp):
-            assert _resolve_cloud_id("https://acme.atlassian.net") is None
-
-
-class TestMaybeRouteViaGateway:
-    """Legacy runtime route helper does not persist gateway URLs."""
-
-    def test_scoped_token_on_site_url_returns_runtime_gateway_config(self):
-        cfg = Config(
-            base_url="https://acme.atlassian.net",
-            email="a@b.com",
-            api_token=SCOPED_TOKEN,
-        )
-        with patch("confluence_export.cli._resolve_cloud_id", return_value="cloud-uuid-123"):
-            result = _maybe_route_via_gateway(cfg)
-
-        assert result.base_url == "https://api.atlassian.com/ex/confluence/cloud-uuid-123"
-        assert cfg.base_url == "https://acme.atlassian.net"
-
-    def test_legacy_token_left_alone(self):
-        cfg = Config(
-            base_url="https://acme.atlassian.net",
-            email="a@b.com",
-            api_token=LEGACY_TOKEN,
-        )
-        with patch("confluence_export.cli._resolve_cloud_id") as mock_resolve:
-            result = _maybe_route_via_gateway(cfg)
-
-        mock_resolve.assert_not_called()
-        assert result.base_url == "https://acme.atlassian.net"
-
-    def test_already_gateway_url_left_alone(self):
-        # If base_url is already the gateway, nothing to do.
-        cfg = Config(
-            base_url="https://api.atlassian.com/ex/confluence/cloud-uuid",
-            email="a@b.com",
-            api_token=SCOPED_TOKEN,
-        )
-        with patch("confluence_export.cli._resolve_cloud_id") as mock_resolve:
-            result = _maybe_route_via_gateway(cfg)
-
-        mock_resolve.assert_not_called()
-        assert result.base_url == cfg.base_url
-
-    def test_cloud_id_lookup_failure_leaves_url_intact(self):
-        """If /_edge/tenant_info is unreachable, fall back to the original URL
-        so the caller sees the underlying 401 instead of a silent rewrite."""
-        cfg = Config(
-            base_url="https://acme.atlassian.net",
-            email="a@b.com",
-            api_token=SCOPED_TOKEN,
-        )
-        with patch(
-            "confluence_export.cli._resolve_cloud_id", return_value=None
-        ):
-            result = _maybe_route_via_gateway(cfg)
-
-        assert result.base_url == "https://acme.atlassian.net"
-
-    def test_runtime_route_does_not_persist(self, tmp_path):
-        cfg = Config(
-            base_url="https://acme.atlassian.net",
-            email="a@b.com",
-            api_token=SCOPED_TOKEN,
-        )
-        with patch("confluence_export.cli._resolve_cloud_id", return_value="cloud-uuid"):
-            result = _maybe_route_via_gateway(cfg)
-
-        assert result.base_url.startswith("https://api.atlassian.com/")
-        assert cfg.base_url == "https://acme.atlassian.net"
+            assert resolve_cloud_id("https://acme.atlassian.net") is None
 
 
 class TestConfigError:

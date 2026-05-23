@@ -104,10 +104,13 @@ def is_scoped_token(token: str) -> bool:
 
 
 def is_atlassian_site_url(url: str) -> bool:
-    """True if url points at a `*.atlassian.net` site, not the OAuth gateway."""
+    """True if url points at an HTTPS `*.atlassian.net` site."""
     if not url:
         return False
-    host = urlparse(url).hostname or ""
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        return False
+    host = parsed.hostname or ""
     return bool(_SITE_HOST_RE.match(host))
 
 
@@ -176,9 +179,12 @@ def display_config_source(path: Path | None, fallback: str = "CLI/environment") 
 
 def resolve_cloud_id(site_url: str) -> str | None:
     """Look up the Confluence cloud ID for a site URL via /_edge/tenant_info."""
+    site_url = normalize_url(site_url)
+    if not is_atlassian_site_url(site_url):
+        return None
     try:
         resp = requests.get(
-            normalize_url(site_url) + "/_edge/tenant_info",
+            site_url + "/_edge/tenant_info",
             headers={"Accept": "application/json"},
             timeout=10,
         )
@@ -212,6 +218,10 @@ def _infer_auth_mode(
     api_base_url: str = "",
 ) -> AuthMode:
     explicit_mode = _auth_mode(explicit)
+    if explicit_mode is AuthMode.BEARER_PAT and email and token:
+        if is_scoped_token(token) or is_gateway_url(api_base_url):
+            return AuthMode.SCOPED_API_TOKEN
+        return AuthMode.BASIC_API_TOKEN
     if explicit_mode is not None:
         return explicit_mode
     if cookie_header:
@@ -282,6 +292,11 @@ def _parse_file_config(path: Path) -> _ResolvedConfig:
         )
 
     base_url = normalize_url(str(data.get("base_url", "") or ""))
+    if is_gateway_url(base_url):
+        raise ConnectionProfileError(
+            "config base_url is the OAuth gateway; run `confluence-export configure` "
+            "with the Confluence site URL"
+        )
     cloud_id = gateway_cloud_id(base_url)
     return _ResolvedConfig(
         site_url=base_url,
@@ -387,9 +402,6 @@ def _resolve_api_base(
     if auth_mode is AuthMode.SCOPED_API_TOKEN:
         if is_gateway_url(api_base_url):
             return api_base_url, cloud_id or gateway_cloud_id(api_base_url), ApiDialect.GATEWAY_V2
-        if is_gateway_url(site_url):
-            resolved_cloud_id = cloud_id or gateway_cloud_id(site_url)
-            return site_url, resolved_cloud_id, ApiDialect.GATEWAY_V2
         resolved_cloud_id = cloud_id or resolve_cloud(site_url)
         if not resolved_cloud_id:
             raise ConnectionProfileError(
@@ -444,6 +456,10 @@ def load_connection_profile(
         raise ConnectionProfileError("authentication credentials are required")
     if not merged.site_url:
         raise ConnectionProfileError("site_url is required")
+    if is_gateway_url(merged.site_url):
+        raise ConnectionProfileError(
+            "site_url must be the Confluence site URL, not the OAuth gateway URL"
+        )
 
     auth = merged.auth
     auth.type = _infer_auth_mode(
@@ -535,6 +551,10 @@ def _config_to_v2_dict(
 ) -> dict:
     if auth.type is None:
         raise ConnectionProfileError("auth type is required")
+    if is_gateway_url(site_url):
+        raise ConnectionProfileError(
+            "site_url must be the Confluence site URL, not the OAuth gateway URL"
+        )
     data = {
         "version": 2,
         "site_url": normalize_url(site_url),

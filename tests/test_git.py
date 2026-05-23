@@ -63,6 +63,7 @@ class TestChunkedPaths:
 class TestSecretConfigPaths:
     def test_matches_anything_under_conex(self):
         assert _is_secret_config_relpath(".conex/config.json") is True
+        assert _is_secret_config_relpath(".Conex/config.json") is True
         assert _is_secret_config_relpath(".conex/secrets.yaml") is True
         assert _is_secret_config_relpath(".conex/profiles/prod.json") is True
 

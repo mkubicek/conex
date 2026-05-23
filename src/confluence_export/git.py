@@ -35,7 +35,7 @@ def _chunked_paths(paths: list[str], max_bytes: int = _MAX_ARGV_BYTES) -> Iterat
 
 def _is_secret_config_relpath(path: str) -> bool:
     """True for any file inside a local .conex directory."""
-    return ".conex" in Path(path).parts
+    return any(part.lower() == ".conex" for part in Path(path).parts)
 
 
 def _is_secret_config_path(output_dir: Path, path: Path) -> bool:
@@ -176,7 +176,7 @@ def _remove_stale_files(output_dir: Path, written_files: list[Path]) -> None:
 
 
 def _unstage_secret_configs(output_dir: Path) -> None:
-    """Undo any accidental staging of local .conex JSON configs."""
+    """Undo any accidental staging of local .conex files."""
     result = _run_git(output_dir, "diff", "--cached", "--name-only", "-z", check=False)
     if result is None or not result.stdout:
         return

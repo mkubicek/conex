@@ -18,9 +18,11 @@ from confluence_export.config import (
     find_local_config,
     gateway_url,
     is_atlassian_site_url,
+    is_gateway_url,
     is_scoped_token,
     load_connection_profile,
     load_config,
+    resolve_cloud_id,
     save_config,
     save_connection_config,
 )
@@ -136,6 +138,9 @@ class TestIsAtlassianSiteUrl:
         assert is_atlassian_site_url("https://acme.atlassian.net") is True
         assert is_atlassian_site_url("https://acme.atlassian.net/") is True
 
+    def test_requires_https(self):
+        assert is_atlassian_site_url("http://acme.atlassian.net") is False
+
     def test_gateway_url(self):
         assert is_atlassian_site_url("https://api.atlassian.com/ex/confluence/abc") is False
 
@@ -150,6 +155,20 @@ class TestGatewayUrl:
     def test_format(self):
         cid = "6298609d-df12-4367-a2f6-2ead80671779"
         assert gateway_url(cid) == f"https://api.atlassian.com/ex/confluence/{cid}"
+
+    def test_detects_gateway_url(self):
+        assert is_gateway_url("https://api.atlassian.com/ex/confluence/abc") is True
+        assert is_gateway_url("https://acme.atlassian.net") is False
+
+
+class TestResolveCloudId:
+    def test_rejects_non_atlassian_urls_without_request(self):
+        with patch("confluence_export.config.requests.get") as mock_get:
+            assert resolve_cloud_id("http://169.254.169.254") is None
+            assert resolve_cloud_id("http://acme.atlassian.net") is None
+            assert resolve_cloud_id("https://wiki.example.com") is None
+
+        mock_get.assert_not_called()
 
 
 class TestSaveConfig:
@@ -206,6 +225,28 @@ class TestConnectionProfile:
                 resolve_cloud=lambda url: None,
             )
 
+    def test_gateway_site_url_is_rejected(self):
+        with pytest.raises(ConnectionProfileError, match="site_url"):
+            load_connection_profile(
+                site_url="https://api.atlassian.com/ex/confluence/cloud-123",
+                api_base_url="https://api.atlassian.com/ex/confluence/cloud-123",
+                email="a@b.com",
+                api_token="ATATT3x_dummy=ADA123",
+                interactive=False,
+            )
+
+    def test_scoped_token_to_internal_url_does_not_request_cloud_id(self):
+        with patch("confluence_export.config.requests.get") as mock_get:
+            with pytest.raises(ConnectionProfileError, match="cloud ID"):
+                load_connection_profile(
+                    site_url="http://169.254.169.254",
+                    email="a@b.com",
+                    api_token="ATATT3x_dummy=ADA123",
+                    interactive=False,
+                )
+
+        mock_get.assert_not_called()
+
     def test_scoped_token_without_email_is_not_bearer(self):
         with pytest.raises(ConnectionProfileError, match="email and API token"):
             load_connection_profile(
@@ -237,6 +278,21 @@ class TestConnectionProfile:
         assert profile.auth_mode is AuthMode.BEARER_PAT
         assert profile.api_dialect is ApiDialect.CLOUD_V2
 
+    def test_cli_email_reinfers_saved_bearer_as_basic(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.json"
+        save_connection_config(
+            site_url="https://x.atlassian.net",
+            auth=AuthConfig(type=AuthMode.BEARER_PAT, token="token"),
+            path=config_file,
+        )
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: config_file)
+
+        profile = load_connection_profile(email="a@b.com", interactive=False)
+
+        assert profile.auth_mode is AuthMode.BASIC_API_TOKEN
+        assert profile.auth.email == "a@b.com"
+        assert profile.auth.token == "token"
+
     def test_v1_config_migration_in_memory(self, tmp_path, monkeypatch):
         config_file = tmp_path / "config.json"
         config_file.write_text(json.dumps({
@@ -252,6 +308,18 @@ class TestConnectionProfile:
         assert profile.api_base_url == "https://file.atlassian.net"
         assert profile.auth_mode is AuthMode.BASIC_API_TOKEN
 
+    def test_v1_gateway_base_url_fails_with_repair_instruction(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({
+            "base_url": "https://api.atlassian.com/ex/confluence/cloud-123",
+            "email": "file@test.com",
+            "api_token": "file-token",
+        }))
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: config_file)
+
+        with pytest.raises(ConnectionProfileError, match="OAuth gateway"):
+            load_connection_profile(interactive=False)
+
     def test_v2_config_roundtrip(self, tmp_path, monkeypatch):
         config_file = tmp_path / "config.json"
         save_connection_config(
@@ -265,6 +333,14 @@ class TestConnectionProfile:
 
         assert profile.auth_mode is AuthMode.COOKIE
         assert profile.api_dialect is ApiDialect.COOKIE_V1
+
+    def test_save_rejects_gateway_site_url(self, tmp_path):
+        with pytest.raises(ConnectionProfileError, match="site_url"):
+            save_connection_config(
+                site_url="https://api.atlassian.com/ex/confluence/cloud-123",
+                auth=AuthConfig(type=AuthMode.SCOPED_API_TOKEN, email="a@b.com", token="tok"),
+                path=tmp_path / "config.json",
+            )
 
     def test_local_config_precedence(self, tmp_path, monkeypatch):
         global_config = tmp_path / "global.json"

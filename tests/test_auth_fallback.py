@@ -8,7 +8,7 @@ import pytest
 import requests
 
 from confluence_export.client import AuthenticationError, ConfluenceClient
-from confluence_export.cli import _with_auth_fallback
+from confluence_export.cli import _exit_on_auth_error
 from confluence_export.config import Config
 
 
@@ -113,12 +113,12 @@ class TestNeedsToken:
         assert cfg.needs_token is False
 
 
-# -- _with_auth_fallback -----------------------------------------------------
+# -- _exit_on_auth_error -----------------------------------------------------
 
 
-class TestWithAuthFallback:
+class TestExitOnAuthError:
     def test_success_no_prompt(self):
-        result = _with_auth_fallback(lambda: 42, MagicMock(), MagicMock())
+        result = _exit_on_auth_error(lambda: 42)
         assert result == 42
 
     def test_exits_on_auth_error_without_prompt(self, capsys):
@@ -129,7 +129,7 @@ class TestWithAuthFallback:
             raise AuthenticationError(401, "https://x.atlassian.net/wiki/api/v2/spaces")
 
         with pytest.raises(SystemExit):
-            _with_auth_fallback(fn, client, config)
+            _exit_on_auth_error(fn)
 
         assert "no interactive prompt" in capsys.readouterr().err
 
@@ -142,7 +142,7 @@ class TestWithAuthFallback:
 
         with patch.object(client, "_get", return_value={"results": []}):
             with pytest.raises(SystemExit):
-                _with_auth_fallback(fn, client, config)
+                _exit_on_auth_error(fn)
 
     def test_exits_on_http_404_without_prompt(self, capsys):
         """Confluence v2 API returns 404 for wrong-instance credentials."""
@@ -155,7 +155,7 @@ class TestWithAuthFallback:
             raise requests.exceptions.HTTPError(response=resp)
 
         with pytest.raises(SystemExit):
-            _with_auth_fallback(fn, client, config)
+            _exit_on_auth_error(fn)
 
         assert "HTTP 404" in capsys.readouterr().err
 
@@ -170,7 +170,7 @@ class TestWithAuthFallback:
             raise requests.exceptions.HTTPError(response=resp)
 
         with pytest.raises(requests.exceptions.HTTPError):
-            _with_auth_fallback(fn, client, config)
+            _exit_on_auth_error(fn)
 
 
 # -- set_cookies -------------------------------------------------------------
