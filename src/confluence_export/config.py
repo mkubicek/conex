@@ -290,11 +290,10 @@ def _parse_file_config(path: Path) -> _ResolvedConfig:
             "config base_url is the OAuth gateway; run `confluence-export configure` "
             "with the Confluence site URL"
         )
-    cloud_id = gateway_cloud_id(base_url)
     return _ResolvedConfig(
         site_url=base_url,
-        api_base_url=base_url if is_gateway_url(base_url) else "",
-        cloud_id=cloud_id,
+        api_base_url="",
+        cloud_id=None,
         auth=_auth_from_v1(data),
         source=path,
         source_label=display_config_source(path),
