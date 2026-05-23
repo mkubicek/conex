@@ -60,7 +60,15 @@ uv pip install -e .
 confluence-export configure
 ```
 
-Stores your base URL and API token to `~/.config/confluence-export/config.json`. You can also use env vars (`CONFLUENCE_BASE_URL`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`) or CLI flags (`--base-url`, `--email`, `--api-token`).
+Stores your site URL and credentials to `~/.config/confluence-export/config.json`. You can also use env vars (`CONFLUENCE_SITE_URL`, `CONFLUENCE_BASE_URL`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`, `CONFLUENCE_PAT`, `CONFLUENCE_COOKIE`) or CLI flags (`--site-url`, `--base-url`, `--email`, `--api-token`, `--cookie`).
+
+Use a local config when an export directory should override the global default:
+
+```bash
+confluence-export configure --local ./docs
+```
+
+Local configs are discovered from the output directory upward as `.conex/config.json`. Export git commits never stage files under `.conex/`.
 
 If you don't have an API token, you can authenticate with a browser cookie instead. Copy the `Cookie` header from DevTools (F12 > Network tab > any `/wiki/` request) and pass it with `--cookie`:
 
@@ -68,7 +76,7 @@ If you don't have an API token, you can authenticate with a browser cookie inste
 confluence-export --base-url https://example.atlassian.net --cookie 'tenant.session.token=...' export SPACEKEY -o ./output
 ```
 
-Cookie authentication uses Confluence's legacy REST read endpoints because Confluence Cloud REST v2 rejects browser session cookies. Use the normal site URL (`https://example.atlassian.net`), not the OAuth gateway URL. If no token or cookie is provided, the tool will prompt interactively. Browser credentials are used for the current run only and never saved.
+Cookie authentication uses Confluence's legacy REST read endpoints because Confluence Cloud REST v2 rejects browser session cookies. Use the normal site URL (`https://example.atlassian.net`), not the OAuth gateway URL. Cookie auth is an explicit mode and reports `API mode: Confluence REST v1 compatibility`.
 
 ## Required permissions
 
@@ -86,7 +94,11 @@ read:user:confluence
 
 For classic OAuth 2.0 (3LO) tokens, the equivalent set is `read:confluence-space.summary`, `read:confluence-content.all`, `readonly:content.attachment:confluence`, and `read:confluence-user`.
 
-Scoped tokens must be addressed via the OAuth gateway URL (`https://api.atlassian.com/ex/confluence/{cloudId}/...`) rather than the site URL. The tool detects this automatically: on first use, it looks up your site's cloud ID from the unauthenticated `/_edge/tenant_info` endpoint, rewrites `base_url` in the saved config, and routes all subsequent requests through the gateway. No manual configuration needed — keep `base_url` set to your site URL.
+Scoped tokens must be addressed via the OAuth gateway URL (`https://api.atlassian.com/ex/confluence/{cloudId}/...`) rather than the site URL. The tool detects this automatically: it keeps the saved `site_url` as the user-facing Atlassian URL, resolves or uses the cached `cloud_id`, and derives the gateway `api_base_url` at runtime. No manual configuration needed in the common case; if cloud ID lookup is blocked, provide `--cloud-id` or `--api-base-url`.
+
+Before export, the tool prints the resolved config source, auth mode, API mode, site URL, output directory, and preflight checks. If auth, gateway routing, space resolution, page listing, attachment listing, or output writability fails, export stops before writing output.
+
+In non-interactive runs, commands never prompt for credentials. Run `confluence-export configure` or pass explicit flags/env vars before invoking export from automation.
 
 ## Commands
 

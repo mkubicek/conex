@@ -33,6 +33,19 @@ def _chunked_paths(paths: list[str], max_bytes: int = _MAX_ARGV_BYTES) -> Iterat
         yield batch
 
 
+def _is_secret_config_relpath(path: str) -> bool:
+    """True for any file inside a local .conex directory."""
+    return any(part.lower() == ".conex" for part in Path(path).parts)
+
+
+def _is_secret_config_path(output_dir: Path, path: Path) -> bool:
+    try:
+        rel = path.resolve().relative_to(output_dir.resolve())
+        return _is_secret_config_relpath(str(rel))
+    except ValueError:
+        return _is_secret_config_relpath(str(path))
+
+
 def git_available() -> bool:
     """Check if git is installed and accessible."""
     return shutil.which("git") is not None
@@ -94,6 +107,7 @@ def commit_local_changes(output_dir: Path) -> bool:
     # Stage only modifications to tracked files within output_dir
     if _run_git(output_dir, "add", "-u", ".") is None:
         return False
+    _unstage_secret_configs(output_dir)
 
     # Check if anything was staged
     result = _run_git(output_dir, "diff", "--cached", "--quiet", check=False)
@@ -113,10 +127,11 @@ def commit_export(output_dir: Path, written_files: list[Path], space_key: str) -
     # Stage only the files the exporter wrote. Chunk to avoid hitting the
     # OS argv limit on big spaces (thousands of paths joined into one exec
     # call exceeds macOS ARG_MAX).
-    paths = [str(f) for f in written_files]
+    paths = [str(f) for f in written_files if not _is_secret_config_path(output_dir, f)]
     for batch in _chunked_paths(paths):
         if _run_git(output_dir, "add", "--", *batch) is None:
             return False
+    _unstage_secret_configs(output_dir)
 
     # Remove stale tracked files (deletions/renames/moves upstream)
     _remove_stale_files(output_dir, written_files)
@@ -147,6 +162,8 @@ def _remove_stale_files(output_dir: Path, written_files: list[Path]) -> None:
         parts = Path(rel_path).parts
         if ".workspace" in parts:
             continue
+        if _is_secret_config_relpath(rel_path):
+            continue
         full = (output_dir / rel_path).resolve()
         if full not in written_resolved:
             stale.append(rel_path)
@@ -156,3 +173,16 @@ def _remove_stale_files(output_dir: Path, written_files: list[Path]) -> None:
         # exceed argv limits when passed to a single git rm call.
         for batch in _chunked_paths(stale):
             _run_git(output_dir, "rm", "--quiet", "--", *batch)
+
+
+def _unstage_secret_configs(output_dir: Path) -> None:
+    """Undo any accidental staging of local .conex files."""
+    result = _run_git(output_dir, "diff", "--cached", "--name-only", "-z", check=False)
+    if result is None or not result.stdout:
+        return
+    secret_paths = [
+        path for path in result.stdout.strip("\0").split("\0")
+        if path and _is_secret_config_relpath(path)
+    ]
+    for batch in _chunked_paths(secret_paths):
+        _run_git(output_dir, "reset", "-q", "HEAD", "--", *batch, check=False)

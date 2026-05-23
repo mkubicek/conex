@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from confluence_export.git import (
     _chunked_paths,
+    _is_secret_config_relpath,
     commit_export,
     commit_local_changes,
     ensure_repo,
@@ -57,6 +58,18 @@ class TestChunkedPaths:
         # 300 / ~108 → ~2 paths per batch → ~10 batches
         assert len(batches) >= 5
         assert [p for batch in batches for p in batch] == paths
+
+
+class TestSecretConfigPaths:
+    def test_matches_anything_under_conex(self):
+        assert _is_secret_config_relpath(".conex/config.json") is True
+        assert _is_secret_config_relpath(".Conex/config.json") is True
+        assert _is_secret_config_relpath(".conex/secrets.yaml") is True
+        assert _is_secret_config_relpath(".conex/profiles/prod.json") is True
+
+    def test_does_not_match_similar_names(self):
+        assert _is_secret_config_relpath("docs/conex/config.json") is False
+        assert _is_secret_config_relpath("docs/.conex-backup/config.json") is False
 
 
 class TestGitAvailable:
@@ -394,3 +407,63 @@ class TestCommitExport:
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True)
         assert "old.md" not in ls.stdout
         assert "New.md" in ls.stdout
+
+    def test_does_not_stage_local_conex_config(self, tmp_path):
+        self._init_repo(tmp_path)
+        secret = tmp_path / ".conex" / "profiles" / "prod.json"
+        secret.parent.mkdir(parents=True)
+        secret.write_text('{"token": "secret"}')
+        md = tmp_path / "Page.md"
+        md.write_text("# Page")
+
+        assert commit_export(tmp_path, [md, secret], "TEST") is True
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True)
+        assert "Page.md" in ls.stdout
+        assert ".conex/profiles/prod.json" not in ls.stdout
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=tmp_path, capture_output=True, text=True)
+        assert "?? .conex/" in status.stdout
+
+    def test_commit_local_changes_unstages_tracked_conex_config(self, tmp_path):
+        self._init_repo(tmp_path)
+        secret = tmp_path / ".conex" / "config.json"
+        secret.parent.mkdir()
+        secret.write_text('{"token": "old"}')
+        md = tmp_path / "Page.md"
+        md.write_text("# Page")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "tracked"], cwd=tmp_path, capture_output=True)
+
+        secret.write_text('{"token": "new"}')
+        md.write_text("# Page v2")
+
+        assert commit_local_changes(tmp_path) is True
+
+        show = subprocess.run(
+            ["git", "show", "--name-only", "--format=", "HEAD"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+        )
+        assert "Page.md" in show.stdout
+        assert ".conex/config.json" not in show.stdout
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=tmp_path, capture_output=True, text=True)
+        assert " M .conex/config.json" in status.stdout
+
+    def test_tracked_conex_config_not_removed_as_stale(self, tmp_path):
+        self._init_repo(tmp_path)
+        secret = tmp_path / ".conex" / "config.json"
+        secret.parent.mkdir()
+        secret.write_text('{"token": "old"}')
+        old = tmp_path / "Old.md"
+        old.write_text("# Old")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first"], cwd=tmp_path, capture_output=True)
+
+        new = tmp_path / "New.md"
+        new.write_text("# New")
+        commit_export(tmp_path, [new], "TEST")
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True)
+        assert ".conex/config.json" in ls.stdout
+        assert "Old.md" not in ls.stdout
