@@ -215,19 +215,14 @@ def _infer_auth_mode(
     email: str,
     token: str,
     cookie_header: str,
-    api_base_url: str = "",
 ) -> AuthMode:
     explicit_mode = _auth_mode(explicit)
-    if explicit_mode is AuthMode.BEARER_PAT and email and token:
-        if is_scoped_token(token) or is_gateway_url(api_base_url):
-            return AuthMode.SCOPED_API_TOKEN
-        return AuthMode.BASIC_API_TOKEN
     if explicit_mode is not None:
         return explicit_mode
     if cookie_header:
         return AuthMode.COOKIE
     if email and token:
-        if is_scoped_token(token) or is_gateway_url(api_base_url):
+        if is_scoped_token(token):
             return AuthMode.SCOPED_API_TOKEN
         return AuthMode.BASIC_API_TOKEN
     if token:
@@ -255,7 +250,6 @@ def _auth_from_v1(data: dict) -> AuthConfig:
         email=email,
         token=token,
         cookie_header="",
-        api_base_url=str(data.get("base_url", "") or ""),
     )
     return AuthConfig(type=mode, email=email, token=token)
 
@@ -275,7 +269,6 @@ def _parse_file_config(path: Path) -> _ResolvedConfig:
             email=email,
             token=token,
             cookie_header=cookie_header,
-            api_base_url=str(data.get("api_base_url", "") or ""),
         )
         return _ResolvedConfig(
             site_url=normalize_url(str(data.get("site_url", "") or "")),
@@ -309,20 +302,63 @@ def _parse_file_config(path: Path) -> _ResolvedConfig:
 
 
 def _overlay(base: _ResolvedConfig, override: _ResolvedConfig) -> _ResolvedConfig:
+    override_auth_has_credentials = False
     if base.auth and override.auth:
+        override_auth_has_cookie = bool(override.auth.cookie_header)
+        override_auth_has_tokenish = bool(override.auth.email or override.auth.token)
+        override_auth_has_credentials = override_auth_has_cookie or override_auth_has_tokenish
+        if override.auth.type is not None:
+            auth_type = override.auth.type
+        elif override_auth_has_credentials:
+            auth_type = None
+        else:
+            auth_type = base.auth.type
         auth = AuthConfig(
-            type=override.auth.type or base.auth.type,
-            email=override.auth.email or base.auth.email,
-            token=override.auth.token or base.auth.token,
-            cookie_header=override.auth.cookie_header or base.auth.cookie_header,
+            type=auth_type,
+            email=override.auth.email or ("" if override_auth_has_cookie else base.auth.email),
+            token=override.auth.token or ("" if override_auth_has_cookie else base.auth.token),
+            cookie_header=override.auth.cookie_header or (
+                "" if override_auth_has_tokenish else base.auth.cookie_header
+            ),
         )
     else:
         auth = override.auth or base.auth
+        override_auth_has_credentials = bool(
+            override.auth and (
+                override.auth.email or override.auth.token or override.auth.cookie_header
+            )
+        )
+
+    site_url_overridden = bool(override.site_url)
+    merged_auth_has_credentials = bool(
+        auth and (auth.email or auth.token or auth.cookie_header)
+    )
+    # A higher-priority explicit non-scoped auth mode may intentionally inherit
+    # credentials from a lower-priority config. It still invalidates cached
+    # gateway routing because the OAuth gateway is scoped-token-only transport.
+    override_auth_forces_site_route = bool(
+        override.auth and override.auth.type in (
+            AuthMode.BASIC_API_TOKEN,
+            AuthMode.BEARER_PAT,
+            AuthMode.COOKIE,
+        )
+        and merged_auth_has_credentials
+    )
+    clear_derived_route = (
+        (site_url_overridden or override_auth_has_credentials or override_auth_forces_site_route)
+        and not override.api_base_url
+    )
 
     return _ResolvedConfig(
         site_url=override.site_url or base.site_url,
-        api_base_url=override.api_base_url or base.api_base_url,
-        cloud_id=override.cloud_id if override.cloud_id is not None else base.cloud_id,
+        api_base_url=override.api_base_url or ("" if clear_derived_route else base.api_base_url),
+        cloud_id=override.cloud_id if override.cloud_id is not None else (
+            None if (
+                site_url_overridden
+                or override_auth_has_credentials
+                or override_auth_forces_site_route
+            ) else base.cloud_id
+        ),
         auth=auth,
         source=override.source or base.source,
         source_label=override.source_label if override.source else base.source_label,
@@ -400,7 +436,11 @@ def _resolve_api_base(
         return site_url, None, ApiDialect.COOKIE_V1
 
     if auth_mode is AuthMode.SCOPED_API_TOKEN:
-        if is_gateway_url(api_base_url):
+        if api_base_url:
+            if not is_gateway_url(api_base_url):
+                raise ConnectionProfileError(
+                    "scoped token api_base_url must be the OAuth gateway URL"
+                )
             return api_base_url, cloud_id or gateway_cloud_id(api_base_url), ApiDialect.GATEWAY_V2
         resolved_cloud_id = cloud_id or resolve_cloud(site_url)
         if not resolved_cloud_id:
@@ -409,7 +449,10 @@ def _resolve_api_base(
             )
         return gateway_url(resolved_cloud_id), resolved_cloud_id, ApiDialect.GATEWAY_V2
 
-    return api_base_url or site_url, cloud_id, ApiDialect.CLOUD_V2
+    if is_gateway_url(api_base_url):
+        raise ConnectionProfileError("OAuth gateway api_base_url requires scoped API token auth")
+
+    return api_base_url or site_url, None, ApiDialect.CLOUD_V2
 
 
 def load_connection_profile(
@@ -467,7 +510,6 @@ def load_connection_profile(
         email=auth.email,
         token=auth.token,
         cookie_header=auth.cookie_header,
-        api_base_url=merged.api_base_url,
     )
     if auth.type is AuthMode.COOKIE and not auth.cookie_header:
         raise ConnectionProfileError("cookie authentication requires a cookie header")

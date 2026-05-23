@@ -293,6 +293,137 @@ class TestConnectionProfile:
         assert profile.auth.email == "a@b.com"
         assert profile.auth.token == "token"
 
+    def test_explicit_cli_bearer_auth_type_is_not_reinferred_from_email(self):
+        profile = load_connection_profile(
+            site_url="https://x.atlassian.net",
+            auth_type=AuthMode.BEARER_PAT,
+            email="a@b.com",
+            api_token="pat-token",
+            interactive=False,
+        )
+
+        assert profile.auth_mode is AuthMode.BEARER_PAT
+        assert profile.api_dialect is ApiDialect.CLOUD_V2
+
+    def test_cli_token_override_reinfers_saved_scoped_as_basic(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.json"
+        save_connection_config(
+            site_url="https://x.atlassian.net",
+            cloud_id="cloud-old",
+            api_base_url=gateway_url("cloud-old"),
+            auth=AuthConfig(
+                type=AuthMode.SCOPED_API_TOKEN,
+                email="a@b.com",
+                token="ATATT3x_dummy=ADA123",
+            ),
+            path=config_file,
+        )
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: config_file)
+
+        profile = load_connection_profile(api_token="legacy-token", interactive=False)
+
+        assert profile.auth_mode is AuthMode.BASIC_API_TOKEN
+        assert profile.api_dialect is ApiDialect.CLOUD_V2
+        assert profile.api_base_url == "https://x.atlassian.net"
+        assert profile.cloud_id is None
+        assert profile.auth.email == "a@b.com"
+        assert profile.auth.token == "legacy-token"
+
+    def test_cli_site_override_drops_cached_gateway_route(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.json"
+        save_connection_config(
+            site_url="https://old.atlassian.net",
+            cloud_id="cloud-old",
+            api_base_url=gateway_url("cloud-old"),
+            auth=AuthConfig(
+                type=AuthMode.SCOPED_API_TOKEN,
+                email="old@test.com",
+                token="ATATT3x_dummy=ADA123",
+            ),
+            path=config_file,
+        )
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: config_file)
+
+        profile = load_connection_profile(
+            site_url="https://new.atlassian.net",
+            email="new@test.com",
+            api_token="legacy-token",
+            interactive=False,
+        )
+
+        assert profile.site_url == "https://new.atlassian.net"
+        assert profile.auth_mode is AuthMode.BASIC_API_TOKEN
+        assert profile.api_base_url == "https://new.atlassian.net"
+        assert profile.cloud_id is None
+
+    def test_cli_token_auth_override_drops_saved_cookie(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.json"
+        save_connection_config(
+            site_url="https://x.atlassian.net",
+            auth=AuthConfig(type=AuthMode.COOKIE, cookie_header="session=abc"),
+            path=config_file,
+        )
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: config_file)
+
+        profile = load_connection_profile(
+            email="a@b.com",
+            api_token="legacy-token",
+            interactive=False,
+        )
+
+        assert profile.auth_mode is AuthMode.BASIC_API_TOKEN
+        assert profile.api_dialect is ApiDialect.CLOUD_V2
+        assert profile.auth.cookie_header == ""
+
+    def test_non_scoped_auth_rejects_gateway_api_base_url(self):
+        with pytest.raises(ConnectionProfileError, match="gateway api_base_url"):
+            load_connection_profile(
+                site_url="https://x.atlassian.net",
+                api_base_url=gateway_url("cloud-123"),
+                email="a@b.com",
+                api_token="legacy-token",
+                interactive=False,
+            )
+
+    def test_scoped_auth_rejects_non_gateway_api_base_url(self):
+        with pytest.raises(ConnectionProfileError, match="OAuth gateway URL"):
+            load_connection_profile(
+                site_url="https://x.atlassian.net",
+                api_base_url="https://x.atlassian.net",
+                email="a@b.com",
+                api_token="ATATT3x_dummy=ADA123",
+                interactive=False,
+                resolve_cloud=lambda url: "cloud-123",
+            )
+
+    def test_explicit_basic_auth_type_inherits_credentials_but_drops_gateway_route(
+        self, tmp_path, monkeypatch
+    ):
+        config_file = tmp_path / "config.json"
+        save_connection_config(
+            site_url="https://x.atlassian.net",
+            cloud_id="cloud-old",
+            api_base_url=gateway_url("cloud-old"),
+            auth=AuthConfig(
+                type=AuthMode.SCOPED_API_TOKEN,
+                email="a@b.com",
+                token="legacy-token",
+            ),
+            path=config_file,
+        )
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: config_file)
+
+        profile = load_connection_profile(
+            auth_type=AuthMode.BASIC_API_TOKEN,
+            interactive=False,
+        )
+
+        assert profile.auth_mode is AuthMode.BASIC_API_TOKEN
+        assert profile.api_base_url == "https://x.atlassian.net"
+        assert profile.cloud_id is None
+        assert profile.auth.email == "a@b.com"
+        assert profile.auth.token == "legacy-token"
+
     def test_v1_config_migration_in_memory(self, tmp_path, monkeypatch):
         config_file = tmp_path / "config.json"
         config_file.write_text(json.dumps({

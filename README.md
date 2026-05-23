@@ -68,7 +68,7 @@ Use a local config when an export directory should override the global default:
 confluence-export configure --local ./docs
 ```
 
-Local configs are discovered from the output directory upward as `.conex/config.json`. Export git commits never stage `.conex/*.json` files.
+Local configs are discovered from the output directory upward as `.conex/config.json`. Export git commits never stage files under `.conex/`.
 
 If you don't have an API token, you can authenticate with a browser cookie instead. Copy the `Cookie` header from DevTools (F12 > Network tab > any `/wiki/` request) and pass it with `--cookie`:
 
