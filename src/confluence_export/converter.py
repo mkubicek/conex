@@ -48,13 +48,23 @@ _EMOTICON_MAP = {
 }
 
 
+# Maximum length of a single path segment (directory or file stem). The layout
+# planner reserves space within this cap when appending disambiguating suffixes,
+# so a collision-suffixed name never exceeds it either.
+MAX_FILENAME_LEN = 100
+
+
 def sanitize_filename(title: str) -> str:
-    """Convert a page title to a safe directory/file name."""
+    """Convert a page title to a safe directory/file name.
+
+    Performs raw normalization only (strip non-word chars, collapse separators,
+    cap length). Per-parent collision disambiguation lives in layout.py.
+    """
     name = re.sub(r"[^\w\s-]", "", title)
     name = re.sub(r"[-\s]+", "-", name)
     name = name.strip("-")
-    if len(name) > 100:
-        name = name[:100].rstrip("-")
+    if len(name) > MAX_FILENAME_LEN:
+        name = name[:MAX_FILENAME_LEN].rstrip("-")
     return name or "untitled"
 
 
