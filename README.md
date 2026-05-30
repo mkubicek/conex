@@ -48,6 +48,22 @@ output/Space-Name/Page-A/.workspace/draft-notes.md
 
 Both `.workspace/` and `.media/` use a dot-prefix to avoid name collisions with Confluence pages. Since each page title becomes a directory name, a page titled "workspace" or "media" would clash with a non-prefixed directory. The dot-prefix is safe because page titles are sanitized to only contain word characters, spaces, and hyphens, so no page can produce a directory name starting with a dot.
 
+### When a page is moved or renamed in Confluence
+
+A page's on-disk path follows its position in the Confluence tree, so reparenting or renaming a page changes where it is exported. On the next full export, conex rewrites the page's markdown at its new path (git's rename detection keeps `git log --follow` history across the move) and re-downloads its `.media/` there.
+
+Your `.workspace/` prep files are **deliberately not moved automatically.** Auto-carrying them would mean reconciling the filesystem against git's index on every export to serve a rare event — a fragile trade conex does not make. Instead, when a page with workspace content moves, conex leaves the `.workspace/` at the old path untouched and prints a note telling you the new location, e.g.:
+
+```
+Note: "Page-A" moved to 'New-Parent/Page-A'; your prep files at
+'Old-Parent/Page-A/.workspace' do not move automatically — relocate them if
+you still need them.
+```
+
+Move the folder yourself if you still want those files. (An empty, auto-created `.workspace/` carries nothing and is cleaned up silently.)
+
+One caveat for `--no-media`: a normal export re-downloads a moved page's `.media/` at its new path, but `--no-media` does not. So if a page moves during a `--no-media` export, its cached attachments are dropped (conex prints a note); re-run a full export with media to restore them.
+
 ## Install
 
 ```bash

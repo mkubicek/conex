@@ -50,6 +50,23 @@ class CacheStore:
         pages = client.get_pages_in_space(space.id, include_archived=include_archived)
         print(f"Found {len(pages)} pages.", file=sys.stderr)
 
+        # A 0-page response over a populated cache is ambiguous: the space may be
+        # genuinely empty, or the API may be hiccupping. Warn loudly but proceed,
+        # so a genuinely-emptied space stays representable. Acting on an empty
+        # result is safe — the reconciler leaves every on-disk page that is absent
+        # from the plan untouched, and an export with no written files prunes
+        # nothing, so no data is lost either way.
+        if not pages:
+            prior = self.load(space.key)
+            if prior is not None and any(p.status != "folder" for p in prior.pages):
+                print(
+                    f"Warning: the API returned 0 pages for space {space.key}, "
+                    "but a populated cache exists. Treating the space as empty — "
+                    "if this is a transient API issue rather than a genuinely "
+                    "emptied space, re-run to refresh.",
+                    file=sys.stderr,
+                )
+
         # Resolve folders: pages may reference parent IDs that are folders,
         # not pages. Fetch these as synthetic Page entries so the tree is complete.
         pages = self._resolve_folders(client, pages)

@@ -241,3 +241,10 @@ class TestMigrateMediaDirs:
     def test_empty_tree(self, tmp_path):
         """No media/ dirs at all — returns empty list."""
         assert migrate_media_dirs(tmp_path) == []
+
+
+def test_load_versions_returns_empty_on_corrupt_json(tmp_path):
+    from confluence_export.media import _VERSIONS_FILE, _load_versions
+
+    (tmp_path / _VERSIONS_FILE).write_text("{ not valid json")
+    assert _load_versions(tmp_path) == {}
