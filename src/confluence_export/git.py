@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -210,13 +211,23 @@ def _remove_stale_files(
     if result is None or not result.stdout.strip("\0"):
         return
 
-    # On a case-insensitive filesystem a fresh write and the index can differ
-    # only in case (a re-cased title, or legacy content from another machine).
-    # git folds those to one path, so we must too — otherwise the same file is
-    # both git-added (new case) and flagged stale (old case), and `git rm` then
-    # fails on its staged content, leaving a "survived the prune" warning that
-    # only clears on the next export.
-    fold = (lambda s: s.casefold()) if _fs_is_case_insensitive(output_dir) else (lambda s: s)
+    # Normalize the comparison key on two axes that git itself folds but
+    # Path.resolve() does not:
+    #   - Unicode form: a macOS attachment title can arrive NFD (decomposed); git
+    #     with core.precomposeunicode (the macOS default) stores it NFC, so
+    #     `git ls-files` returns NFC while `written_files` is still NFD. Comparing
+    #     raw strings flags the file stale and `git rm` then fails on its just-
+    #     staged content (issue #15). Fold both sides to NFC.
+    #   - Case: on a case-insensitive filesystem a fresh write and the index can
+    #     differ only in case (a re-cased title, or legacy content from another
+    #     machine); git folds those to one path, so we must too, or the same file
+    #     is both git-added (new case) and flagged stale (old case).
+    _nfc = lambda s: unicodedata.normalize("NFC", s)  # noqa: E731
+    fold = (
+        (lambda s: _nfc(s).casefold())
+        if _fs_is_case_insensitive(output_dir)
+        else _nfc
+    )
     written_keys = {fold(str(f.resolve())) for f in written_files}
 
     stale = []
