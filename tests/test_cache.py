@@ -179,3 +179,51 @@ class TestCacheStore:
             cs = store.refresh(client, _make_space(), include_archived=True)
 
             assert cs.include_archived is True
+
+
+class TestEmptyResponse:
+    def test_zero_pages_over_populated_cache_warns_but_proceeds(self, tmp_path, capsys):
+        # A 0-page response over a populated cache warns loudly (could be a
+        # transient hiccup) but proceeds — so a genuinely-emptied space stays
+        # representable. Acting on an empty result is safe (nothing is pruned).
+        with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
+            store = CacheStore()
+            store.save(_make_cached_space())  # prior populated snapshot
+            client = MagicMock()
+            client.returns_archived_pages = False
+            client.get_pages_in_space.return_value = []
+
+            result = store.refresh(client, _make_space())
+
+            assert result.pages == []  # reflects the API, not the stale cache
+            assert store.load("TEST").pages == []  # empty snapshot saved
+            assert "returned 0 pages" in capsys.readouterr().err
+
+    def test_zero_pages_with_no_prior_cache_proceeds(self, tmp_path):
+        with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
+            store = CacheStore()
+            client = MagicMock()
+            client.returns_archived_pages = False
+            client.get_pages_in_space.return_value = []
+            client.get_attachments.return_value = []
+
+            result = store.refresh(client, _make_space())
+
+            assert result.pages == []  # legitimately empty space, no guard fires
+
+
+def test_resolve_folders_skips_unresolvable_parent():
+    # A parent folder that the API cannot return (get_folder_by_id -> None) is
+    # skipped, and the resolution loop terminates instead of hanging.
+    from unittest.mock import MagicMock
+
+    from confluence_export.cache import CacheStore
+    from confluence_export.types import Page
+
+    client = MagicMock()
+    client.get_folder_by_id.return_value = None
+    pages = [Page(id="c", title="C", parent_id="ghost", parent_type="folder")]
+
+    result = CacheStore._resolve_folders(client, pages)
+
+    assert [p.id for p in result] == ["c"]

@@ -17,9 +17,10 @@ from confluence_export.drawio import (
     render_drawio_to_png,
     replace_drawio_placeholders,
 )
-from confluence_export.media import download_attachments, ensure_media_dir
+from confluence_export.media import WORKSPACE_DIR_NAME, download_attachments, ensure_media_dir
 from confluence_export.tree import (
     build_tree,
+    collect_subtree,
     find_node_by_path,
     format_tree,
     page_path,
@@ -33,6 +34,15 @@ class ExportResult:
 
     count: int = 0
     written_files: list[Path] = field(default_factory=list)
+
+
+def is_full_export(path_filter: str | None, no_children: bool) -> bool:
+    """Whether this export writes the COMPLETE space tree (the only mode with
+    full visibility). The single source of truth for the predicate that gates
+    BOTH move/orphan reconciliation (exporter) and git stale-file pruning (cli):
+    a partial export must do neither. Used by export_space and by cli's
+    commit_export call so the two can never diverge."""
+    return path_filter is None and not no_children
 
 
 class Exporter:
@@ -135,16 +145,75 @@ class Exporter:
 
         self._prefetch_bodies(cs)
 
-        roots = build_tree(cs.pages)
+        roots_full = build_tree(cs.pages)
 
+        roots = roots_full
         if not include_archived:
-            roots = [r for r in roots if r.page.id != "__archived__"]
+            roots = [r for r in roots_full if r.page.id != "__archived__"]
 
-        # Plan the collision-free on-disk layout once, up front. Both the
-        # directory name and the markdown filename of every page are read from
-        # this plan, so two pages whose titles sanitize to the same name get
-        # distinct, stable paths instead of silently overwriting (issue #11).
-        self._plan = plan_layout(roots)
+        # Plan the collision-free on-disk layout once, up front, over the FULL
+        # tree (including the synthetic __archived__ subtree). Both the directory
+        # name and the markdown filename of every page are read from this plan,
+        # so two pages whose titles sanitize to the same name get distinct,
+        # stable paths instead of silently overwriting (issue #11). Planning over
+        # the full tree also keeps an archived page's plan entry alive at its
+        # _archived/ target, so it is relocated into / out of _archived/ when
+        # archived or unarchived instead of being stranded at its old path.
+        self._plan = plan_layout(roots_full)
+
+        # Reconcile moved pages and heal orphans BEFORE writing — but only on a
+        # full, freshly-fetched export, the one mode with complete tree
+        # visibility. Filtered / single-subtree / no-children runs never
+        # reconcile, nor prune (commit_export is_full=False). A --cached full
+        # export also skips reconcile here (stale tree), though git pruning still
+        # runs on it via commit_export.
+        is_full = is_full_export(path_filter, no_children)
+        if is_full and force_refresh:
+            from confluence_export.reconcile import reconcile
+
+            # Reconcile only over what this run actually writes. When archived
+            # pages are out of scope (no --include-archived) they are left
+            # untouched on disk rather than relocated into _archived/. Restrict
+            # the full plan by removing the archived page ids (rather than
+            # re-running plan_layout over a different tree) so every retained
+            # page's target is byte-identical to the write walk's — otherwise a
+            # real page titled "_archived" could get a different target in the two
+            # plans and be seen as a spurious move.
+            if include_archived:
+                reconcile_plan = self._plan
+            else:
+                archived_node = next(
+                    (r for r in roots_full if r.page.id == "__archived__"), None
+                )
+                archived_ids = (
+                    {n.page.id for n in collect_subtree(archived_node)}
+                    if archived_node else set()
+                )
+                reconcile_plan = {
+                    pid: t for pid, t in self._plan.items() if pid not in archived_ids
+                }
+            try:
+                reconcile(
+                    reconcile_plan, output_dir, space.key,
+                    media_will_redownload=self.download_media,
+                )
+            except Exception as exc:
+                # Reconciliation is a best-effort relayout; never let it abort the
+                # export. The write walk still produces correct content at the
+                # planned paths, and a transient failure heals on the next run
+                # (reconcile is idempotent). Surface the error and continue.
+                print(f"Warning: layout reconciliation skipped ({exc})", file=sys.stderr)
+        elif is_full:
+            print(
+                "Note: orphan/move healing runs on a fresh full export; "
+                "re-run with --force-refresh to heal a stale layout.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Note: orphan/move healing happens on a full export of the space.",
+                file=sys.stderr,
+            )
 
         # Resolve subtree if path given
         if path_filter:
@@ -185,14 +254,17 @@ class Exporter:
     ) -> ExportResult:
         """Recursively export a node and its children."""
         page = node.page
-        dir_name = self._planned_segment(page)
-        page_dir = parent_dir / dir_name
+        page_dir = parent_dir / self._planned_segment(page)
         page_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create workspace directory for user's preparation files
+        # Create workspace directory for user's preparation files. Folders are
+        # structural-only and never hold prep files, so they get no .workspace —
+        # this also means a renamed folder leaves a genuinely-empty directory the
+        # reconciler can prune instead of a stranded .workspace orphan.
         # Dot-prefix avoids collision with a Confluence page titled "workspace"
         # (sanitize_filename strips dots, so no page can produce ".workspace")
-        (page_dir / ".workspace").mkdir(exist_ok=True)
+        if page.status != "folder":
+            (page_dir / WORKSPACE_DIR_NAME).mkdir(exist_ok=True)
 
         indent = "  " * depth
         print(f"{indent}Exporting: {page.title}")

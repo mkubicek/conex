@@ -36,7 +36,7 @@ from confluence_export.tree import (
     format_tree,
     page_path,
 )
-from confluence_export.exporter import Exporter
+from confluence_export.exporter import Exporter, is_full_export
 from confluence_export.types import Space
 
 
@@ -613,11 +613,15 @@ def _cmd_export(
         include_archived=include_archived,
     )
 
-    # Git: post-export
+    # Git: post-export. A partial export (subtree / single page / no-children)
+    # writes only part of the tree, so it must not prune the rest of the repo:
+    # commit only adds in that mode (is_full=False). Shared predicate with the
+    # exporter (is_full_export) so the relocation gate and the prune gate agree.
+    is_full = is_full_export(path_filter, no_children)
     if use_git and result.written_files:
         from confluence_export.git import commit_export
 
-        commit_export(out, result.written_files, space_key)
+        commit_export(out, result.written_files, space_key, is_full=is_full)
 
     print(f"\nExported {result.count} page(s) to {out.resolve()}")
 

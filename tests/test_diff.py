@@ -11,6 +11,7 @@ from confluence_export.diff import (
     compute_diff,
     format_diff,
     scan_export_dir,
+    scan_export_dir_grouped,
 )
 from confluence_export.types import Page, Version
 
@@ -85,6 +86,50 @@ def test_scan_skips_invalid(tmp_path: Path):
     result = scan_export_dir(tmp_path, "TST")
     assert len(result) == 1
     assert "1" in result
+
+
+# -- scan_export_dir_grouped ---------------------------------------------------
+
+
+def test_scan_grouped_surfaces_duplicate_ids(tmp_path: Path):
+    # Two markdown files carrying the same page_id (legacy collision/orphan
+    # state) must both surface, canonical (higher version) first.
+    _write_page(tmp_path, "A/A.md", "1", 1, title="A", path="/A")
+    _write_page(tmp_path, "B/B.md", "1", 5, title="B", path="/B")
+
+    grouped = scan_export_dir_grouped(tmp_path, "TST")
+    assert len(grouped["1"]) == 2
+    assert grouped["1"][0].version == 5  # canonical first
+
+
+def test_scan_grouped_excludes_workspace_and_media(tmp_path: Path):
+    # A user markdown note inside .workspace/, or a stray .md under .media/, is
+    # not a page and must never be scanned, moved, or deleted.
+    _write_page(tmp_path, "P/.workspace/note.md", "ws", 1)
+    _write_page(tmp_path, "P/.media/leak.md", "media", 1)
+    _write_page(tmp_path, "P/P.md", "real", 1)
+
+    grouped = scan_export_dir_grouped(tmp_path, "TST")
+    assert set(grouped) == {"real"}
+
+
+def test_scan_grouped_skips_other_space_with_warning(tmp_path: Path, capsys):
+    _write_page(tmp_path, "A/A.md", "1", 1, space_key="TST")
+    _write_page(tmp_path, "B/B.md", "9", 1, space_key="OTHER")
+
+    grouped = scan_export_dir_grouped(tmp_path, "TST")
+    assert set(grouped) == {"1"}
+    assert "OTHER" in capsys.readouterr().err
+
+
+def test_scan_grouped_tolerates_garbled_version(tmp_path: Path):
+    # A non-integer / null version must degrade to 0, not crash the whole scan.
+    (tmp_path / "P").mkdir()
+    (tmp_path / "P" / "P.md").write_text(
+        "---\ntitle: P\npage_id: '1'\nspace_key: TST\nversion: not-a-number\n---\n\nBody\n"
+    )
+    grouped = scan_export_dir_grouped(tmp_path, "TST")
+    assert grouped["1"][0].version == 0
 
 
 # -- compute_diff --------------------------------------------------------------
@@ -183,3 +228,19 @@ def test_format_diff_empty():
     result = DiffResult(unchanged_count=5)
     output = format_diff(result, [])
     assert output == "Unchanged: 5 page(s)"
+
+
+def test_parse_frontmatter_unterminated_block_returns_none(tmp_path: Path):
+    from confluence_export.diff import _parse_frontmatter
+
+    f = tmp_path / "x.md"
+    f.write_text("---\ntitle: X\nbody with no closing fence\n")
+    assert _parse_frontmatter(f) is None
+
+
+def test_scan_skips_non_markdown_and_markdown_without_page_id(tmp_path: Path):
+    # A non-.md file is skipped during the walk; a .md with frontmatter but no
+    # page_id is not a page and is also skipped.
+    (tmp_path / "ignore.txt").write_text("not markdown")
+    (tmp_path / "Note.md").write_text("---\ntitle: Note\nspace_key: TST\n---\n\nbody\n")
+    assert scan_export_dir_grouped(tmp_path, "TST") == {}

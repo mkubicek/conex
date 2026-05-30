@@ -12,6 +12,11 @@ from confluence_export.types import Attachment
 
 _VERSIONS_FILE = ".versions.json"
 MEDIA_DIR_NAME = ".media"
+# User preparation files attached to a page (scripts, notes). Preserved across
+# re-exports and, when a page moves, deliberately left in place (never
+# auto-relocated — issue #17, Option B); the user is told where the page went.
+# Shared here so the exporter, reconciler, git prune, and frontmatter scan agree.
+WORKSPACE_DIR_NAME = ".workspace"
 
 
 def ensure_media_dir(page_dir: Path) -> Path:

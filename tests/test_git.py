@@ -248,6 +248,117 @@ class TestCommitExport:
         assert "Old-Name.md" not in ls.stdout
         assert "New-Name.md" in ls.stdout
 
+    def test_recased_page_does_not_trigger_stale_prune_warning(self, tmp_path, capsys):
+        """On a case-insensitive FS a title whose only change is case must not be
+        seen as both written (new case) and stale (old case): that makes git rm
+        fail on staged content and leaves a 'survived the prune' warning that only
+        clears on the next export (the real-export finding on PR #25)."""
+        import pytest
+
+        from confluence_export.git import _fs_is_case_insensitive
+
+        self._init_repo(tmp_path)
+        if not _fs_is_case_insensitive(tmp_path):
+            pytest.skip("requires a case-insensitive filesystem")
+
+        page = tmp_path / "Foo"
+        page.mkdir()
+        (page / "Foo.md").write_text("# Foo")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        # The title is re-cased: the writer now produces "foo/foo.md" (same files
+        # on a case-insensitive FS). A single full export must converge.
+        (page / "foo.md").write_text("# Foo v2")
+        commit_export(tmp_path, [page / "foo.md"], "TEST")
+
+        assert "survived the prune" not in capsys.readouterr().err
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert ls.lower().count("foo/foo.md") == 1  # one tracked copy, no case-dup churn
+
+    def test_recase_converges_even_when_core_ignorecase_lies(self, tmp_path, capsys):
+        """We must probe the real FS, not trust git's core.ignorecase: that value
+        is fixed at init and drifts (a Linux/CI clone opened on a Mac carries
+        ignorecase=false). With it forced false on a case-insensitive FS, the
+        re-case must STILL converge in one export — the case the unit relies on."""
+        import pytest
+
+        from confluence_export.git import _fs_is_case_insensitive
+
+        self._init_repo(tmp_path)
+        if not _fs_is_case_insensitive(tmp_path):
+            pytest.skip("requires a case-insensitive filesystem")
+        # Force git's recorded verdict to disagree with the real (insensitive) FS.
+        subprocess.run(["git", "config", "core.ignorecase", "false"], cwd=tmp_path, capture_output=True)
+
+        page = tmp_path / "Bar"
+        page.mkdir()
+        (page / "Bar.md").write_text("# Bar")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        (page / "bar.md").write_text("# Bar v2")
+        commit_export(tmp_path, [page / "bar.md"], "TEST")
+
+        assert "survived the prune" not in capsys.readouterr().err  # FS probe, not config
+
+    def test_moved_media_re_downloaded_at_new_path_follows_as_rename(self, tmp_path):
+        """A moved page's .media is disposable (Option B): the reconciler drops it
+        at the old path and the write walk re-downloads it at the new path. The
+        stale-file prune removes the old tracked copy and git's own rename
+        detection links the dropped + re-added attachment — no relocation."""
+        self._init_repo(tmp_path)
+        old = tmp_path / "A" / "P"
+        (old / ".media").mkdir(parents=True)
+        (old / "P.md").write_text("# P")
+        (old / ".media" / "img.png").write_bytes(b"\x89PNG-bytes-for-rename-detection")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        # Simulate the export of the moved page: old markdown + media dropped (by
+        # the reconciler), both rewritten/re-downloaded fresh at the new path.
+        new = tmp_path / "B" / "P"
+        (new / ".media").mkdir(parents=True)
+        import shutil
+
+        shutil.rmtree(old / ".media")
+        (old / "P.md").unlink()
+        old.rmdir()
+        (new / "P.md").write_text("# P")
+        (new / ".media" / "img.png").write_bytes(b"\x89PNG-bytes-for-rename-detection")
+
+        commit_export(tmp_path, [new / "P.md", new / ".media" / "img.png"], "TEST")
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "B/P/.media/img.png" in ls          # tracked at the new path
+        assert "A/P/.media/img.png" not in ls       # old tracked copy pruned
+        follow = subprocess.run(
+            ["git", "log", "--follow", "--oneline", "--", "B/P/.media/img.png"],
+            cwd=tmp_path, capture_output=True, text=True,
+        ).stdout
+        assert len(follow.strip().splitlines()) >= 2  # history follows the rename
+
+    def test_partial_export_does_not_prune(self, tmp_path):
+        """is_full=False (filtered/subtree export) must NOT git-rm files outside
+        the written subset — otherwise a subtree export wipes the rest of the repo."""
+        self._init_repo(tmp_path)
+        kept = tmp_path / "Sub" / "Sub.md"
+        kept.parent.mkdir()
+        kept.write_text("# Sub")
+        rest = tmp_path / "Other" / "Other.md"
+        rest.parent.mkdir()
+        rest.write_text("# Other")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "full export"], cwd=tmp_path, capture_output=True)
+
+        # A filtered re-export writes only the Sub subtree.
+        kept.write_text("# Sub v2")
+        commit_export(tmp_path, [kept], "TEST", is_full=False)
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True)
+        assert "Other/Other.md" in ls.stdout  # untouched by a partial export
+        assert (tmp_path / "Other" / "Other.md").exists()
+
     def test_commit_message_contains_timestamp(self, tmp_path):
         self._init_repo(tmp_path)
         md = tmp_path / "Page.md"
@@ -467,3 +578,158 @@ class TestCommitExport:
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True)
         assert ".conex/config.json" in ls.stdout
         assert "Old.md" not in ls.stdout
+
+
+def _raise_filenotfound(*args, **kwargs):
+    raise FileNotFoundError("git missing")
+
+
+class TestGitDefensiveBranches:
+    """Cover the error/fallback branches of the git helpers (no pragma policy in
+    this repo — defensive paths are exercised with monkeypatched failures)."""
+
+    def test_is_secret_config_path_outside_output_dir(self, tmp_path):
+        from confluence_export.git import _is_secret_config_path
+
+        # A path that is NOT under output_dir hits the ValueError fallback, which
+        # inspects the raw path string instead of the relative one.
+        assert _is_secret_config_path(tmp_path, Path("/elsewhere/.conex/c.json")) is True
+        assert _is_secret_config_path(tmp_path, Path("/elsewhere/page.md")) is False
+
+    def test_run_git_returns_none_when_binary_missing(self, tmp_path, monkeypatch, capsys):
+        from confluence_export import git as G
+
+        monkeypatch.setattr(subprocess, "run", _raise_filenotfound)
+        assert G._run_git(tmp_path, "status") is None
+        assert "git status failed" in capsys.readouterr().err
+
+    def test_ensure_repo_false_when_init_fails(self, tmp_path, monkeypatch):
+        from confluence_export import git as G
+
+        real = G._run_git
+
+        def fake(repo, *args, **kwargs):
+            if args and args[0] == "init":
+                return None
+            return real(repo, *args, **kwargs)
+
+        monkeypatch.setattr(G, "_run_git", fake)
+        assert G.ensure_repo(tmp_path) is False
+
+    def test_commit_local_changes_false_when_add_fails(self, tmp_path, monkeypatch):
+        from confluence_export import git as G
+
+        ensure_repo(tmp_path)
+        (tmp_path / "a.md").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "i"], cwd=tmp_path, capture_output=True)
+
+        real = G._run_git
+
+        def fake(repo, *args, **kwargs):
+            if args[:2] == ("add", "-u"):
+                return None
+            return real(repo, *args, **kwargs)
+
+        monkeypatch.setattr(G, "_run_git", fake)
+        assert commit_local_changes(tmp_path) is False
+
+    def test_fs_case_probe_false_when_mkstemp_fails(self, tmp_path, monkeypatch):
+        import tempfile
+
+        from confluence_export import git as G
+
+        def _boom(*args, **kwargs):
+            raise OSError("no temp")
+
+        monkeypatch.setattr(tempfile, "mkstemp", _boom)
+        assert G._fs_is_case_insensitive(tmp_path) is False
+
+    def test_fs_case_probe_swallows_unlink_error(self, tmp_path, monkeypatch):
+        from confluence_export import git as G
+
+        def _boom(self, *args, **kwargs):
+            raise OSError("locked")
+
+        # mkstemp succeeds; the finally's probe.unlink() raises and is swallowed.
+        monkeypatch.setattr(Path, "unlink", _boom)
+        assert G._fs_is_case_insensitive(tmp_path) in (True, False)
+
+    def test_remove_stale_files_returns_early_when_index_empty(self, tmp_path, monkeypatch):
+        from confluence_export import git as G
+
+        ensure_repo(tmp_path)
+        (tmp_path / "a.md").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "i"], cwd=tmp_path, capture_output=True)
+
+        real = G._run_git
+
+        class _Empty:
+            stdout = ""
+            returncode = 0
+
+        def fake(repo, *args, **kwargs):
+            if args and args[0] == "ls-files":
+                return _Empty()
+            return real(repo, *args, **kwargs)
+
+        monkeypatch.setattr(G, "_run_git", fake)
+        G._remove_stale_files(tmp_path, [])  # hits the empty-index guard; no raise
+
+    def test_remove_stale_files_warns_when_rm_fails(self, tmp_path, monkeypatch, capsys):
+        from confluence_export import git as G
+
+        ensure_repo(tmp_path)
+        (tmp_path / "old.md").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "i"], cwd=tmp_path, capture_output=True)
+
+        real = G._run_git
+
+        class _Fail:
+            stdout = ""
+            returncode = 1
+
+        def fake(repo, *args, **kwargs):
+            if args and args[0] == "rm":
+                return _Fail()
+            return real(repo, *args, **kwargs)
+
+        monkeypatch.setattr(G, "_run_git", fake)
+        # old.md is tracked but not in written_files -> stale -> rm attempted ->
+        # batch fails -> per-path fallback also fails -> warning.
+        G._remove_stale_files(tmp_path, [])
+        assert "survived the prune" in capsys.readouterr().err
+
+    def test_remove_stale_files_per_path_fallback_succeeds(self, tmp_path, monkeypatch, capsys):
+        # The point of the per-path fallback: a batch `git rm` fails but the
+        # individual paths then succeed, so the stale files ARE pruned and no
+        # warning is printed. (Previously only the all-fail path was covered.)
+        from confluence_export import git as G
+
+        ensure_repo(tmp_path)
+        (tmp_path / "old.md").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "i"], cwd=tmp_path, capture_output=True)
+
+        real = G._run_git
+        state = {"rm_calls": 0}
+
+        class _Fail:
+            stdout = ""
+            returncode = 1
+
+        def fake(repo, *args, **kwargs):
+            if args and args[0] == "rm":
+                state["rm_calls"] += 1
+                if state["rm_calls"] == 1:
+                    return _Fail()  # fail the first (batch) rm
+            return real(repo, *args, **kwargs)  # the per-path rm runs for real
+
+        monkeypatch.setattr(G, "_run_git", fake)
+        G._remove_stale_files(tmp_path, [])
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "old.md" not in ls  # pruned via the per-path fallback
+        assert "survived the prune" not in capsys.readouterr().err
