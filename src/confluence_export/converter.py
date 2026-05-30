@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import yaml
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -75,12 +76,20 @@ def convert_page(
     path: str,
     attachments: list[Attachment] | None = None,
     user_resolver: UserResolver = None,
+    rendered: dict[str, Path] | None = None,
 ) -> str:
-    """Convert a Confluence page to markdown with YAML frontmatter."""
+    """Convert a Confluence page to markdown with YAML frontmatter.
+
+    ``rendered`` maps a draw.io diagram/attachment name to its rendered PNG path
+    (built by the exporter BEFORE conversion). The drawio macro handler uses it to
+    emit a real ``<img>`` inline, so no escapable ``[drawio:NAME]`` sentinel ever
+    round-trips through markdownify (issues #9, #8)."""
     html = page.body_storage
 
     # Pre-process Confluence-specific HTML
-    html = _preprocess_html(html, attachments or [], user_resolver=user_resolver)
+    html = _preprocess_html(
+        html, attachments or [], user_resolver=user_resolver, rendered=rendered or {}
+    )
 
     # Convert to markdown using markdownify
     markdown = md(
@@ -145,9 +154,11 @@ def _preprocess_html(
     html: str,
     attachments: list[Attachment],
     user_resolver: UserResolver = None,
+    rendered: dict[str, Path] | None = None,
 ) -> str:
     """Pre-process Confluence storage HTML before markdownify."""
     soup = BeautifulSoup(html, "html.parser")
+    rendered = rendered or {}
 
     # Build attachment lookup
     attach_map = {a.title: a for a in attachments}
@@ -258,7 +269,7 @@ def _preprocess_html(
         elif macro_name == "code":
             _convert_code_block(soup, macro)
         elif macro_name in ("drawio", "inc-drawio"):
-            _convert_drawio_placeholder(soup, macro)
+            _convert_drawio_placeholder(soup, macro, rendered, attach_map)
         elif macro_name == "profile":
             _convert_profile(soup, macro, user_resolver)
         elif macro_name == "profile-picture":
@@ -516,14 +527,49 @@ def _convert_view_file(soup: BeautifulSoup, macro: Tag) -> None:
         macro.decompose()
 
 
-def _convert_drawio_placeholder(soup: BeautifulSoup, macro: Tag) -> None:
-    """Replace drawio/inc-drawio macro with a placeholder."""
+def _convert_drawio_placeholder(
+    soup: BeautifulSoup,
+    macro: Tag,
+    rendered: dict[str, Path],
+    attach_map: dict[str, Attachment],
+) -> None:
+    """Replace a drawio/inc-drawio macro with its rendered PNG (image + source
+    link), or a graceful "not rendered" note when no PNG is available.
+
+    Emitting real ``<img>``/``<a>`` here — rather than a ``[drawio:NAME]`` text
+    sentinel resolved by a post-markdownify string replace — means markdownify
+    can no longer escape the diagram name (``_`` -> ``\\_``) and break the lookup
+    (#9), and a failed render can no longer leak a raw sentinel into the output
+    (#8). The render is done by the exporter before conversion and handed in via
+    ``rendered``."""
     name_param = macro.find("ac:parameter", attrs={"ac:name": "diagramName"})
     diagram_name = name_param.get_text().strip() if name_param else "diagram"
+    bare = diagram_name.removesuffix(".drawio")
+    drawio_filename = f"{bare}.drawio"
 
-    placeholder = soup.new_tag("p")
-    placeholder.string = f"[drawio:{diagram_name}]"
-    macro.replace_with(placeholder)
+    png_path = None
+    for key in (diagram_name, drawio_filename, bare):
+        if key in rendered:
+            png_path = rendered[key]
+            break
+    source_tracked = drawio_filename in attach_map or diagram_name in attach_map
+
+    p = soup.new_tag("p")
+    if png_path is not None:
+        p.append(soup.new_tag("img", src=f"{MEDIA_DIR_NAME}/{png_path.name}", alt=bare))
+    else:
+        em = soup.new_tag("em")
+        em.string = f"[Draw.io diagram not rendered: {drawio_filename}]"
+        p.append(em)
+    if source_tracked:
+        p.append(soup.new_tag("br"))
+        src_em = soup.new_tag("em")
+        src_em.append("Draw.io source: ")
+        link = soup.new_tag("a", href=f"{MEDIA_DIR_NAME}/{drawio_filename}")
+        link.string = drawio_filename
+        src_em.append(link)
+        p.append(src_em)
+    macro.replace_with(p)
 
 
 def _convert_dynamic_macro_placeholder(

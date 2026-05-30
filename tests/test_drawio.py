@@ -1,11 +1,8 @@
 """Tests for draw.io diagram detection and processing."""
 
-from pathlib import Path
-
 from confluence_export.drawio import (
     detect_drawio_macros,
     find_drawio_attachments,
-    replace_drawio_placeholders,
 )
 from confluence_export.types import Attachment
 
@@ -46,36 +43,3 @@ def test_detect_drawio_macros():
 def test_detect_drawio_macros_none():
     html = "<p>No drawio here</p>"
     assert detect_drawio_macros(html) == []
-
-
-def test_replace_drawio_placeholders(tmp_path):
-    markdown = (
-        "# Page\n\n"
-        "Some text\n\n"
-        "[drawio:architecture]\n\n"
-        "More text\n"
-    )
-    png = tmp_path / "architecture.drawio.png"
-    png.touch()
-
-    result = replace_drawio_placeholders(
-        markdown,
-        {"architecture": png},
-    )
-    assert "![architecture](.media/architecture.drawio.png)" in result
-    assert "Draw.io source:" in result
-    assert "architecture.drawio" in result
-    assert "[drawio:" not in result
-
-
-def test_replace_drawio_placeholders_with_extension(tmp_path):
-    markdown = "Some [drawio:arch.drawio] diagram\n"
-    png = tmp_path / "arch.drawio.png"
-    png.touch()
-
-    result = replace_drawio_placeholders(
-        markdown,
-        {"arch.drawio": png},
-    )
-    assert "arch.drawio.png" in result
-    assert "[drawio:" not in result
