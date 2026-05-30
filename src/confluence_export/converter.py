@@ -141,6 +141,17 @@ def _build_frontmatter(
     return f"---\n{yaml_str}---\n\n"
 
 
+def _resolve_user_name(account_id: str, user_resolver: UserResolver) -> str:
+    """Resolve a Confluence account id to a display name, falling back to the id
+    when there is no resolver or no resolved name. Shared by the standalone
+    user-mention pass and the profile-picture macro so they render identically."""
+    if account_id and user_resolver:
+        info = user_resolver(account_id)
+        if info and info.get("displayName"):
+            return info["displayName"]
+    return account_id
+
+
 def _preprocess_html(
     html: str,
     attachments: list[Attachment],
@@ -220,21 +231,24 @@ def _preprocess_html(
 
     # --- User mentions (ri:user inside ac:link or standalone) ---
     for user_tag in list(soup.find_all("ri:user")):
-        # The profile-picture macro renders its own inline mention in the
-        # structured-macro pass below; leave its ri:user intact so that handler
-        # can resolve it, instead of it being consumed here and the macro then
-        # falling through to a noisy dynamic-content placeholder (issue #5).
+        account_id = user_tag.get("ri:account-id", "")
+        # A profile-picture macro is resolved to its inline @mention HERE, by
+        # replacing the WHOLE macro — not deferred to the structured-macro pass.
+        # Deferring breaks when the macro sits inside a panel/expand whose body is
+        # re-parsed into a fresh soup before that pass runs: the macro would be
+        # detached from the dispatch snapshot and the mention silently dropped
+        # (issue #5, nested-macro regression).
         parent_macro = user_tag.find_parent("ac:structured-macro")
         if parent_macro is not None and parent_macro.get("ac:name") == "profile-picture":
+            if account_id:
+                span = soup.new_tag("span")
+                span.string = f"@{_resolve_user_name(account_id, user_resolver)}"
+                parent_macro.replace_with(span)
+            else:
+                parent_macro.decompose()
             continue
-        account_id = user_tag.get("ri:account-id", "")
+        name = _resolve_user_name(account_id, user_resolver)
         parent_link = user_tag.find_parent("ac:link")
-        display_name = None
-        if account_id and user_resolver:
-            info = user_resolver(account_id)
-            if info:
-                display_name = info.get("displayName")
-        name = display_name or account_id
         if parent_link:
             span = soup.new_tag("span")
             span.string = f"@{name}"
@@ -262,7 +276,10 @@ def _preprocess_html(
         elif macro_name == "profile":
             _convert_profile(soup, macro, user_resolver)
         elif macro_name == "profile-picture":
-            _convert_profile_picture(soup, macro, user_resolver)
+            # A profile-picture with a user was already resolved to an inline
+            # mention in the user-mention pre-pass; one reaching here has no user
+            # — drop it rather than emit a dynamic-content placeholder.
+            macro.decompose()
         elif macro_name == "status":
             _convert_status(soup, macro)
         elif macro_name == "expand":
@@ -401,29 +418,6 @@ def _convert_profile(soup: BeautifulSoup, macro: Tag, user_resolver: UserResolve
     else:
         li.string = f"user:{account_id}" if account_id else "Unknown user"
     macro.replace_with(li)
-
-
-def _convert_profile_picture(soup: BeautifulSoup, macro: Tag, user_resolver: UserResolver) -> None:
-    """Render the lightweight profile-picture macro as an inline @mention.
-
-    The macro embeds an ``<ri:user>`` (its ``ri:user`` is left intact for us by the
-    user-mention pre-pass). Resolve the account id to a display name and emit
-    ``@Name`` inline, matching how standalone user mentions render — instead of the
-    generic dynamic-content placeholder. If there is no user, drop it silently
-    rather than leaving noise (issue #5)."""
-    user_tag = macro.find("ri:user")
-    account_id = user_tag.get("ri:account-id", "") if user_tag else ""
-    if not account_id:
-        macro.decompose()
-        return
-    name = account_id
-    if user_resolver:
-        info = user_resolver(account_id)
-        if info and info.get("displayName"):
-            name = info["displayName"]
-    span = soup.new_tag("span")
-    span.string = f"@{name}"
-    macro.replace_with(span)
 
 
 def _convert_status(soup: BeautifulSoup, macro: Tag) -> None:

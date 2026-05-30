@@ -180,6 +180,38 @@ def test_profile_picture_resolver_without_name_falls_back_to_id():
     assert "Confluence dynamic content" not in result
 
 
+def test_profile_picture_empty_account_id_dropped():
+    # A profile-picture whose ri:user carries no account-id → dropped cleanly,
+    # no mention text and no dynamic-content placeholder.
+    html = (
+        '<ac:structured-macro ac:name="profile-picture">'
+        '<ac:parameter ac:name="User"><ri:user/></ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [])
+    assert "@" not in result
+    assert "Confluence dynamic content" not in result
+
+
+def test_profile_picture_inside_panel_keeps_mention():
+    # Regression guard (#5 follow-up): a profile-picture nested in a panel must
+    # keep its mention. _convert_panel re-parses the panel body into a fresh soup,
+    # so a macro resolved only in the later structured-macro pass would be detached
+    # from that pass's snapshot and the mention silently dropped. Resolving the
+    # profile-picture in the user-mention pre-pass (before any panel re-parse)
+    # survives it.
+    html = (
+        '<ac:structured-macro ac:name="info"><ac:rich-text-body>'
+        '<p>Owner: <ac:structured-macro ac:name="profile-picture">'
+        '<ac:parameter ac:name="User"><ri:user ri:account-id="abc"/></ac:parameter>'
+        "</ac:structured-macro></p>"
+        "</ac:rich-text-body></ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [], user_resolver=lambda aid: {"displayName": "Alice"})
+    assert "@Alice" in result
+    assert "Confluence dynamic content" not in result
+
+
 # -- Full pipeline test: HTML → markdown with frontmatter --------------------
 
 def test_full_conversion_pipeline():
