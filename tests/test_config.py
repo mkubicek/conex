@@ -27,6 +27,39 @@ from confluence_export.config import (
     save_connection_config,
 )
 
+# Every CONFLUENCE_* env var read by load_connection_profile (config.py _env_config).
+_CONFLUENCE_ENV_VARS = (
+    "CONFLUENCE_BASE_URL",
+    "CONFLUENCE_SITE_URL",
+    "CONFLUENCE_API_BASE_URL",
+    "CONFLUENCE_CLOUD_ID",
+    "CONFLUENCE_EMAIL",
+    "CONFLUENCE_API_TOKEN",
+    "CONFLUENCE_PAT",
+    "CONFLUENCE_COOKIE",
+    "CONFLUENCE_AUTH_TYPE",
+)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_config(tmp_path_factory, monkeypatch):
+    """Make config resolution hermetic by default (issue #26).
+
+    ``load_connection_profile`` overlays global config file → local config → env →
+    CLI args, so without isolation a test inherits the developer machine's real
+    ``~/.config/confluence-export/config.json`` and any ``CONFLUENCE_*`` env vars —
+    e.g. an inherited email flips ``test_scoped_token_without_email_is_not_bearer``
+    from raising to ``BASIC_API_TOKEN``, making the suite pass/fail on machine state.
+
+    Point the global config at a non-existent temp path and clear the env vars. A
+    test that wants either sets its own ``monkeypatch.setattr(config_path, ...)`` /
+    ``monkeypatch.setenv(...)``, which runs after this fixture and so wins.
+    """
+    empty_global = tmp_path_factory.mktemp("no-global-config") / "config.json"
+    monkeypatch.setattr("confluence_export.config.config_path", lambda: empty_global)
+    for var in _CONFLUENCE_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
 
 class TestConfig:
     def test_needs_token_true(self):
