@@ -124,6 +124,8 @@ PREPROCESS_CASES = [
 
     # Profile macro (ri:user consumed by mention handler first)
     ("profile macro no user", '<ac:structured-macro ac:name="profile"></ac:structured-macro>', ["Unknown user"], []),
+    # profile-picture with no user: dropped silently, never a dynamic-content placeholder (#5)
+    ("profile-picture no user dropped", '<ac:structured-macro ac:name="profile-picture"></ac:structured-macro>', [], ["Confluence dynamic content"]),
 ]
 
 
@@ -148,6 +150,34 @@ def test_user_mention_unresolved_shows_id():
     html = '<ac:link><ri:user ri:account-id="abc"/></ac:link>'
     result = _preprocess_html(html, [])
     assert "@abc" in result
+
+
+# -- profile-picture macro renders as an inline mention, not a placeholder (#5) --
+
+_PROFILE_PIC = (
+    '<ac:structured-macro ac:name="profile-picture">'
+    '<ac:parameter ac:name="User"><ri:user ri:account-id="abc"/></ac:parameter>'
+    "</ac:structured-macro>"
+)
+
+
+def test_profile_picture_renders_resolved_mention():
+    result = _preprocess_html(_PROFILE_PIC, [], user_resolver=lambda aid: {"displayName": "Alice"})
+    assert "@Alice" in result
+    assert "Confluence dynamic content" not in result  # no placeholder noise
+
+
+def test_profile_picture_unresolved_shows_id():
+    result = _preprocess_html(_PROFILE_PIC, [])
+    assert "@abc" in result
+    assert "Confluence dynamic content" not in result
+
+
+def test_profile_picture_resolver_without_name_falls_back_to_id():
+    # Resolver present but can't resolve the account id → fall back to the id.
+    result = _preprocess_html(_PROFILE_PIC, [], user_resolver=lambda aid: None)
+    assert "@abc" in result
+    assert "Confluence dynamic content" not in result
 
 
 # -- Full pipeline test: HTML → markdown with frontmatter --------------------
