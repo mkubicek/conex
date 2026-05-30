@@ -6,11 +6,12 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from confluence_export.cache import CacheStore
 from confluence_export.client import ConfluenceClient
 from confluence_export.converter import convert_page, sanitize_filename
+from confluence_export.layout import plan_layout
 from confluence_export.drawio import (
     find_drawio_attachments,
     render_drawio_to_png,
@@ -56,6 +57,21 @@ class Exporter:
         self.debug = debug
         self.skip_author_lookup = skip_author_lookup
         self._user_cache: dict[str, dict | None] = {}
+        # Per-export layout plan (page_id -> target_dir), set in export_space.
+        # Empty when a page is exported via a direct _export_single_page call
+        # (e.g. unit tests), in which case naming falls back to sanitize_filename.
+        self._plan: dict[str, PurePosixPath] = {}
+
+    def _planned_segment(self, page: Page) -> str:
+        """The collision-free path segment for a page's dir leaf and md stem.
+
+        Both the directory name and the markdown filename come from this single
+        value, so they cannot desync. Falls back to raw sanitization when no
+        plan entry exists (direct calls without a precomputed plan)."""
+        target_dir = self._plan.get(page.id)
+        if target_dir is not None:
+            return target_dir.name
+        return sanitize_filename(page.title)
 
     def _resolve_user(self, account_id: str) -> dict | None:
         """Resolve user account ID to user info dict, with caching."""
@@ -124,6 +140,12 @@ class Exporter:
         if not include_archived:
             roots = [r for r in roots if r.page.id != "__archived__"]
 
+        # Plan the collision-free on-disk layout once, up front. Both the
+        # directory name and the markdown filename of every page are read from
+        # this plan, so two pages whose titles sanitize to the same name get
+        # distinct, stable paths instead of silently overwriting (issue #11).
+        self._plan = plan_layout(roots)
+
         # Resolve subtree if path given
         if path_filter:
             node = find_node_by_path(roots, path_filter)
@@ -163,7 +185,7 @@ class Exporter:
     ) -> ExportResult:
         """Recursively export a node and its children."""
         page = node.page
-        dir_name = sanitize_filename(page.title)
+        dir_name = self._planned_segment(page)
         page_dir = parent_dir / dir_name
         page_dir.mkdir(parents=True, exist_ok=True)
 
@@ -249,8 +271,9 @@ class Exporter:
                 if rendered:
                     markdown = replace_drawio_placeholders(markdown, rendered)
 
-        # Write markdown file
-        base_filename = sanitize_filename(page.title)
+        # Write markdown file. Same allocated segment as the page directory
+        # (via the shared plan), so the dir name and file stem stay in sync.
+        base_filename = self._planned_segment(page)
         md_path = page_dir / (base_filename + ".md")
         md_path.write_text(markdown, encoding="utf-8")
         written.append(md_path)

@@ -146,6 +146,28 @@ class TestTreeExport:
         assert result.count == 1  # only the root
 
 
+class TestCollisionHandling:
+    def test_sibling_title_collision_does_not_overwrite(self, tmp_path):
+        # Two distinct titles that sanitize to the same name must land in two
+        # distinct directories instead of the second silently overwriting the
+        # first (issue #11).
+        exporter, _, cache = _make_exporter()
+        a = _make_page(id="p1", title="page one", body="<p>First page</p>")
+        b = _make_page(id="p2", title="page-one", body="<p>Second page</p>")
+        cs = _make_cached_space(pages=[a, b])
+        cache.ensure_loaded.return_value = cs
+
+        result = exporter.export_space(_make_space(), tmp_path)
+
+        assert result.count == 2
+        first = tmp_path / "page-one" / "page-one.md"
+        second = tmp_path / "page-one-2" / "page-one-2.md"
+        assert first.exists() and second.exists()
+        first_text, second_text = first.read_text(), second.read_text()
+        assert "First page" in first_text and "page_id: p1" in first_text
+        assert "Second page" in second_text and "page_id: p2" in second_text
+
+
 class TestFolderHandling:
     def test_folders_produce_no_markdown(self, tmp_path):
         exporter, _, _ = _make_exporter()
