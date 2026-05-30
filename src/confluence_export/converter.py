@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import urllib.parse
 from pathlib import Path
 
 import yaml
@@ -554,19 +555,31 @@ def _convert_drawio_placeholder(
             break
     source_tracked = drawio_filename in attach_map or diagram_name in attach_map
 
+    # diagramName is API-controlled and can contain spaces / parens / brackets.
+    # Once markdownify renders the emitted <img>/<a>, an unencoded URL with a space
+    # or `(` truncates, and a `]` in the visible text closes the image/link syntax
+    # early (broken output, and a `](javascript:…)`-style injection vector). So
+    # percent-encode the URL path and strip markdown-structural chars from labels.
+    def _label(text: str) -> str:
+        return re.sub(r"[\[\]()\r\n]", "", text)
+
     p = soup.new_tag("p")
     if png_path is not None:
-        p.append(soup.new_tag("img", src=f"{MEDIA_DIR_NAME}/{png_path.name}", alt=bare))
+        p.append(soup.new_tag(
+            "img",
+            src=f"{MEDIA_DIR_NAME}/{urllib.parse.quote(png_path.name)}",
+            alt=_label(bare),
+        ))
     else:
         em = soup.new_tag("em")
-        em.string = f"[Draw.io diagram not rendered: {drawio_filename}]"
+        em.string = f"[Draw.io diagram not rendered: {_label(drawio_filename)}]"
         p.append(em)
     if source_tracked:
         p.append(soup.new_tag("br"))
         src_em = soup.new_tag("em")
         src_em.append("Draw.io source: ")
-        link = soup.new_tag("a", href=f"{MEDIA_DIR_NAME}/{drawio_filename}")
-        link.string = drawio_filename
+        link = soup.new_tag("a", href=f"{MEDIA_DIR_NAME}/{urllib.parse.quote(drawio_filename)}")
+        link.string = _label(drawio_filename)
         src_em.append(link)
         p.append(src_em)
     macro.replace_with(p)

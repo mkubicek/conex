@@ -285,3 +285,40 @@ def test_drawio_render_failure_keeps_source_link_no_sentinel():
     assert "Draw.io diagram not rendered: arch.drawio" in result
     assert 'href=".media/arch.drawio"' in result  # source link still offered
     assert "[drawio:" not in result
+
+
+def test_drawio_name_with_spaces_produces_valid_encoded_url():
+    # A diagram/attachment name with spaces must yield a percent-encoded URL so
+    # the image actually renders after markdownify (a raw space truncates the URL).
+    page = Page(
+        id="1", title="P", space_id="1",
+        version=Version(created_at="2025-01-01T00:00:00Z", number=1),
+        body_storage=_DRAWIO_MACRO.format(name="Foo Bar"), webui="/x",
+    )
+    atts = [Attachment(id="a", title="Foo Bar.drawio", media_type="application/x-drawio")]
+    md_out = convert_page(
+        page, base_url="https://x", space_key="T", path="/P",
+        attachments=atts, rendered={"Foo Bar.drawio": Path(".media/Foo Bar.drawio.png")},
+    )
+    assert ".media/Foo%20Bar.drawio.png" in md_out      # space encoded -> valid URL
+    assert "(.media/Foo Bar.drawio.png)" not in md_out  # no raw space in the URL
+
+
+def test_drawio_name_with_injection_chars_is_neutralized():
+    # A diagramName with markdown-structural chars must not break the image/link
+    # syntax or inject a clickable javascript link (#9 review).
+    page = Page(
+        id="1", title="P", space_id="1",
+        version=Version(created_at="2025-01-01T00:00:00Z", number=1),
+        body_storage=_DRAWIO_MACRO.format(name="x](javascript:alert(1))"), webui="/x",
+    )
+    title = "x](javascript:alert(1)).drawio"
+    atts = [Attachment(id="a", title=title, media_type="application/x-drawio")]
+    md_out = convert_page(
+        page, base_url="https://x", space_key="T", path="/P",
+        attachments=atts, rendered={title: Path(".media/safe.drawio.png")},
+    )
+    assert ".media/safe.drawio.png" in md_out          # image still renders
+    assert "javascript%3A" in md_out                   # source href percent-encoded (neutralized)
+    body = md_out.split("# P", 1)[1]                   # exclude the YAML frontmatter
+    assert "](javascript:" not in body                 # no injected clickable link in the body
