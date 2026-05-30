@@ -733,3 +733,43 @@ class TestGitDefensiveBranches:
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
         assert "old.md" not in ls  # pruned via the per-path fallback
         assert "survived the prune" not in capsys.readouterr().err
+
+    def test_remove_stale_files_nfd_attachment_matched_as_nfc(self, tmp_path, monkeypatch, capsys):
+        # macOS: an attachment title arrives NFD (decomposed); git with
+        # core.precomposeunicode stores it NFC, so `git ls-files` returns NFC while
+        # written_files still holds the NFD path. They must compare equal (folded
+        # to NFC) so the file is not wrongly flagged stale and git-rm'd (issue #15).
+        # Deterministic on any OS: ls-files is stubbed to the NFC form.
+        import unicodedata
+
+        from confluence_export import git as G
+
+        ensure_repo(tmp_path)
+        (tmp_path / "seed.md").write_text("x")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "i"], cwd=tmp_path, capture_output=True)
+
+        name_nfd = unicodedata.normalize("NFD", "Übersicht.txt")
+        name_nfc = unicodedata.normalize("NFC", "Übersicht.txt")
+        assert name_nfd != name_nfc  # sanity: the two Unicode forms differ
+
+        written = [tmp_path / ".media" / name_nfd]  # written_files in NFD form
+        real = G._run_git
+        rm_calls = []
+
+        class _LsFiles:
+            returncode = 0
+            stdout = f".media/{name_nfc}\0"  # git returns NFC
+
+        def fake(repo, *args, **kwargs):
+            if args and args[0] == "ls-files":
+                return _LsFiles()
+            if args and args[0] == "rm":
+                rm_calls.append(args)
+            return real(repo, *args, **kwargs)
+
+        monkeypatch.setattr(G, "_run_git", fake)
+        G._remove_stale_files(tmp_path, written)
+
+        assert rm_calls == []  # NFD written == NFC tracked → not stale → no git rm
+        assert "survived the prune" not in capsys.readouterr().err
