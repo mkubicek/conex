@@ -171,6 +171,15 @@ class Exporter:
         # later --force-refresh re-heals to the fresh positions. Filtered /
         # single-subtree / no-children runs never reconcile, nor prune
         # (commit_export is_full=False).
+        #
+        # Window: reconcile drops a moved page's old markdown/.media BEFORE the
+        # write walk regenerates them. The disposable artifacts are recomputable
+        # from the API (a --cached export uses the cached bodies, which the cache
+        # carries — get_pages_in_space fetches body.storage inline), so a failed
+        # write self-heals on the next successful full export; only the user's
+        # .workspace is irreplaceable, and it is never dropped. Same recoverable
+        # window the --force-refresh path already had — #27 just widens it to
+        # --cached (verified during review).
         is_full = is_full_export(path_filter, no_children)
         if is_full:
             from confluence_export.reconcile import reconcile
