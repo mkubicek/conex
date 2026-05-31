@@ -46,7 +46,6 @@ _EMOTICON_MAP = {
     "check_mark": "\u2705",
     "cross_mark": "\u274c",
     "info": "\u2139\ufe0f",
-    "warning": "\u26a0\ufe0f",
 }
 
 
@@ -493,8 +492,6 @@ def _convert_status(soup: BeautifulSoup, macro: Tag) -> None:
     """Convert status macro to bold inline text."""
     title_param = macro.find("ac:parameter", attrs={"ac:name": "title"})
     title = title_param.get_text().strip() if title_param else ""
-    colour_param = macro.find("ac:parameter", attrs={"ac:name": "colour"})
-    colour = colour_param.get_text().strip().upper() if colour_param else ""
 
     if title:
         # Render as: **STATUS_TEXT**
@@ -550,9 +547,6 @@ def _convert_jira(soup: BeautifulSoup, macro: Tag) -> None:
     """Convert Jira issue macro to a link."""
     key_param = macro.find("ac:parameter", attrs={"ac:name": "key"})
     key = key_param.get_text().strip() if key_param else ""
-
-    server_param = macro.find("ac:parameter", attrs={"ac:name": "server"})
-    server_id_param = macro.find("ac:parameter", attrs={"ac:name": "serverId"})
 
     if key:
         code = soup.new_tag("code")
