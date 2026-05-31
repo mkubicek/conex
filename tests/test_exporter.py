@@ -401,6 +401,26 @@ class TestMoveHealingEndToEnd:
         assert (tmp_path / "A" / "P" / ".workspace" / "u.txt").read_text() == "mine"  # left
         assert "do not move automatically" in capsys.readouterr().err
 
+    def test_cached_full_export_also_reconciles(self, tmp_path):
+        # #27: reconcile must run on a full export even WITHOUT --force-refresh
+        # (force_refresh=False loads from cache). Otherwise a moved page's old
+        # path is left as an on-disk orphan while git prunes only its tracked
+        # files. The page should be rewritten at the new path and the old shell
+        # cleaned, healing to the cached plan the write walk is also using.
+        exporter, _, cache = _make_exporter()
+        _seed_export_page(tmp_path, "A", "a")
+        _seed_export_page(tmp_path, "A/P", "p")  # old path on disk
+        cache.ensure_loaded.return_value = _make_cached_space(pages=[
+            _make_page(id="a", title="A"),
+            _make_page(id="b", title="B"),
+            _make_page(id="p", title="P", parent_id="b", parent_type="page"),
+        ])
+
+        exporter.export_space(_make_space(), tmp_path)  # no force_refresh (cached)
+
+        assert (tmp_path / "B" / "P" / "P.md").exists()  # written at new path
+        assert not (tmp_path / "A" / "P").exists()        # old orphan cleaned (was left pre-#27)
+
 
 class TestSelfNestEndToEnd:
     def test_reparent_into_own_name_no_crash_leaves_workspace(self, tmp_path):

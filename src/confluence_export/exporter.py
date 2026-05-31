@@ -160,14 +160,27 @@ class Exporter:
         # archived or unarchived instead of being stranded at its old path.
         self._plan = plan_layout(roots_full)
 
-        # Reconcile moved pages and heal orphans BEFORE writing — but only on a
-        # full, freshly-fetched export, the one mode with complete tree
-        # visibility. Filtered / single-subtree / no-children runs never
-        # reconcile, nor prune (commit_export is_full=False). A --cached full
-        # export also skips reconcile here (stale tree), though git pruning still
-        # runs on it via commit_export.
+        # Reconcile moved pages and heal orphans BEFORE writing — on ANY full
+        # export (the one mode with complete tree visibility), whether the tree
+        # was freshly fetched or loaded from cache. Reconcile is idempotent and
+        # derives its targets from the SAME plan the write walk uses, so a
+        # --cached export heals the on-disk layout to match the cached plan it is
+        # also writing — without reconcile, a moved page's old path would be left
+        # as an orphan while git pruned only its tracked files (issue #27). A
+        # later --force-refresh re-heals to the fresh positions. Filtered /
+        # single-subtree / no-children runs never reconcile, nor prune
+        # (commit_export is_full=False).
+        #
+        # Window: reconcile drops a moved page's old markdown/.media BEFORE the
+        # write walk regenerates them. The disposable artifacts are recomputable
+        # from the API (a --cached export uses the cached bodies, which the cache
+        # carries — get_pages_in_space fetches body.storage inline), so a failed
+        # write self-heals on the next successful full export; only the user's
+        # .workspace is irreplaceable, and it is never dropped. Same recoverable
+        # window the --force-refresh path already had — #27 just widens it to
+        # --cached (verified during review).
         is_full = is_full_export(path_filter, no_children)
-        if is_full and force_refresh:
+        if is_full:
             from confluence_export.reconcile import reconcile
 
             # Reconcile only over what this run actually writes. When archived
@@ -202,12 +215,6 @@ class Exporter:
                 # planned paths, and a transient failure heals on the next run
                 # (reconcile is idempotent). Surface the error and continue.
                 print(f"Warning: layout reconciliation skipped ({exc})", file=sys.stderr)
-        elif is_full:
-            print(
-                "Note: orphan/move healing runs on a fresh full export; "
-                "re-run with --force-refresh to heal a stale layout.",
-                file=sys.stderr,
-            )
         else:
             print(
                 "Note: orphan/move healing happens on a full export of the space.",
