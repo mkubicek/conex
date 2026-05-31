@@ -212,6 +212,55 @@ def test_profile_picture_inside_panel_keeps_mention():
     assert "Confluence dynamic content" not in result
 
 
+def test_profile_picture_two_ri_users_does_not_crash():
+    # Hardening: resolving a profile-picture in the pre-pass replaces the WHOLE
+    # macro, detaching any sibling ri:user still in the find_all snapshot. Without
+    # a detached-node guard the second iteration called replace_with on a node not
+    # in the tree -> ValueError, aborting the entire export. Malformed/atypical
+    # input (a well-formed macro has one ri:user) but the blast radius is the whole
+    # run, so it must degrade gracefully to the first resolved mention.
+    html = (
+        '<ac:structured-macro ac:name="profile-picture">'
+        '<ac:parameter ac:name="U1"><ri:user ri:account-id="abc"/></ac:parameter>'
+        '<ac:parameter ac:name="U2"><ri:user ri:account-id="def"/></ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [], user_resolver=lambda aid: {"displayName": "Alice"})
+    assert "@Alice" in result
+
+
+def test_profile_picture_empty_then_second_ri_user_does_not_crash():
+    # Hardening: a first empty-account-id ri:user decomposes the macro, which
+    # destroys (attrs=None) a second snapshotted ri:user; without the guard the
+    # next iteration did user_tag.get(...) on the dead node -> AttributeError,
+    # aborting the export. Must degrade to a clean drop instead.
+    html = (
+        '<ac:structured-macro ac:name="profile-picture">'
+        '<ac:parameter ac:name="a"><ri:user ri:account-id=""/></ac:parameter>'
+        '<ac:parameter ac:name="b"><ri:user ri:account-id="def"/></ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [])
+    assert "@" not in result
+    assert "Confluence dynamic content" not in result
+
+
+def test_profile_picture_inside_ac_link_keeps_mention():
+    # Regression guard: a profile-picture wrapped in an ac:link must keep its
+    # mention. Resolving the macro to a bare <span> while it is still inside the
+    # link left the later ac:link pass with a link whose only child is a plain
+    # span -> it fell through to decompose and silently dropped the mention (the
+    # exact failure class #5 fixes). Retargeting the enclosing ac:link survives it.
+    html = (
+        "<p><ac:link><ac:structured-macro ac:name=\"profile-picture\">"
+        '<ac:parameter ac:name="U"><ri:user ri:account-id="abc"/></ac:parameter>'
+        "</ac:structured-macro></ac:link></p>"
+    )
+    result = _preprocess_html(html, [], user_resolver=lambda aid: {"displayName": "Alice"})
+    assert "@Alice" in result
+    assert "Confluence dynamic content" not in result
+
+
 # -- Full pipeline test: HTML → markdown with frontmatter --------------------
 
 def test_full_conversion_pipeline():

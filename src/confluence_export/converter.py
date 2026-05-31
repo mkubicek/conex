@@ -141,6 +141,19 @@ def _build_frontmatter(
     return f"---\n{yaml_str}---\n\n"
 
 
+def _is_detached(node: Tag, soup: BeautifulSoup) -> bool:
+    """True if ``node`` is no longer reachable from ``soup`` — i.e. an earlier
+    mutation extracted or decomposed it (or an ancestor). Walking up to the soup
+    root is robust to both replace_with (subtree detached, parents intact) and
+    decompose (parent set to None)."""
+    cur = node
+    while cur is not None:
+        if cur is soup:
+            return False
+        cur = cur.parent
+    return True
+
+
 def _resolve_user_name(account_id: str, user_resolver: UserResolver) -> str:
     """Resolve a Confluence account id to a display name, falling back to the id
     when there is no resolver or no resolved name. Shared by the standalone
@@ -231,6 +244,14 @@ def _preprocess_html(
 
     # --- User mentions (ri:user inside ac:link or standalone) ---
     for user_tag in list(soup.find_all("ri:user")):
+        # The snapshot can hold ri:user nodes an earlier iteration already
+        # detached — e.g. a second ri:user inside a profile-picture we already
+        # resolved (replace_with leaves the sibling in a detached subtree) or one
+        # whose ancestor macro we decomposed (.get would raise on the dead node).
+        # Operating on those would abort the whole export, so skip anything no
+        # longer reachable from the live tree.
+        if _is_detached(user_tag, soup):
+            continue
         account_id = user_tag.get("ri:account-id", "")
         # A profile-picture macro is resolved to its inline @mention HERE, by
         # replacing the WHOLE macro — not deferred to the structured-macro pass.
@@ -240,12 +261,17 @@ def _preprocess_html(
         # (issue #5, nested-macro regression).
         parent_macro = user_tag.find_parent("ac:structured-macro")
         if parent_macro is not None and parent_macro.get("ac:name") == "profile-picture":
+            # Retarget an enclosing ac:link so the later ac:link pass doesn't
+            # unwrap-and-drop the resolved span (a link whose only child is a
+            # plain span falls through to decompose) — that would re-introduce the
+            # very silent mention-drop #5 set out to fix.
+            target = parent_macro.find_parent("ac:link") or parent_macro
             if account_id:
                 span = soup.new_tag("span")
                 span.string = f"@{_resolve_user_name(account_id, user_resolver)}"
-                parent_macro.replace_with(span)
+                target.replace_with(span)
             else:
-                parent_macro.decompose()
+                target.decompose()
             continue
         name = _resolve_user_name(account_id, user_resolver)
         parent_link = user_tag.find_parent("ac:link")
