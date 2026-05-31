@@ -272,6 +272,34 @@ class TestCommitExport:
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
         assert "Page/.media/gone.png" not in ls
 
+    def test_no_media_prunes_reconcile_deleted_media(self, tmp_path):
+        """RF-C: preserve_media must only preserve media STILL ON DISK. A moved
+        page's old .media that reconcile already deleted from disk must still be
+        pruned, not left tracked-but-deleted (a dirty index)."""
+        import shutil
+
+        self._init_repo(tmp_path)
+        page = tmp_path / "P"
+        media = page / ".media"
+        media.mkdir(parents=True)
+        (page / "P.md").write_text("# P")
+        (media / "img.png").write_bytes(b"\x89PNG")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first"], cwd=tmp_path, capture_output=True)
+
+        # Simulate reconcile having dropped the old .media from disk on a move.
+        shutil.rmtree(media)
+
+        # --no-media full export (P.md re-written in place for the test).
+        commit_export(tmp_path, [page / "P.md"], "TEST", is_full=True, preserve_media=True)
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "P/.media/img.png" not in ls, "deleted media left tracked under --no-media"
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=tmp_path, capture_output=True, text=True
+        ).stdout
+        assert status.strip() == "", f"dirty tree after export: {status!r}"
+
     def test_protected_dirs_survive_prune_while_real_deletions_pruned(self, tmp_path):
         """A page SKIPPED this run (transient convert/body failure) must keep its
         last-good committed files — passing its dir in protected_dirs excludes it

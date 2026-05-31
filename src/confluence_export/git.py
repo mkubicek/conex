@@ -276,8 +276,15 @@ def _remove_stale_files(
         if WORKSPACE_DIR_NAME in parts:
             continue
         # M1: a --no-media run wrote no attachments; never prune committed
-        # media just because it is absent from this run's written_files.
-        if preserve_media and MEDIA_DIR_NAME in parts:
+        # media just because it is absent from this run's written_files — BUT
+        # only media that is still ON DISK. Media reconcile already deleted (a
+        # moved page's old .media) must still be pruned, or it is left tracked
+        # but missing and the export finishes dirty (RF-C).
+        if (
+            preserve_media
+            and MEDIA_DIR_NAME in parts
+            and (output_dir / rel_path).exists()
+        ):
             continue
         if _is_secret_config_relpath(rel_path):
             continue
