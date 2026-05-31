@@ -76,6 +76,24 @@ class TestMovedPage:
         err = capsys.readouterr().err
         assert "moved to" in err and "B/P" in err and "do not move automatically" in err
 
+    def test_reconcile_is_idempotent_safe_to_rerun_after_crash(self, tmp_path):
+        # T1 / crash-mid-reconcile: reconcile derives all state from frontmatter
+        # and holds no transient on-disk state, so re-running it (after a crash
+        # partway, or just twice) is safe — the second run finds nothing left to
+        # do and changes nothing, and the user's .workspace is preserved.
+        _seed(tmp_path, "A", "a")
+        _seed(tmp_path, "A/P", "p", workspace="keep")
+        plan = _plan([_page("a", "A"), _page("b", "B"), _page("p", "P", parent_id="b")])
+
+        reconcile(plan, tmp_path, "TEST")
+        after_first = sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*"))
+
+        reconcile(plan, tmp_path, "TEST")  # re-run, simulating a crash + retry
+        after_second = sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*"))
+
+        assert after_first == after_second
+        assert (tmp_path / "A" / "P" / ".workspace" / "note.txt").read_text() == "keep"
+
     def test_note_points_at_new_path_and_old_workspace(self, tmp_path, capsys):
         _seed(tmp_path, "Old", "p", title="Old", workspace="keep")
         reconcile(_plan([_page("q", "New-Parent"), _page("p", "Old", parent_id="q")]),

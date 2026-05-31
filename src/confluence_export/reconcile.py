@@ -37,9 +37,12 @@ State is derived entirely from frontmatter via
 :func:`diff.scan_export_dir_grouped`; reconcile holds no transient on-disk state,
 so re-running it is safe. Note the recovery model: reconcile drops a moved page's
 old markdown *before* the write walk regenerates it at the new path, so a crash
-between the two leaves the page absent on disk for that run. It is restored on the
-next full export because the **write walk re-fetches it from the API** — not
+between the two leaves the page absent **on disk** for that run. It is restored on
+the next full export because the **write walk re-fetches it from the API** — not
 because reconcile "heals" it (the dropped page has no frontmatter left to scan).
+The page's last-good **committed** copy is not lost in the meantime: the exporter
+snapshots each page's pre-reconcile path and, if the write then fails, protects
+that old path from the git stale-prune (M2), so the tracked copy stays in HEAD.
 Markdown and ``.media`` are recomputable from Confluence; only the user's
 ``.workspace`` is never touched, so nothing irreplaceable is at risk in that window.
 """

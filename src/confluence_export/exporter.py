@@ -201,11 +201,14 @@ class Exporter:
         # Window: reconcile drops a moved page's old markdown/.media BEFORE the
         # write walk regenerates them. The disposable artifacts are recomputable
         # from the API (a --cached export uses the cached bodies, which the cache
-        # carries — get_pages_in_space fetches body.storage inline), so a failed
-        # write self-heals on the next successful full export; only the user's
-        # .workspace is irreplaceable, and it is never dropped. Same recoverable
-        # window the --force-refresh path already had — #27 just widens it to
-        # --cached (verified during review).
+        # carries — get_pages_in_space fetches body.storage inline). If the write
+        # then FAILS for that page, the old path is no longer left to be pruned
+        # out of git: it is snapshotted into _pre_reconcile_dirs below and added
+        # to the page's protected paths on skip (M2), so the last-good COMMITTED
+        # copy survives in HEAD and the page converges on the next successful
+        # export. Only the user's .workspace is irreplaceable, and it is never
+        # dropped. Same recoverable window the --force-refresh path already had —
+        # #27 just widened it to --cached (verified during review).
         is_full = is_full_export(path_filter, no_children)
         # M1: on a full export that omits archived pages, surface the archived
         # subtree root so the git prune preserves a prior --include-archived
