@@ -344,15 +344,22 @@ class Exporter:
 
         # Convert to markdown (drawio macros become real images via `rendered`,
         # or a graceful "not rendered" note when a diagram has no PNG).
-        markdown = convert_page(
-            page,
-            base_url=self.base_url,
-            space_key=space_key,
-            path=path,
-            attachments=attachments,
-            user_resolver=self._resolve_user,
-            rendered=rendered,
-        )
+        # Defense-in-depth: a malformed page body must not abort the whole space
+        # export. Mirror the body-fetch guard above — warn and skip just this page
+        # (the rest still export; this one heals on a later run once fixed).
+        try:
+            markdown = convert_page(
+                page,
+                base_url=self.base_url,
+                space_key=space_key,
+                path=path,
+                attachments=attachments,
+                user_resolver=self._resolve_user,
+                rendered=rendered,
+            )
+        except Exception as exc:
+            print(f"  Warning: could not convert {page.title}: {exc}", file=sys.stderr)
+            return []
 
         # Write markdown file. Same allocated segment as the page directory
         # (via the shared plan), so the dir name and file stem stay in sync.
