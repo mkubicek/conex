@@ -248,3 +248,75 @@ def test_load_versions_returns_empty_on_corrupt_json(tmp_path):
 
     (tmp_path / _VERSIONS_FILE).write_text("{ not valid json")
     assert _load_versions(tmp_path) == {}
+
+
+class TestPathTraversal:
+    """S1: an untrusted attachment title must never write outside .media/."""
+
+    @staticmethod
+    def _writing_client():
+        client = MagicMock()
+
+        def _write(download_path, dest):
+            p = Path(dest)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"payload")
+            return len(b"payload")
+
+        client.download_attachment_to_file.side_effect = _write
+        return client
+
+    def _written_files(self, media_dir):
+        return [
+            p
+            for p in media_dir.rglob("*")
+            if p.is_file() and p.name != _VERSIONS_FILE
+        ]
+
+    def _assert_contained(self, media_dir):
+        root = media_dir.resolve()
+        for p in self._written_files(media_dir):
+            assert root == p.resolve().parent or root in p.resolve().parents, p
+
+    def test_relative_traversal_title_cannot_escape(self, tmp_path):
+        # media_dir is 3 levels deep: export/page/.media
+        media_dir = tmp_path / "export" / "page" / ".media"
+        media_dir.mkdir(parents=True)
+        sentinel = tmp_path / "outside.txt"  # export/page/.media/../../../outside.txt
+
+        client = self._writing_client()
+        download_attachments(client, [_att(title="../../../outside.txt")], media_dir)
+
+        assert not sentinel.exists(), "attachment escaped .media via ../ traversal"
+        self._assert_contained(media_dir)
+
+    def test_absolute_title_cannot_escape(self, tmp_path):
+        media_dir = tmp_path / "export" / "page" / ".media"
+        media_dir.mkdir(parents=True)
+        sentinel = tmp_path / "abs_evil.txt"
+
+        client = self._writing_client()
+        download_attachments(client, [_att(title=str(sentinel))], media_dir)
+
+        assert not sentinel.exists(), "absolute-path title escaped .media"
+        self._assert_contained(media_dir)
+
+    def test_control_char_title_contained(self, tmp_path):
+        media_dir = tmp_path / "export" / "page" / ".media"
+        media_dir.mkdir(parents=True)
+
+        client = self._writing_client()
+        download_attachments(client, [_att(title="a\x00b/../c.png")], media_dir)
+
+        self._assert_contained(media_dir)
+
+    def test_benign_names_preserved_for_link_compatibility(self, tmp_path):
+        # Common safe names must keep their EXACT on-disk name so existing
+        # markdown links (built from the raw ri:filename) still resolve.
+        media_dir = tmp_path / "export" / "page" / ".media"
+        media_dir.mkdir(parents=True)
+
+        client = self._writing_client()
+        for title in ("report.pdf", "My Diagram (v2).png", "data.final.xlsx"):
+            download_attachments(client, [_att(title=title, att_id=title)], media_dir)
+            assert (media_dir / title).exists(), f"benign name changed: {title}"

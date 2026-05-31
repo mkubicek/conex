@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from confluence_export.client import ConfluenceClient
+from confluence_export.paths import resolve_within, safe_attachment_name
 from confluence_export.types import Attachment
 
 _VERSIONS_FILE = ".versions.json"
@@ -80,25 +81,30 @@ def download_attachments(
     """
     versions = _load_versions(media_dir) if skip_existing else {}
     downloaded: list[Path] = []
-    to_download: list[tuple[Attachment, Path]] = []
+    to_download: list[tuple[Attachment, str, Path]] = []
 
     for att in attachments:
-        dest = media_dir / att.title
+        # S1: an untrusted attachment title must never write outside .media/.
+        # safe_attachment_name keeps benign titles verbatim (so existing links
+        # and the manifest still resolve) and neutralizes only escaping ones;
+        # resolve_within is the defence-in-depth assert at the write site.
+        name = safe_attachment_name(att.title)
+        dest = resolve_within(media_dir, name)
         if (
             skip_existing
             and dest.exists()
             and att.version.number > 0
-            and versions.get(att.title) == att.version.number
+            and versions.get(name) == att.version.number
         ):
             downloaded.append(dest)
             continue
         if not att.download_link:
             print(f"  Warning: no download link for {att.title}", file=sys.stderr)
             continue
-        to_download.append((att, dest))
+        to_download.append((att, name, dest))
 
-    def _download_one(item: tuple[Attachment, Path]) -> Path:
-        att, dest = item
+    def _download_one(item: tuple[Attachment, str, Path]) -> Path:
+        att, _name, dest = item
         # Prefer the v1 REST attachment-download endpoint over the legacy
         # `_links.download` path (`/wiki/download/attachments/...`). The REST
         # endpoint works on both the site URL and the OAuth gateway URL used
@@ -121,17 +127,17 @@ def download_attachments(
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {pool.submit(_download_one, item): item for item in to_download}
         for future in as_completed(futures):
-            att, dest = futures[future]
+            att, name, dest = futures[future]
             try:
                 downloaded.append(future.result())
-                versions[att.title] = att.version.number
+                versions[name] = att.version.number
             except Exception as exc:
                 print(f"  Warning: failed to download {att.title}: {exc}", file=sys.stderr)
 
     # Also record versions for skipped files (in case manifest was missing)
     for att in attachments:
         if att.version.number > 0:
-            versions.setdefault(att.title, att.version.number)
+            versions.setdefault(safe_attachment_name(att.title), att.version.number)
 
     _save_versions(media_dir, versions)
     downloaded.append(media_dir / _VERSIONS_FILE)

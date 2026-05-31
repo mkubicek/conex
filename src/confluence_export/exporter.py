@@ -12,6 +12,7 @@ from confluence_export.cache import CacheStore
 from confluence_export.client import ConfluenceClient
 from confluence_export.converter import convert_page, sanitize_filename
 from confluence_export.layout import plan_layout
+from confluence_export.paths import resolve_within, safe_attachment_name
 from confluence_export.drawio import (
     find_drawio_attachments,
     render_drawio_to_png,
@@ -362,7 +363,9 @@ class Exporter:
             if drawio_atts:
                 media_dir = media_dir or ensure_media_dir(page_dir)
                 for att in drawio_atts:
-                    drawio_file = media_dir / att.title
+                    # S1: resolve the diagram from the same safe name media.py
+                    # wrote it under, never the raw (possibly escaping) title.
+                    drawio_file = resolve_within(media_dir, safe_attachment_name(att.title))
                     if drawio_file.exists():
                         png_path = render_drawio_to_png(drawio_file)
                         if png_path:
