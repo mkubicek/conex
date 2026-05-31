@@ -45,6 +45,11 @@ class ExportResult:
     # because they are absent from written_files this run (they regenerate on
     # the next successful export).
     skipped_paths: list[Path] = field(default_factory=list)
+    # Subtrees deliberately OUT of scope this run but still valid on disk
+    # (the _archived/ tree when --include-archived is omitted). Like
+    # skipped_paths they must be excluded from the git stale-prune so a prior
+    # --include-archived export is not deleted (M1).
+    preserved_paths: list[Path] = field(default_factory=list)
 
 
 def is_full_export(path_filter: str | None, no_children: bool) -> bool:
@@ -81,6 +86,7 @@ class Exporter:
         # Page directories skipped this run due to a transient failure (reset at
         # the start of each export_space; see ExportResult.skipped_paths).
         self._skipped_paths: list[Path] = []
+        self._preserved_paths: list[Path] = []
         # Per-export layout plan (page_id -> target_dir), set in export_space.
         # Empty when a page is exported via a direct _export_single_page call
         # (e.g. unit tests), in which case naming falls back to sanitize_filename.
@@ -152,6 +158,7 @@ class Exporter:
     ) -> ExportResult:
         """Export a space (or subtree) to output_dir."""
         self._skipped_paths = []
+        self._preserved_paths = []
         # Ensure cache
         if force_refresh:
             cs = self.cache.refresh(self.client, space, include_archived=include_archived)
@@ -196,6 +203,16 @@ class Exporter:
         # window the --force-refresh path already had — #27 just widens it to
         # --cached (verified during review).
         is_full = is_full_export(path_filter, no_children)
+        # M1: on a full export that omits archived pages, surface the archived
+        # subtree root so the git prune preserves a prior --include-archived
+        # export (its files are absent from written_files this run). Derived from
+        # the SAME full-tree plan the write walk uses, so it is byte-identical to
+        # where the archived content actually lives (handles the _archived
+        # collision via the plan rather than a fragile name match).
+        if is_full and not include_archived:
+            archived_target = self._plan.get("__archived__")
+            if archived_target is not None:
+                self._preserved_paths = [output_dir.joinpath(*archived_target.parts)]
         if is_full:
             from confluence_export.reconcile import reconcile
 
@@ -248,6 +265,7 @@ class Exporter:
             else:
                 node_result = self._export_node(node, output_dir, cs, space.key, depth=0)
                 node_result.skipped_paths = list(self._skipped_paths)
+                node_result.preserved_paths = list(self._preserved_paths)
                 return node_result
         else:
             if no_children:
@@ -259,6 +277,7 @@ class Exporter:
                     result.count += r.count
                     result.written_files.extend(r.written_files)
                 result.skipped_paths = list(self._skipped_paths)
+                result.preserved_paths = list(self._preserved_paths)
                 return result
 
         # Export flat list (no_children case)
@@ -268,6 +287,7 @@ class Exporter:
             result.count += 1 if files else 0
             result.written_files.extend(files)
         result.skipped_paths = list(self._skipped_paths)
+        result.preserved_paths = list(self._preserved_paths)
         return result
 
     def _export_node(

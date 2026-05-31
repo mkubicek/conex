@@ -611,6 +611,39 @@ class TestReconcileWriterHandshake:
         assert (tmp_path / "_archived-2" / ".workspace" / "u.txt").read_text() == "keep"
         assert not (tmp_path / "_archived" / ".workspace").exists()  # not relocated into the container
 
+    def test_full_export_without_archived_preserves_archived_subtree(self, tmp_path):
+        # M1: a full export WITHOUT --include-archived does not write archived
+        # pages, so their committed files are absent from written_files. The
+        # exporter surfaces the archived subtree root in preserved_paths so the
+        # git prune does not delete a prior --include-archived export.
+        exporter, _, cache = _make_exporter()
+        live = _make_page(id="p1", title="Live")
+        archived = _make_page(id="z", title="Zarch", body="<p>old</p>")
+        archived.status = "archived"
+        cache.ensure_loaded.return_value = _make_cached_space(pages=[live, archived])
+
+        result = exporter.export_space(_make_space(), tmp_path)  # no include_archived
+
+        preserved = [p.resolve() for p in result.preserved_paths]
+        assert (tmp_path / "_archived").resolve() in preserved
+
+    def test_no_archived_pages_means_no_preserved_paths(self, tmp_path):
+        exporter, _, cache = _make_exporter()
+        cache.ensure_loaded.return_value = _make_cached_space(pages=[_make_page()])
+        result = exporter.export_space(_make_space(), tmp_path)
+        assert result.preserved_paths == []
+
+    def test_include_archived_does_not_preserve(self, tmp_path):
+        # When archived pages ARE written, there is nothing to preserve.
+        exporter, _, cache = _make_exporter()
+        archived = _make_page(id="z", title="Zarch", body="<p>old</p>")
+        archived.status = "archived"
+        cache.refresh.return_value = _make_cached_space(pages=[_make_page(), archived])
+        result = exporter.export_space(
+            _make_space(), tmp_path, force_refresh=True, include_archived=True
+        )
+        assert result.preserved_paths == []
+
     def test_reconcile_failure_does_not_abort_export(self, tmp_path):
         # A reconcile exception must never abort the export; the write walk still
         # produces correct content at planned paths.

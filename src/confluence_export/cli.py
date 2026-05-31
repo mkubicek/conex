@@ -626,7 +626,7 @@ def _cmd_export(
             result.written_files,
             space_key,
             is_full=is_full,
-            protected_dirs=result.skipped_paths,
+            protected_dirs=result.skipped_paths + result.preserved_paths,
             preserve_media=no_media,
         )
 
