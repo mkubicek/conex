@@ -108,10 +108,14 @@ class TestConvertFailureIsolated:
             return "---\ntitle: Good Page\n---\n\n# Good Page\n"
 
         with patch("confluence_export.exporter.convert_page", side_effect=flaky):
-            exporter.export_space(_make_space(), tmp_path)  # must not raise
+            result = exporter.export_space(_make_space(), tmp_path)  # must not raise
 
         assert (tmp_path / "Good-Page" / "Good-Page.md").exists()
         assert not (tmp_path / "Bad-Page" / "Bad-Page.md").exists()
+        # The skipped page's dir is surfaced so the git prune can protect its
+        # last-good committed copy instead of deleting it (#34 follow-up).
+        assert (tmp_path / "Bad-Page") in result.skipped_paths
+        assert (tmp_path / "Good-Page") not in result.skipped_paths
 
 
 class TestTreeExport:

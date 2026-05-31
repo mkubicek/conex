@@ -231,6 +231,32 @@ class TestCommitExport:
         assert "OldPage.md" not in ls.stdout
         assert "NewPage.md" in ls.stdout
 
+    def test_protected_dirs_survive_prune_while_real_deletions_pruned(self, tmp_path):
+        """A page SKIPPED this run (transient convert/body failure) must keep its
+        last-good committed files — passing its dir in protected_dirs excludes it
+        from the stale prune — while a genuinely upstream-deleted page is still
+        pruned. Regression for the #34 skip-then-prune silent deletion."""
+        self._init_repo(tmp_path)
+        (tmp_path / "A").mkdir()
+        (tmp_path / "A" / "A.md").write_text("# A")
+        (tmp_path / "P").mkdir()
+        (tmp_path / "P" / "P.md").write_text("# P last-good")
+        (tmp_path / "Gone").mkdir()
+        (tmp_path / "Gone" / "Gone.md").write_text("# upstream-deleted")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        # Full export: only A is written; P was skipped (protected), Gone is gone.
+        commit_export(
+            tmp_path, [tmp_path / "A" / "A.md"], "TEST",
+            is_full=True, protected_dirs=[tmp_path / "P"],
+        )
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "P/P.md" in ls  # skipped page's last-good copy preserved
+        assert (tmp_path / "P" / "P.md").exists()  # and still on disk
+        assert "Gone/Gone.md" not in ls  # genuine upstream deletion still pruned
+
     def test_removes_renamed_page(self, tmp_path):
         """A page renamed upstream: old name removed, new name added."""
         self._init_repo(tmp_path)

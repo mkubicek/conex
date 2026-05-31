@@ -621,7 +621,13 @@ def _cmd_export(
     if use_git and result.written_files:
         from confluence_export.git import commit_export
 
-        commit_export(out, result.written_files, space_key, is_full=is_full)
+        commit_export(
+            out,
+            result.written_files,
+            space_key,
+            is_full=is_full,
+            protected_dirs=result.skipped_paths,
+        )
 
     print(f"\nExported {result.count} page(s) to {out.resolve()}")
 
