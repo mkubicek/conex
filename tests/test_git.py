@@ -300,6 +300,33 @@ class TestCommitExport:
         ).stdout
         assert status.strip() == "", f"dirty tree after export: {status!r}"
 
+    def test_protected_deletion_restored_so_next_local_commit_keeps_it(self, tmp_path):
+        """RF-B: M2 keeps a moved-then-failed page's old copy in HEAD, but
+        reconcile deleted it from disk. commit_export must restore the tracked-
+        but-deleted file under the protected dir, or the NEXT run's
+        commit_local_changes (git add -u) stages the deletion and drops the
+        last-good copy."""
+        ensure_repo(tmp_path)
+        old = tmp_path / "A" / "P"
+        old.mkdir(parents=True)
+        (old / "P.md").write_text("# P last-good")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first"], cwd=tmp_path, capture_output=True)
+
+        # Moved + failed this run: reconcile deleted A/P/P.md from disk; the page
+        # was skipped, so its old dir is protected from the prune.
+        (old / "P.md").unlink()
+        commit_export(tmp_path, [], "TEST", is_full=True, protected_dirs=[old])
+
+        # The working tree must be clean (the deletion restored), so the next
+        # run's pre-export safety commit does not stage it away.
+        commit_local_changes(tmp_path)
+
+        ls = subprocess.run(
+            ["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True
+        ).stdout
+        assert "A/P/P.md" in ls, "protection defeated by next-run commit_local_changes"
+
     def test_protected_dirs_survive_prune_while_real_deletions_pruned(self, tmp_path):
         """A page SKIPPED this run (transient convert/body failure) must keep its
         last-good committed files — passing its dir in protected_dirs excludes it

@@ -178,6 +178,10 @@ def commit_export(
             output_dir, written_files, protected_dirs or [],
             preserve_media=preserve_media,
         )
+        # Restore any tracked file reconcile deleted from disk under a protected
+        # (skipped-page) dir, so the worktree matches the copy we kept in HEAD and
+        # the next run's commit_local_changes can't stage the deletion (RF-B/M2).
+        _restore_protected_deletions(output_dir, protected_dirs or [])
 
     # Check if anything was staged
     result = _run_git(output_dir, "diff", "--cached", "--quiet", check=False)
@@ -310,6 +314,37 @@ def _remove_stale_files(
                             "it survived the prune",
                             file=sys.stderr,
                         )
+
+
+def _restore_protected_deletions(output_dir: Path, protected_dirs: list[Path]) -> None:
+    """Restore tracked-but-deleted files under a protected dir from HEAD.
+
+    When a moved page is skipped (transient body/convert failure), reconcile has
+    already removed its old path from disk and the stale-prune keeps it tracked
+    (protected) so the last-good committed copy stays in HEAD. That leaves the
+    working tree with a tracked deletion, which the NEXT run's commit_local_changes
+    (``git add -u``) would stage — quietly dropping the copy M2 protected. Restore
+    those files so the worktree matches HEAD. Only restores genuinely-deleted
+    files (``ls-files --deleted``), so a present (possibly user-edited) file is
+    never reverted."""
+    if not protected_dirs:
+        return
+    out = output_dir.resolve()
+    protected = {p.resolve() for p in protected_dirs if p.resolve() != out}
+    if not protected:
+        return
+    result = _run_git(output_dir, "ls-files", "--deleted", "-z", check=False)
+    if result is None or not result.stdout.strip("\0"):
+        return
+    to_restore = []
+    for rel_path in result.stdout.strip("\0").split("\0"):
+        if not rel_path:
+            continue
+        full = (output_dir / rel_path).resolve()
+        if any(full.is_relative_to(d) for d in protected):
+            to_restore.append(rel_path)
+    for batch in _chunked_paths(to_restore):
+        _run_git(output_dir, "checkout", "HEAD", "--", *batch, check=False)
 
 
 def _unstage_secret_configs(output_dir: Path) -> None:
