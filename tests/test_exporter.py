@@ -595,6 +595,47 @@ class TestReconcileWriterHandshake:
         assert "B/P/P.md" in ls                       # the page itself moved
         assert "A/P/P.md" not in ls
 
+    def test_moved_page_convert_failure_keeps_last_good_old_path(self, tmp_path):
+        # M2/F8: a page that BOTH moved and failed to regenerate this run (empty
+        # cached body + offline refetch) must keep its last-good committed export.
+        # reconcile drops the old path before the write walk; the page is then
+        # skipped, so its files are absent from written_files. The git prune must
+        # NOT delete the old committed copy — the old path is protected too, not
+        # just the new (failed) page_dir.
+        import subprocess
+
+        from confluence_export.git import commit_export, ensure_repo
+
+        ensure_repo(tmp_path)
+        exporter, client, cache = _make_exporter()
+        body = "<p>" + "stable body for export. " * 6 + "</p>"
+        cache.refresh.return_value = _make_cached_space(pages=[
+            _make_page(id="a", title="A", body="<p>p</p>"),
+            _make_page(id="p", title="P", parent_id="a", parent_type="page", body=body),
+        ])
+        r1 = exporter.export_space(_make_space(), tmp_path, force_refresh=True)
+        commit_export(tmp_path, r1.written_files, "TEST")
+        assert (tmp_path / "A" / "P" / "P.md").exists()
+
+        # Reparent P under B; its cached body is now empty and the refetch fails
+        # (offline) -> P is skipped AFTER reconcile already dropped A/P.
+        cache.refresh.return_value = _make_cached_space(pages=[
+            _make_page(id="a", title="A", body="<p>p</p>"),
+            _make_page(id="b", title="B", body="<p>np</p>"),
+            _make_page(id="p", title="P", parent_id="b", parent_type="page", body=""),
+        ])
+        client.get_page_by_id.side_effect = RuntimeError("offline")
+        r2 = exporter.export_space(_make_space(), tmp_path, force_refresh=True)
+        commit_export(
+            tmp_path, r2.written_files, "TEST",
+            protected_dirs=r2.skipped_paths + r2.preserved_paths,
+        )
+
+        ls = subprocess.run(
+            ["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True
+        ).stdout
+        assert "A/P/P.md" in ls, "moved+failed page lost its last-good committed export"
+
     def test_real_page_titled_archived_not_spuriously_moved(self, tmp_path):
         # A real live page titled "_archived" loses the bare name to the synthetic
         # __archived__ container (gets "_archived-2"). The reconcile plan must

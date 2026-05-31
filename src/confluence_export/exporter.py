@@ -87,6 +87,9 @@ class Exporter:
         # the start of each export_space; see ExportResult.skipped_paths).
         self._skipped_paths: list[Path] = []
         self._preserved_paths: list[Path] = []
+        # page_id -> on-disk dirs as they existed BEFORE reconcile ran this run.
+        # Used to protect a moved-then-skipped page's old path from the prune (M2).
+        self._pre_reconcile_dirs: dict[str, list[Path]] = {}
         # Per-export layout plan (page_id -> target_dir), set in export_space.
         # Empty when a page is exported via a direct _export_single_page call
         # (e.g. unit tests), in which case naming falls back to sanitize_filename.
@@ -159,6 +162,7 @@ class Exporter:
         """Export a space (or subtree) to output_dir."""
         self._skipped_paths = []
         self._preserved_paths = []
+        self._pre_reconcile_dirs = {}
         # Ensure cache
         if force_refresh:
             cs = self.cache.refresh(self.client, space, include_archived=include_archived)
@@ -214,7 +218,19 @@ class Exporter:
             if archived_target is not None:
                 self._preserved_paths = [output_dir.joinpath(*archived_target.parts)]
         if is_full:
+            from confluence_export.diff import scan_export_dir_grouped
             from confluence_export.reconcile import reconcile
+
+            # M2: snapshot each page's CURRENT on-disk location BEFORE reconcile
+            # drops moved pages' old paths. If a moved page then fails to
+            # regenerate this run, we protect its OLD path from the git prune so
+            # its last-good committed export survives — reconcile has already
+            # removed the old files from disk, but protecting the path keeps the
+            # tracked copy in HEAD instead of pruning it out of the new commit.
+            self._pre_reconcile_dirs = {
+                pid: [ep.file_path.parent for ep in eps]
+                for pid, eps in scan_export_dir_grouped(output_dir, space.key).items()
+            }
 
             # Reconcile only over what this run actually writes. When archived
             # pages are out of scope (no --include-archived) they are left
@@ -350,6 +366,9 @@ class Exporter:
             except Exception as exc:
                 print(f"  Warning: could not fetch body for {page.title}: {exc}", file=sys.stderr)
                 self._skipped_paths.append(page_dir)
+                # M2: also protect the page's pre-reconcile (old) path so a moved
+                # page that fails to refetch keeps its last-good committed export.
+                self._skipped_paths.extend(self._pre_reconcile_dirs.get(page.id, []))
                 return []
 
         # Get attachments from cache
@@ -410,6 +429,8 @@ class Exporter:
         except Exception as exc:
             print(f"  Warning: could not convert {page.title}: {exc}", file=sys.stderr)
             self._skipped_paths.append(page_dir)
+            # M2: also protect the page's pre-reconcile (old) path (see above).
+            self._skipped_paths.extend(self._pre_reconcile_dirs.get(page.id, []))
             # Don't leave this run's freshly downloaded/rendered media orphaned for
             # a page that produced no markdown — but only remove files THIS run
             # created (a pre-existing path may be a previously-committed copy).
