@@ -91,6 +91,29 @@ class TestExportWritesCorrectMarkdown:
         assert "<strong>world</strong>" in html_path.read_text()
 
 
+class TestConvertFailureIsolated:
+    def test_one_bad_page_does_not_abort_export(self, tmp_path):
+        # Defense-in-depth: a convert_page exception on one page must not abort
+        # the whole space export. The bad page is skipped with a warning; every
+        # other page still exports.
+        exporter, _, cache = _make_exporter()
+        cache.ensure_loaded.return_value = _make_cached_space(pages=[
+            _make_page(id="good", title="Good Page"),
+            _make_page(id="bad", title="Bad Page"),
+        ])
+
+        def flaky(page, **kwargs):
+            if page.title == "Bad Page":
+                raise ValueError("boom")
+            return "---\ntitle: Good Page\n---\n\n# Good Page\n"
+
+        with patch("confluence_export.exporter.convert_page", side_effect=flaky):
+            exporter.export_space(_make_space(), tmp_path)  # must not raise
+
+        assert (tmp_path / "Good-Page" / "Good-Page.md").exists()
+        assert not (tmp_path / "Bad-Page" / "Bad-Page.md").exists()
+
+
 class TestTreeExport:
     def test_nested_pages_create_nested_directories(self, tmp_path):
         exporter, _, cache = _make_exporter()
