@@ -12,7 +12,7 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
-from confluence_export.media import WORKSPACE_DIR_NAME
+from confluence_export.media import MEDIA_DIR_NAME, WORKSPACE_DIR_NAME
 
 # Conservative per-call argv budget for git add / git rm path lists. macOS
 # ARG_MAX is 1 MiB (and includes the environment block), so 100 KiB leaves
@@ -129,6 +129,7 @@ def commit_export(
     *,
     is_full: bool = True,
     protected_dirs: list[Path] | None = None,
+    preserve_media: bool = False,
 ) -> bool:
     """Stage exporter-written files and remove stale tracked files.
 
@@ -154,6 +155,12 @@ def commit_export(
     makes history follow — no sidecar relocation or index patching needed (issue
     #17, Option B). The user's ``.workspace`` is never moved; it is preserved by
     the prune skip below and stays where the user put it.
+
+    ``preserve_media`` must be True on a ``--no-media`` run (M1): that run writes
+    no attachments, so written_files carries no ``.media`` paths and the prune
+    would otherwise ``git rm`` every committed attachment even though they are
+    still valid on disk. The committed media is left untouched; a later full
+    export with media reconciles genuine attachment deletions.
     """
     # Stage only the files the exporter wrote. Chunk to avoid hitting the
     # OS argv limit on big spaces (thousands of paths joined into one exec
@@ -167,7 +174,10 @@ def commit_export(
     # Remove stale tracked files (deletions/renames/moves upstream). Only on a
     # full export — a partial export's written_files is not the whole tree.
     if is_full:
-        _remove_stale_files(output_dir, written_files, protected_dirs or [])
+        _remove_stale_files(
+            output_dir, written_files, protected_dirs or [],
+            preserve_media=preserve_media,
+        )
 
     # Check if anything was staged
     result = _run_git(output_dir, "diff", "--cached", "--quiet", check=False)
@@ -211,6 +221,8 @@ def _remove_stale_files(
     output_dir: Path,
     written_files: list[Path],
     protected_dirs: list[Path] | None = None,
+    *,
+    preserve_media: bool = False,
 ) -> None:
     """Remove tracked files that are no longer part of the export."""
     if not _has_commits(output_dir):
@@ -256,6 +268,10 @@ def _remove_stale_files(
         # relocated — issue #17, Option B); the user moves it themselves.
         parts = Path(rel_path).parts
         if WORKSPACE_DIR_NAME in parts:
+            continue
+        # M1: a --no-media run wrote no attachments; never prune committed
+        # media just because it is absent from this run's written_files.
+        if preserve_media and MEDIA_DIR_NAME in parts:
             continue
         if _is_secret_config_relpath(rel_path):
             continue

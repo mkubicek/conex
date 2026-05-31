@@ -231,6 +231,47 @@ class TestCommitExport:
         assert "OldPage.md" not in ls.stdout
         assert "NewPage.md" in ls.stdout
 
+    def test_no_media_export_preserves_committed_media(self, tmp_path):
+        """M1: a --no-media FULL export writes no media, so written_files has no
+        .media paths. The stale prune must NOT git-rm the committed attachments
+        (they are still valid on disk) — preserve_media gates that."""
+        self._init_repo(tmp_path)
+        page = tmp_path / "Page"
+        media = page / ".media"
+        media.mkdir(parents=True)
+        (page / "Page.md").write_text("# Page")
+        (media / "img.png").write_bytes(b"\x89PNG")
+        (media / ".versions.json").write_text("{}")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        # --no-media full export: only the markdown is (re)written.
+        commit_export(
+            tmp_path, [page / "Page.md"], "TEST",
+            is_full=True, preserve_media=True,
+        )
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Page/.media/img.png" in ls, "committed media pruned on --no-media export"
+
+    def test_full_export_with_media_still_prunes_orphaned_media(self, tmp_path):
+        """Counterpart: a normal full export (media downloaded) still prunes an
+        attachment deleted upstream — preserve_media defaults False."""
+        self._init_repo(tmp_path)
+        page = tmp_path / "Page"
+        media = page / ".media"
+        media.mkdir(parents=True)
+        (page / "Page.md").write_text("# Page")
+        (media / "gone.png").write_bytes(b"\x89PNG")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        # Full export with media: gone.png is no longer an attachment.
+        commit_export(tmp_path, [page / "Page.md"], "TEST", is_full=True)
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Page/.media/gone.png" not in ls
+
     def test_protected_dirs_survive_prune_while_real_deletions_pruned(self, tmp_path):
         """A page SKIPPED this run (transient convert/body failure) must keep its
         last-good committed files — passing its dir in protected_dirs excludes it

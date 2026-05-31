@@ -627,6 +627,7 @@ def _cmd_export(
             space_key,
             is_full=is_full,
             protected_dirs=result.skipped_paths,
+            preserve_media=no_media,
         )
 
     print(f"\nExported {result.count} page(s) to {out.resolve()}")
