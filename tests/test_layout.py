@@ -50,6 +50,19 @@ class TestCollisionMatrix:
         plan = _plan([_page("1", "Dup"), _page("2", "dup"), _page("3", "DUP")])
         assert _segments(plan, "1", "2", "3") == ["Dup", "dup-2", "DUP-3"]
 
+    def test_nfc_equivalent_titles_collide(self):
+        # Byte-distinct but NFC-equivalent precomposed codepoints (Greek alpha with
+        # oxia U+1F71 vs tonos U+03AC) map to one path on a normalizing filesystem
+        # (APFS) and would silently overwrite. Folding the collision key on NFC
+        # disambiguates them, like a casefold collision.
+        oxia = "alpha-\u1f71"   # α with oxia
+        tonos = "alpha-\u03ac"  # α with tonos (NFC-equivalent to oxia)
+        assert oxia != tonos  # byte-distinct code points...
+        plan = _plan([_page("1", oxia), _page("2", tonos)])
+        seg1, seg2 = _segments(plan, "1", "2")
+        assert seg1 != seg2
+        assert seg2.endswith("-2")
+
     def test_long_title_prefix_collision(self):
         # Two distinct titles sharing the first 100 chars collide after truncation
         long_a = "a" * 150

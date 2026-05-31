@@ -117,6 +117,27 @@ class TestConvertFailureIsolated:
         assert (tmp_path / "Bad-Page") in result.skipped_paths
         assert (tmp_path / "Good-Page") not in result.skipped_paths
 
+    def test_convert_failure_cleans_up_newly_downloaded_media(self, tmp_path):
+        # A convert failure must not leave THIS run's freshly downloaded media
+        # orphaned on disk (no untracked junk). download_media=True, one attachment
+        # written, then convert raises -> the media file is cleaned up.
+        exporter, _, cache = _make_exporter(download_media=True)
+        cache.ensure_loaded.return_value = _make_cached_space(
+            pages=[_make_page(id="bad", title="Bad Page")],
+            attachments={"bad": [Attachment(id="x", title="img.png", media_type="image/png", file_size=3)]},
+        )
+
+        def fake_download(client, attachments, media_dir):
+            p = media_dir / "img.png"
+            p.write_bytes(b"png")
+            return [p]
+
+        with patch("confluence_export.exporter.download_attachments", side_effect=fake_download), \
+             patch("confluence_export.exporter.convert_page", side_effect=ValueError("boom")):
+            exporter.export_space(_make_space(), tmp_path)
+
+        assert not (tmp_path / "Bad-Page" / ".media" / "img.png").exists()
+
 
 class TestTreeExport:
     def test_nested_pages_create_nested_directories(self, tmp_path):

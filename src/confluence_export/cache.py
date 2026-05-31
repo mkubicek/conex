@@ -57,7 +57,12 @@ class CacheStore:
         # from the plan untouched, and an export with no written files prunes
         # nothing, so no data is lost either way.
         if not pages:
-            prior = self.load(space.key)
+            # A corrupt/unreadable prior cache must not abort the refresh — refresh
+            # exists precisely to overwrite it. Treat it as "no populated cache".
+            try:
+                prior = self.load(space.key)
+            except (json.JSONDecodeError, OSError):
+                prior = None
             if prior is not None and any(p.status != "folder" for p in prior.pages):
                 print(
                     f"Warning: the API returned 0 pages for space {space.key}, "

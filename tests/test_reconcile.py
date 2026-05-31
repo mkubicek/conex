@@ -211,6 +211,26 @@ class TestFolderRename:
         # ...but the empty legacy FOLDER .workspace is tidied away.
         assert not (tmp_path / "Docs" / ".workspace").exists()
 
+    def test_legacy_empty_folder_workspace_tidied_despite_stray_sidecar_md(self, tmp_path):
+        # A stray .md under a SIDECAR dir (.media/.conex/.git) must not count as a
+        # real page and so must not spare an empty folder-level .workspace from
+        # cleanup. The has-page scan mirrors the grouped scan's sidecar pruning.
+        (tmp_path / "Docs").mkdir()
+        (tmp_path / "Docs" / ".workspace").mkdir()
+        (tmp_path / "Docs" / ".media").mkdir()
+        (tmp_path / "Docs" / ".media" / "stray.md").write_text("# not a page")
+        _seed(tmp_path, "Docs/Guide", "guide", workspace="g")
+        plan = _plan([
+            _page("f", "Manuals", status="folder"),
+            _page("guide", "Guide", parent_id="f"),
+        ])
+
+        reconcile(plan, tmp_path, "TEST")
+
+        # The stray .md under .media does not make the folder look occupied, so the
+        # empty legacy FOLDER .workspace is still tidied.
+        assert not (tmp_path / "Docs" / ".workspace").exists()
+
     def test_legacy_nonempty_folder_workspace_preserved_and_warned(self, tmp_path, capsys):
         (tmp_path / "Docs").mkdir()
         ws = tmp_path / "Docs" / ".workspace"
