@@ -9,8 +9,6 @@ import sys
 import time
 from pathlib import Path
 
-from confluence_export.media import MEDIA_DIR_NAME
-
 from confluence_export.types import Attachment
 
 
@@ -111,30 +109,3 @@ def render_drawio_to_png(drawio_path: Path, output_path: Path | None = None) -> 
 
     print(f"  Warning: draw.io produced no output for {drawio_path.name}", file=sys.stderr)
     return None
-
-
-def replace_drawio_placeholders(
-    markdown: str,
-    rendered_diagrams: dict[str, Path],
-    media_dir_name: str = MEDIA_DIR_NAME,
-) -> str:
-    """Replace [drawio:name] placeholders in markdown with image + source link."""
-    for diagram_name, png_path in rendered_diagrams.items():
-        bare_name = diagram_name.removesuffix(".drawio")
-        placeholder = f"[drawio:{diagram_name}]"
-        if placeholder not in markdown:
-            placeholder = f"[drawio:{bare_name}]"
-            if placeholder not in markdown:
-                continue
-
-        drawio_filename = diagram_name if diagram_name.endswith(".drawio") else f"{diagram_name}.drawio"
-        png_filename = png_path.name
-
-        replacement = (
-            f"![{bare_name}]"
-            f"({media_dir_name}/{png_filename})\n"
-            f"*Draw.io source: [{drawio_filename}]({media_dir_name}/{drawio_filename})*"
-        )
-        markdown = markdown.replace(placeholder, replacement)
-
-    return markdown

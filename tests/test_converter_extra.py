@@ -1,5 +1,7 @@
 """Converter tests: Confluence HTML in, verify transformed output."""
 
+from pathlib import Path
+
 import pytest
 
 from confluence_export.converter import _preprocess_html, convert_page
@@ -81,7 +83,7 @@ PREPROCESS_CASES = [
     ("view-file via ri:attachment", '<ac:structured-macro ac:name="view-file"><ri:attachment ri:filename="report.pdf"/></ac:structured-macro>', [".media/report.pdf"], []),
     ("view-file via name param", '<ac:structured-macro ac:name="view-file"><ac:parameter ac:name="name">doc.pdf</ac:parameter></ac:structured-macro>', [".media/doc.pdf"], []),
     ("view-file empty", '<ac:structured-macro ac:name="view-file"></ac:structured-macro>', [], ["ac:structured-macro"]),
-    ("drawio placeholder", '<ac:structured-macro ac:name="drawio"><ac:parameter ac:name="diagramName">arch</ac:parameter></ac:structured-macro>', ["[drawio:arch]"], []),
+    ("drawio not rendered falls back", '<ac:structured-macro ac:name="drawio"><ac:parameter ac:name="diagramName">arch</ac:parameter></ac:structured-macro>', ["Draw.io diagram not rendered: arch.drawio"], ["[drawio:"]),
 
     # Structural macros
     ("toc placeholder", '<ac:structured-macro ac:name="toc"></ac:structured-macro>', ["[Confluence dynamic content: toc]"], ["ac:structured-macro"]),
@@ -314,3 +316,90 @@ def test_full_conversion_pipeline():
     assert "ac:structured-macro" not in md
     assert "ac:image" not in md
     assert "ri:attachment" not in md
+
+
+# -- draw.io: render-before-convert, real <img> not a [drawio:NAME] sentinel (#9, #8) --
+
+_DRAWIO_MACRO = (
+    '<ac:structured-macro ac:name="drawio">'
+    '<ac:parameter ac:name="diagramName">{name}</ac:parameter>'
+    "</ac:structured-macro>"
+)
+
+
+def test_drawio_rendered_emits_real_image():
+    html = _DRAWIO_MACRO.format(name="arch")
+    atts = [Attachment(id="a", title="arch.drawio", media_type="application/x-drawio")]
+    result = _preprocess_html(html, atts, rendered={"arch.drawio": Path(".media/arch.drawio.png")})
+    assert 'src=".media/arch.drawio.png"' in result  # a real <img>, not a sentinel
+    assert 'href=".media/arch.drawio"' in result      # source link
+    assert "[drawio:" not in result
+    assert "not rendered" not in result
+
+
+def test_drawio_underscore_name_survives_markdownify():
+    # #9: a diagramName containing '_' used to be markdownify-escaped ('foo\\_bar')
+    # inside the [drawio:...] sentinel, so the post-pass string replace failed and
+    # the literal token leaked. Emitting a real <img> before markdownify keeps the
+    # rendered PNG link intact through the full pipeline.
+    page = Page(
+        id="1", title="Diagram Page", space_id="1",
+        version=Version(created_at="2025-01-01T00:00:00Z", number=1),
+        body_storage=_DRAWIO_MACRO.format(name="foo_bar"),
+        webui="/x",
+    )
+    atts = [Attachment(id="a", title="foo_bar.drawio", media_type="application/x-drawio")]
+    md = convert_page(
+        page, base_url="https://x", space_key="T", path="/Diagram Page",
+        attachments=atts, rendered={"foo_bar.drawio": Path(".media/foo_bar.drawio.png")},
+    )
+    assert ".media/foo_bar.drawio.png" in md  # rendered PNG link survives (not escaped)
+    assert "[drawio:" not in md               # no leaked sentinel
+
+
+def test_drawio_render_failure_keeps_source_link_no_sentinel():
+    # #8: render failed (empty `rendered`) but the .drawio attachment exists → a
+    # graceful "not rendered" note + source link, never a leaked [drawio:...] token.
+    html = _DRAWIO_MACRO.format(name="arch")
+    atts = [Attachment(id="a", title="arch.drawio", media_type="application/x-drawio")]
+    result = _preprocess_html(html, atts, rendered={})
+    assert "Draw.io diagram not rendered: arch.drawio" in result
+    assert 'href=".media/arch.drawio"' in result  # source link still offered
+    assert "[drawio:" not in result
+
+
+def test_drawio_name_with_spaces_produces_valid_encoded_url():
+    # A diagram/attachment name with spaces must yield a percent-encoded URL so
+    # the image actually renders after markdownify (a raw space truncates the URL).
+    page = Page(
+        id="1", title="P", space_id="1",
+        version=Version(created_at="2025-01-01T00:00:00Z", number=1),
+        body_storage=_DRAWIO_MACRO.format(name="Foo Bar"), webui="/x",
+    )
+    atts = [Attachment(id="a", title="Foo Bar.drawio", media_type="application/x-drawio")]
+    md_out = convert_page(
+        page, base_url="https://x", space_key="T", path="/P",
+        attachments=atts, rendered={"Foo Bar.drawio": Path(".media/Foo Bar.drawio.png")},
+    )
+    assert ".media/Foo%20Bar.drawio.png" in md_out      # space encoded -> valid URL
+    assert "(.media/Foo Bar.drawio.png)" not in md_out  # no raw space in the URL
+
+
+def test_drawio_name_with_injection_chars_is_neutralized():
+    # A diagramName with markdown-structural chars must not break the image/link
+    # syntax or inject a clickable javascript link (#9 review).
+    page = Page(
+        id="1", title="P", space_id="1",
+        version=Version(created_at="2025-01-01T00:00:00Z", number=1),
+        body_storage=_DRAWIO_MACRO.format(name="x](javascript:alert(1))"), webui="/x",
+    )
+    title = "x](javascript:alert(1)).drawio"
+    atts = [Attachment(id="a", title=title, media_type="application/x-drawio")]
+    md_out = convert_page(
+        page, base_url="https://x", space_key="T", path="/P",
+        attachments=atts, rendered={title: Path(".media/safe.drawio.png")},
+    )
+    assert ".media/safe.drawio.png" in md_out          # image still renders
+    assert "javascript%3A" in md_out                   # source href percent-encoded (neutralized)
+    body = md_out.split("# P", 1)[1]                   # exclude the YAML frontmatter
+    assert "](javascript:" not in body                 # no injected clickable link in the body

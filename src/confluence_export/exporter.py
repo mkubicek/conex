@@ -15,7 +15,6 @@ from confluence_export.layout import plan_layout
 from confluence_export.drawio import (
     find_drawio_attachments,
     render_drawio_to_png,
-    replace_drawio_placeholders,
 )
 from confluence_export.media import WORKSPACE_DIR_NAME, download_attachments, ensure_media_dir
 from confluence_export.tree import (
@@ -313,26 +312,21 @@ class Exporter:
 
         # Download media
         written: list[Path] = []
+        media_dir: Path | None = None
         if self.download_media and attachments:
             media_dir = ensure_media_dir(page_dir)
             written.extend(download_attachments(self.client, attachments, media_dir))
 
-        # Convert to markdown
-        markdown = convert_page(
-            page,
-            base_url=self.base_url,
-            space_key=space_key,
-            path=path,
-            attachments=attachments,
-            user_resolver=self._resolve_user,
-        )
-
-        # Handle draw.io diagrams
+        # Render draw.io diagrams BEFORE conversion so the converter can emit a
+        # real <img> inline. (Previously the converter wrote a [drawio:NAME] text
+        # sentinel that a post-pass string-replaced; markdownify escaped `_` in
+        # that sentinel so the replace silently failed (#9), and a failed render
+        # left the raw sentinel in the output (#8). Rendering first removes both.)
+        rendered: dict[str, Path] = {}
         if self.render_drawio:
             drawio_atts = find_drawio_attachments(attachments)
             if drawio_atts:
-                rendered = {}
-                media_dir = ensure_media_dir(page_dir)
+                media_dir = media_dir or ensure_media_dir(page_dir)
                 for att in drawio_atts:
                     drawio_file = media_dir / att.title
                     if drawio_file.exists():
@@ -340,8 +334,18 @@ class Exporter:
                         if png_path:
                             rendered[att.title] = png_path
                             written.append(png_path)
-                if rendered:
-                    markdown = replace_drawio_placeholders(markdown, rendered)
+
+        # Convert to markdown (drawio macros become real images via `rendered`,
+        # or a graceful "not rendered" note when a diagram has no PNG).
+        markdown = convert_page(
+            page,
+            base_url=self.base_url,
+            space_key=space_key,
+            path=path,
+            attachments=attachments,
+            user_resolver=self._resolve_user,
+            rendered=rendered,
+        )
 
         # Write markdown file. Same allocated segment as the page directory
         # (via the shared plan), so the dir name and file stem stay in sync.

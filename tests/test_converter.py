@@ -93,11 +93,14 @@ def test_preprocess_code_block():
     assert "print('hello')" in result
 
 
-def test_preprocess_drawio_placeholder():
+def test_preprocess_drawio_not_rendered_falls_back():
+    # No rendered PNG and no attachment: graceful "not rendered" note, never a
+    # raw [drawio:NAME] sentinel that could leak to the output (#8).
     html = (
         '<ac:structured-macro ac:name="drawio">'
         '<ac:parameter ac:name="diagramName">architecture</ac:parameter>'
         "</ac:structured-macro>"
     )
     result = _preprocess_html(html, [])
-    assert "[drawio:architecture]" in result
+    assert "Draw.io diagram not rendered: architecture.drawio" in result
+    assert "[drawio:" not in result

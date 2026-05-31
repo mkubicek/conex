@@ -10,7 +10,6 @@ from confluence_export.drawio import (
     find_drawio_attachments,
     find_drawio_cli,
     render_drawio_to_png,
-    replace_drawio_placeholders,
 )
 from confluence_export.types import Attachment
 
@@ -211,24 +210,3 @@ class TestRenderDrawioToPng:
              patch("confluence_export.drawio.time.sleep"):
             result = render_drawio_to_png(drawio)
             assert result == expected_png
-
-
-class TestReplaceDrawioPlaceholders:
-    def test_replace_with_extension(self):
-        md = "# Diagram\n\n[drawio:arch.drawio]\n\nMore text"
-        rendered = {"arch.drawio": Path(".media/arch.drawio.png")}
-        result = replace_drawio_placeholders(md, rendered)
-        assert "![arch](.media/arch.drawio.png)" in result
-        assert "arch.drawio" in result  # source link
-
-    def test_replace_without_extension(self):
-        md = "# Diagram\n\n[drawio:arch]\n\nMore text"
-        rendered = {"arch.drawio": Path(".media/arch.drawio.png")}
-        result = replace_drawio_placeholders(md, rendered)
-        assert "![arch](.media/arch.drawio.png)" in result
-
-    def test_no_matching_placeholder(self):
-        md = "# No diagrams here"
-        rendered = {"other.drawio": Path(".media/other.drawio.png")}
-        result = replace_drawio_placeholders(md, rendered)
-        assert result == md
