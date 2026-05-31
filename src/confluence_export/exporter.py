@@ -33,6 +33,12 @@ class ExportResult:
 
     count: int = 0
     written_files: list[Path] = field(default_factory=list)
+    # Directories of pages SKIPPED this run because of a transient failure
+    # (body fetch or conversion raised), NOT genuine upstream deletions. The
+    # git stale-prune must not delete their last-good committed files just
+    # because they are absent from written_files this run (they regenerate on
+    # the next successful export).
+    skipped_paths: list[Path] = field(default_factory=list)
 
 
 def is_full_export(path_filter: str | None, no_children: bool) -> bool:
@@ -66,6 +72,9 @@ class Exporter:
         self.debug = debug
         self.skip_author_lookup = skip_author_lookup
         self._user_cache: dict[str, dict | None] = {}
+        # Page directories skipped this run due to a transient failure (reset at
+        # the start of each export_space; see ExportResult.skipped_paths).
+        self._skipped_paths: list[Path] = []
         # Per-export layout plan (page_id -> target_dir), set in export_space.
         # Empty when a page is exported via a direct _export_single_page call
         # (e.g. unit tests), in which case naming falls back to sanitize_filename.
@@ -136,6 +145,7 @@ class Exporter:
         include_archived: bool = False,
     ) -> ExportResult:
         """Export a space (or subtree) to output_dir."""
+        self._skipped_paths = []
         # Ensure cache
         if force_refresh:
             cs = self.cache.refresh(self.client, space, include_archived=include_archived)
@@ -230,7 +240,9 @@ class Exporter:
             if no_children:
                 nodes_to_export = [node]
             else:
-                return self._export_node(node, output_dir, cs, space.key, depth=0)
+                node_result = self._export_node(node, output_dir, cs, space.key, depth=0)
+                node_result.skipped_paths = list(self._skipped_paths)
+                return node_result
         else:
             if no_children:
                 nodes_to_export = roots
@@ -240,6 +252,7 @@ class Exporter:
                     r = self._export_node(root, output_dir, cs, space.key, depth=0)
                     result.count += r.count
                     result.written_files.extend(r.written_files)
+                result.skipped_paths = list(self._skipped_paths)
                 return result
 
         # Export flat list (no_children case)
@@ -248,6 +261,7 @@ class Exporter:
             files = self._export_single_page(node.page, output_dir, cs, space.key)
             result.count += 1 if files else 0
             result.written_files.extend(files)
+        result.skipped_paths = list(self._skipped_paths)
         return result
 
     def _export_node(
@@ -309,6 +323,7 @@ class Exporter:
                     page.webui = full_page.webui
             except Exception as exc:
                 print(f"  Warning: could not fetch body for {page.title}: {exc}", file=sys.stderr)
+                self._skipped_paths.append(page_dir)
                 return []
 
         # Get attachments from cache
@@ -359,6 +374,7 @@ class Exporter:
             )
         except Exception as exc:
             print(f"  Warning: could not convert {page.title}: {exc}", file=sys.stderr)
+            self._skipped_paths.append(page_dir)
             return []
 
         # Write markdown file. Same allocated segment as the page directory

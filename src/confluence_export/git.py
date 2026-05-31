@@ -128,6 +128,7 @@ def commit_export(
     space_key: str,
     *,
     is_full: bool = True,
+    protected_dirs: list[Path] | None = None,
 ) -> bool:
     """Stage exporter-written files and remove stale tracked files.
 
@@ -139,6 +140,13 @@ def commit_export(
     exports: those write only part of the tree, so written_files covers only
     that subset. Pruning then would ``git rm`` the entire rest of the repo. A
     partial export is therefore strictly add-only.
+
+    ``protected_dirs`` are page directories SKIPPED this run because of a
+    transient failure (body fetch / conversion raised) rather than a genuine
+    upstream deletion. Their tracked files are absent from written_files but must
+    NOT be pruned — that would silently delete a stable page's last-good
+    committed export just because it failed to regenerate this run. They are
+    excluded from the stale prune and heal on the next successful export.
 
     A moved page is handled as a plain delete + add: the reconciler drops the old
     path's markdown/.media and the write walk regenerates them at the new path,
@@ -159,7 +167,7 @@ def commit_export(
     # Remove stale tracked files (deletions/renames/moves upstream). Only on a
     # full export — a partial export's written_files is not the whole tree.
     if is_full:
-        _remove_stale_files(output_dir, written_files)
+        _remove_stale_files(output_dir, written_files, protected_dirs or [])
 
     # Check if anything was staged
     result = _run_git(output_dir, "diff", "--cached", "--quiet", check=False)
@@ -202,10 +210,21 @@ def _fs_is_case_insensitive(output_dir: Path) -> bool:
 def _remove_stale_files(
     output_dir: Path,
     written_files: list[Path],
+    protected_dirs: list[Path] | None = None,
 ) -> None:
     """Remove tracked files that are no longer part of the export."""
     if not _has_commits(output_dir):
         return
+
+    # Page dirs skipped this run due to a transient failure: their tracked files
+    # are absent from written_files but must be preserved, not pruned (a stable
+    # page that merely failed to regenerate this run must keep its last-good
+    # committed export). Never treat output_dir itself as protected.
+    out_resolved = output_dir.resolve()
+    protected = {
+        p.resolve() for p in (protected_dirs or [])
+        if p.resolve() != out_resolved
+    }
 
     result = _run_git(output_dir, "ls-files", "-z", ".", check=False)
     if result is None or not result.stdout.strip("\0"):
@@ -241,6 +260,8 @@ def _remove_stale_files(
         if _is_secret_config_relpath(rel_path):
             continue
         full = (output_dir / rel_path).resolve()
+        if protected and any(full.is_relative_to(d) for d in protected):
+            continue
         if fold(str(full)) not in written_keys:
             stale.append(rel_path)
 
