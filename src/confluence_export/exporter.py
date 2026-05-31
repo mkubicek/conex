@@ -220,6 +220,18 @@ class Exporter:
             archived_target = self._plan.get("__archived__")
             if archived_target is not None:
                 self._preserved_paths = [output_dir.joinpath(*archived_target.parts)]
+            elif not cs.include_archived:
+                # RF-A: a current-only refresh (cookie_v1, or any dialect that did
+                # not return archived pages) has no __archived__ node in the plan,
+                # so the branch above can't fire — yet a prior --include-archived
+                # export may have left an _archived/ subtree on disk that the prune
+                # would now delete. We cannot see those pages this run, so preserve
+                # the on-disk _archived/ root if present. (Gated on the cache
+                # provenance bit so a dialect that DID cover archived and simply
+                # has none does not protect a stray real page titled "_archived".)
+                archived_dir = output_dir / "_archived"
+                if archived_dir.is_dir():
+                    self._preserved_paths = [archived_dir]
         if is_full:
             from confluence_export.diff import scan_export_dir_grouped
             from confluence_export.reconcile import reconcile

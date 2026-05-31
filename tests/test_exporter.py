@@ -670,9 +670,28 @@ class TestReconcileWriterHandshake:
 
     def test_no_archived_pages_means_no_preserved_paths(self, tmp_path):
         exporter, _, cache = _make_exporter()
-        cache.ensure_loaded.return_value = _make_cached_space(pages=[_make_page()])
+        cs = _make_cached_space(pages=[_make_page()])
+        cs.include_archived = True  # cache provably covers archived; none exist
+        cache.ensure_loaded.return_value = cs
         result = exporter.export_space(_make_space(), tmp_path)
         assert result.preserved_paths == []
+
+    def test_archived_preserved_when_cache_omits_archived(self, tmp_path):
+        # RF-A: a current-only refresh (cookie_v1, or any dialect that doesn't
+        # return archived) has no __archived__ node in the plan. A prior
+        # --include-archived export's _archived/ subtree on disk must still be
+        # preserved from the prune — we cannot see those pages this run.
+        exporter, _, cache = _make_exporter()
+        cs = _make_cached_space(pages=[_make_page(id="p1", title="Live")])
+        cs.include_archived = False  # current-only provenance
+        cache.ensure_loaded.return_value = cs
+        (tmp_path / "_archived" / "Old").mkdir(parents=True)
+        (tmp_path / "_archived" / "Old" / "Old.md").write_text("# Old")
+
+        result = exporter.export_space(_make_space(), tmp_path)  # no include_archived
+
+        preserved = [p.resolve() for p in result.preserved_paths]
+        assert (tmp_path / "_archived").resolve() in preserved
 
     def test_include_archived_does_not_preserve(self, tmp_path):
         # When archived pages ARE written, there is nothing to preserve.
