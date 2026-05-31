@@ -12,10 +12,10 @@ a case-insensitive filesystem still get distinct, stable paths.
 
 from __future__ import annotations
 
-import unicodedata
 from pathlib import PurePosixPath
 
 from confluence_export.converter import MAX_FILENAME_LEN, sanitize_filename
+from confluence_export.paths import nfc_casefold
 from confluence_export.types import PageNode
 
 
@@ -25,8 +25,10 @@ def _fold(segment: str) -> str:
     siblings whose sanitized titles are NFC-equivalent (e.g. distinct precomposed
     codepoints with the same canonical form) or case-equivalent then collide and
     get a disambiguating suffix, instead of mapping to one path and silently
-    overwriting on a normalizing filesystem like APFS (the issue-#11 class)."""
-    return unicodedata.normalize("NFC", segment).casefold()
+    overwriting on a normalizing filesystem like APFS (the issue-#11 class).
+
+    Shares the one fold definition with git's stale-prune comparison (Q6)."""
+    return nfc_casefold(segment)
 
 
 def _truncate_with_suffix(segment: str, suffix: str) -> str:

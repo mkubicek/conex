@@ -46,6 +46,7 @@ Markdown and ``.media`` are recomputable from Confluence; only the user's
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from pathlib import Path, PurePosixPath
@@ -226,12 +227,16 @@ def _heal_folder_workspaces(output_dir: Path, move_sources: list[Path]) -> None:
         if not ws.is_dir():
             continue
         # A real page is markdown that is NOT inside a sidecar/internal dir.
-        # Mirror the grouped scan's pruning (.workspace/.media/.conex/.git) so a
-        # stray .md under a sidecar dir can't make an empty folder workspace look
-        # occupied and wrongly spare it from cleanup.
-        has_page = any(
-            not (_NON_PAGE_DIRS & set(md.relative_to(d).parts)) for md in d.rglob("*.md")
-        )
+        # Prune those dirs DURING traversal (P2) rather than rglob-ing the whole
+        # subtree (incl. .media attachment trees) and filtering after: any .md
+        # surviving the prune is a real page, so a stray .md under a sidecar dir
+        # can't make an empty folder workspace look occupied and wrongly spare it.
+        has_page = False
+        for dirpath, dirnames, filenames in os.walk(d):
+            dirnames[:] = [x for x in dirnames if x not in _NON_PAGE_DIRS]
+            if any(f.endswith(".md") for f in filenames):
+                has_page = True
+                break
         if has_page:
             continue
         if not any(ws.iterdir()):

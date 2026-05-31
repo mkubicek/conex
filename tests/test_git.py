@@ -840,3 +840,18 @@ class TestGitDefensiveBranches:
 
         assert rm_calls == []  # NFD written == NFC tracked → not stale → no git rm
         assert "survived the prune" not in capsys.readouterr().err
+
+
+def test_case_probe_sweeps_stranded_probe(tmp_path):
+    """S2: a .conex-case-* probe stranded by a prior hard-kill is swept on the
+    next probe, not left as working-tree clutter."""
+    from confluence_export.git import _fs_is_case_insensitive
+
+    stranded = tmp_path / ".conex-case-OLD"
+    stranded.write_text("")
+
+    _fs_is_case_insensitive(tmp_path)
+
+    assert not stranded.exists()
+    # No fresh probe is left behind either.
+    assert list(tmp_path.glob(".conex-case-*")) == []

@@ -7,12 +7,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import unicodedata
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
 from confluence_export.media import MEDIA_DIR_NAME, WORKSPACE_DIR_NAME
+from confluence_export.paths import nfc, nfc_casefold
 
 # Conservative per-call argv budget for git add / git rm path lists. macOS
 # ARG_MAX is 1 MiB (and includes the environment block), so 100 KiB leaves
@@ -201,6 +201,16 @@ def _fs_is_case_insensitive(output_dir: Path) -> bool:
     The probe is a uniquely-named temp file created with O_EXCL (via mkstemp), so
     it can never clobber or be spoofed by a real user file: it tests whether an
     upper-cased variant of *that unique name* resolves to the same file."""
+    # S2: sweep any probe stranded by a prior hard-kill. A SIGKILL between
+    # mkstemp and the unlink below cannot be caught, so a probe file can be left
+    # in the export tree; clean up leftovers on the next probe. (It is never
+    # committed — commit_export stages only the explicit written_files list — but
+    # leaving clutter in the user's working tree is avoidable.)
+    for stale in output_dir.glob(".conex-case-*"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
     try:
         fd, probe_name = tempfile.mkstemp(dir=output_dir, prefix=".conex-case-")
     except OSError:
@@ -253,12 +263,8 @@ def _remove_stale_files(
     #     differ only in case (a re-cased title, or legacy content from another
     #     machine); git folds those to one path, so we must too, or the same file
     #     is both git-added (new case) and flagged stale (old case).
-    _nfc = lambda s: unicodedata.normalize("NFC", s)  # noqa: E731
-    fold = (
-        (lambda s: _nfc(s).casefold())
-        if _fs_is_case_insensitive(output_dir)
-        else _nfc
-    )
+    # One shared fold definition with layout's collision keys (Q6).
+    fold = nfc_casefold if _fs_is_case_insensitive(output_dir) else nfc
     written_keys = {fold(str(f.resolve())) for f in written_files}
 
     stale = []

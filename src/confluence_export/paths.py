@@ -22,6 +22,20 @@ from pathlib import Path
 MAX_FILENAME_LEN = 100
 
 
+def nfc(s: str) -> str:
+    """Normalize to Unicode NFC — the form git stores on macOS with
+    core.precomposeunicode, and the canonical form a normalizing filesystem
+    (APFS) folds equivalent byte strings to."""
+    return unicodedata.normalize("NFC", s)
+
+
+def nfc_casefold(s: str) -> str:
+    """NFC + casefold: the identity a case-insensitive, normalizing filesystem
+    and git fold together. The shared fold for collision keys (layout) and
+    stale-file comparison (git)."""
+    return nfc(s).casefold()
+
+
 def safe_component(
     value: object,
     *,
