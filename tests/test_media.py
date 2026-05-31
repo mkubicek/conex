@@ -242,6 +242,25 @@ class TestMigrateMediaDirs:
         """No media/ dirs at all — returns empty list."""
         assert migrate_media_dirs(tmp_path) == []
 
+    def test_does_not_descend_internal_dirs(self, tmp_path):
+        """P1: never descend .git/.media/.workspace/.conex.
+
+        A legacy ``media/`` planted inside one of those is neither migrated nor
+        even visited — both a correctness guard (we must not touch git internals
+        or already-migrated trees) and the pruning that keeps the walk cheap.
+        """
+        internal = (".git", ".media", ".workspace", ".conex")
+        for parent in internal:
+            d = tmp_path / parent / "media"
+            d.mkdir(parents=True)
+            (d / _VERSIONS_FILE).write_text("{}")
+
+        renamed = migrate_media_dirs(tmp_path)
+
+        assert renamed == []
+        for parent in internal:
+            assert (tmp_path / parent / "media").is_dir()  # untouched
+
 
 def test_load_versions_returns_empty_on_corrupt_json(tmp_path):
     from confluence_export.media import _VERSIONS_FILE, _load_versions

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -38,16 +39,26 @@ def migrate_media_dirs(root_dir: Path) -> list[tuple[Path, Path]]:
     Returns list of (old_path, new_path) tuples for each renamed directory.
     """
     renamed: list[tuple[Path, Path]] = []
-    for dirpath in sorted(root_dir.rglob("media"), reverse=True):
-        if not dirpath.is_dir() or dirpath.name != "media":
+    # Prune heavy/irrelevant trees DURING traversal (P1): never descend git
+    # internals, already-migrated .media, user .workspace, or local .conex. This
+    # keeps the walk O(page dirs) instead of O(entire export tree, including
+    # gigabytes of attachments) on every export, and is also a correctness guard
+    # (a legacy "media/" inside .git is not ours to migrate).
+    skip = {".git", MEDIA_DIR_NAME, WORKSPACE_DIR_NAME, ".conex"}
+    for dirpath, dirnames, _filenames in os.walk(root_dir):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        if "media" not in dirnames:
             continue
-        if not (dirpath / _VERSIONS_FILE).exists():
+        candidate = Path(dirpath) / "media"
+        if not (candidate / _VERSIONS_FILE).exists():
             continue
-        new_path = dirpath.parent / MEDIA_DIR_NAME
+        new_path = candidate.parent / MEDIA_DIR_NAME
         if new_path.exists():
             continue
-        dirpath.rename(new_path)
-        renamed.append((dirpath, new_path))
+        candidate.rename(new_path)
+        renamed.append((candidate, new_path))
+        # Don't descend into the just-renamed (now migrated) attachment dir.
+        dirnames.remove("media")
     return renamed
 
 
