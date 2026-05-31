@@ -23,3 +23,9 @@ htmlcov/
 # OS
 .DS_Store
 .gstack/
+
+# Local working notes (session reflections/summaries)
+PR24-PR25-REFLECTION.md
+fresh-session-summary.md
+*-REFLECTION.md
+*-session-summary.md
