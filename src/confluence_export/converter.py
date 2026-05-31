@@ -285,14 +285,15 @@ def _preprocess_html(
             else:
                 parent_macro.decompose()
             continue
+        if parent_macro is not None and parent_macro.get("ac:name") == "profile":
+            # F3: leave the ri:user for _convert_profile to resolve. Consuming it
+            # here starved the profile macro, leaving "Unknown user".
+            continue
         name = _resolve_user_name(account_id, user_resolver)
-        parent_link = user_tag.find_parent("ac:link")
-        if parent_link:
-            span = soup.new_tag("span")
-            span.string = f"@{name}"
-            parent_link.replace_with(span)
-        else:
-            user_tag.replace_with(f"@{name}")
+        # F2: replace only this ri:user, never an enclosing ac:link — replacing the
+        # link would drop a sibling ri:user not yet processed. The ac:link pass
+        # below unwraps a link left holding only resolved mentions.
+        user_tag.replace_with(f"@{name}")
 
     # --- ac:image ---
     for img_tag in list(soup.find_all("ac:image")):
@@ -304,6 +305,11 @@ def _preprocess_html(
 
     # --- Structured macros ---
     for macro in list(soup.find_all("ac:structured-macro")):
+        # An earlier pass (e.g. a nested macro resolved in the mention pre-pass)
+        # may have detached this node from the live tree; operating on it would
+        # error or resurrect dropped content. Skip anything unreachable (F4).
+        if _is_detached(macro, soup):
+            continue
         macro_name = macro.get("ac:name", "")
         if macro_name in ("info", "tip", "note", "warning", "panel"):
             _convert_panel(soup, macro, macro_name)
@@ -315,9 +321,14 @@ def _preprocess_html(
             _convert_profile(soup, macro, user_resolver)
         elif macro_name == "profile-picture":
             # A profile-picture with a user was already resolved to an inline
-            # mention in the user-mention pre-pass; one reaching here has no user
-            # — drop it rather than emit a dynamic-content placeholder.
-            macro.decompose()
+            # mention in the user-mention pre-pass. If it still holds that
+            # resolved content (e.g. a nested profile-picture whose inner mention
+            # we kept — F4), unwrap to preserve it; an empty one (no user) is
+            # dropped rather than emitting a dynamic-content placeholder.
+            if macro.get_text(strip=True):
+                macro.unwrap()
+            else:
+                macro.decompose()
         elif macro_name == "status":
             _convert_status(soup, macro)
         elif macro_name == "expand":
@@ -410,11 +421,14 @@ def _replace_ac_link(soup: BeautifulSoup, tag: Tag, attach_map: dict[str, Attach
         tag.unwrap()
         return
 
-    # A link whose profile-picture macro(s) were already resolved to inline
-    # mention span(s) in the user-mention pre-pass has no ri: child left. Unwrap
-    # to keep the mention(s) inline — supporting more than one avatar per link —
-    # instead of dropping the link's content.
-    if tag.find("span"):
+    # A link with no recognized ri: child but still holding content is unwrapped
+    # to preserve that content rather than dropping it: an inline mention span
+    # resolved by the user pre-pass (supports >1 avatar per link), or a
+    # structured-macro the ac:link pass must not destroy before the macro-dispatch
+    # pass runs (F1). Only a genuinely empty link is removed. Using a content
+    # check rather than a bare <span> sentinel avoids coupling to whatever tag an
+    # earlier pass happened to emit (Q2).
+    if tag.find("ac:structured-macro") or tag.get_text(strip=True):
         tag.unwrap()
         return
 

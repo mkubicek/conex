@@ -279,6 +279,57 @@ def test_two_profile_pictures_in_one_ac_link_keep_both_mentions():
     assert "@N-u2" in result
 
 
+def test_macro_inside_ac_link_is_preserved():
+    # F1: an ac:link wrapping a structured-macro must not be decomposed before the
+    # macro-dispatch pass runs — the macro is preserved (link unwrapped) and
+    # converted in place.
+    html = (
+        '<p><ac:link><ac:structured-macro ac:name="status">'
+        '<ac:parameter ac:name="title">DONE</ac:parameter>'
+        "</ac:structured-macro></ac:link></p>"
+    )
+    result = _preprocess_html(html, [])
+    assert "DONE" in result
+
+
+def test_two_bare_ri_users_in_one_link_both_resolved():
+    # F2: two bare ri:user sharing one ac:link must each resolve. Replacing the
+    # whole link on the first dropped the second.
+    html = (
+        '<p><ac:link><ri:user ri:account-id="a1"/>'
+        '<ri:user ri:account-id="a2"/></ac:link></p>'
+    )
+    result = _preprocess_html(html, [], user_resolver=lambda aid: {"displayName": f"N-{aid}"})
+    assert "@N-a1" in result
+    assert "@N-a2" in result
+
+
+def test_profile_macro_resolves_user_name():
+    # F3: the profile macro must resolve the user's display name, not be starved
+    # of its ri:user by the mention pre-pass (which left it showing "Unknown user").
+    html = (
+        '<ac:structured-macro ac:name="profile">'
+        '<ac:parameter ac:name="User"><ri:user ri:account-id="a1"/></ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [], user_resolver=lambda aid: {"displayName": "Alice"})
+    assert "Alice" in result
+    assert "Unknown user" not in result
+
+
+def test_nested_profile_picture_keeps_inner_mention():
+    # F4: a profile-picture nested inside a profile-picture must keep the inner
+    # resolved mention — the outer must not decompose the already-resolved span.
+    html = (
+        '<ac:structured-macro ac:name="profile-picture">'
+        '<ac:structured-macro ac:name="profile-picture">'
+        '<ri:user ri:account-id="a1"/>'
+        "</ac:structured-macro></ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [], user_resolver=lambda aid: {"displayName": "Alice"})
+    assert "@Alice" in result
+
+
 def test_drawio_nested_in_panel_still_renders():
     # A drawio diagram inside an info/panel body must still emit its real <img>.
     # _convert_panel re-parsed the body into a fresh soup, detaching the inner
