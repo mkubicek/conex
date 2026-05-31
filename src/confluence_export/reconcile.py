@@ -50,7 +50,7 @@ import shutil
 import sys
 from pathlib import Path, PurePosixPath
 
-from confluence_export.diff import ExportedPage, scan_export_dir_grouped
+from confluence_export.diff import _NON_PAGE_DIRS, ExportedPage, scan_export_dir_grouped
 from confluence_export.media import MEDIA_DIR_NAME, WORKSPACE_DIR_NAME
 
 
@@ -225,8 +225,12 @@ def _heal_folder_workspaces(output_dir: Path, move_sources: list[Path]) -> None:
         ws = d / WORKSPACE_DIR_NAME
         if not ws.is_dir():
             continue
+        # A real page is markdown that is NOT inside a sidecar/internal dir.
+        # Mirror the grouped scan's pruning (.workspace/.media/.conex/.git) so a
+        # stray .md under a sidecar dir can't make an empty folder workspace look
+        # occupied and wrongly spare it from cleanup.
         has_page = any(
-            WORKSPACE_DIR_NAME not in md.relative_to(d).parts for md in d.rglob("*.md")
+            not (_NON_PAGE_DIRS & set(md.relative_to(d).parts)) for md in d.rglob("*.md")
         )
         if has_page:
             continue

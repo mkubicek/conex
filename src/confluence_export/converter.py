@@ -273,17 +273,17 @@ def _preprocess_html(
         # (issue #5, nested-macro regression).
         parent_macro = user_tag.find_parent("ac:structured-macro")
         if parent_macro is not None and parent_macro.get("ac:name") == "profile-picture":
-            # Retarget an enclosing ac:link so the later ac:link pass doesn't
-            # unwrap-and-drop the resolved span (a link whose only child is a
-            # plain span falls through to decompose) — that would re-introduce the
-            # very silent mention-drop #5 set out to fix.
-            target = parent_macro.find_parent("ac:link") or parent_macro
+            # Replace only the macro itself with its inline mention (NOT any
+            # enclosing ac:link) so that multiple avatars sharing one link each
+            # resolve. A link left holding only resolved mention spans is unwrapped
+            # (not dropped) by the ac:link pass below, so the span still survives —
+            # which is the silent-drop class #5 set out to fix.
             if account_id:
                 span = soup.new_tag("span")
                 span.string = f"@{_resolve_user_name(account_id, user_resolver)}"
-                target.replace_with(span)
+                parent_macro.replace_with(span)
             else:
-                target.decompose()
+                parent_macro.decompose()
             continue
         name = _resolve_user_name(account_id, user_resolver)
         parent_link = user_tag.find_parent("ac:link")
@@ -410,6 +410,14 @@ def _replace_ac_link(soup: BeautifulSoup, tag: Tag, attach_map: dict[str, Attach
         tag.unwrap()
         return
 
+    # A link whose profile-picture macro(s) were already resolved to inline
+    # mention span(s) in the user-mention pre-pass has no ri: child left. Unwrap
+    # to keep the mention(s) inline — supporting more than one avatar per link —
+    # instead of dropping the link's content.
+    if tag.find("span"):
+        tag.unwrap()
+        return
+
     tag.decompose()
 
 
@@ -419,7 +427,6 @@ def _convert_panel(soup: BeautifulSoup, macro: Tag, macro_name: str) -> None:
     title = title_param.get_text().strip() if title_param else macro_name.capitalize()
 
     body = macro.find("ac:rich-text-body")
-    body_html = "".join(str(child) for child in body.children) if body else ""
 
     blockquote = soup.new_tag("blockquote")
     strong = soup.new_tag("strong")
@@ -428,9 +435,14 @@ def _convert_panel(soup: BeautifulSoup, macro: Tag, macro_name: str) -> None:
     title_p.append(strong)
     blockquote.append(title_p)
 
-    if body_html:
-        body_soup = BeautifulSoup(body_html, "html.parser")
-        for element in list(body_soup.children):
+    # Move the LIVE body children into the blockquote instead of re-parsing their
+    # serialized HTML into a fresh soup. Re-parsing detached any macro nested in
+    # the body from the structured-macro dispatch snapshot, so e.g. a drawio
+    # diagram inside a panel was silently dropped (never converted). Moving the
+    # live nodes keeps them attached and still in the snapshot, so the dispatch
+    # converts them in place.
+    if body:
+        for element in list(body.children):
             blockquote.append(element)
 
     macro.replace_with(blockquote)
@@ -480,18 +492,19 @@ def _convert_expand(soup: BeautifulSoup, macro: Tag) -> None:
     title = title_param.get_text().strip() if title_param else "Details"
 
     body = macro.find("ac:rich-text-body")
-    body_html = "".join(str(child) for child in body.children) if body else ""
 
-    # Use <details><summary> which markdownify will preserve as HTML
-    # or just use a heading + content approach
+    # Heading + content. Move the LIVE body children (not a re-parsed copy) so a
+    # macro nested in the expand body — e.g. a drawio diagram — stays attached and
+    # in the structured-macro dispatch snapshot and is still converted (re-parsing
+    # detached it, silently dropping it). The container is a throwaway holder; only
+    # its children are spliced in where the macro was.
     container = BeautifulSoup("", "html.parser")
     h4 = soup.new_tag("h4")
     h4.string = title
     container.append(h4)
 
-    if body_html:
-        body_soup = BeautifulSoup(body_html, "html.parser")
-        for element in list(body_soup.children):
+    if body:
+        for element in list(body.children):
             container.append(element)
 
     macro.replace_with(*list(container.children))

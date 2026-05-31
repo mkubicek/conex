@@ -199,6 +199,23 @@ class TestEmptyResponse:
             assert store.load("TEST").pages == []  # empty snapshot saved
             assert "returned 0 pages" in capsys.readouterr().err
 
+    def test_zero_pages_over_corrupt_cache_proceeds(self, tmp_path):
+        # A 0-page response with a CORRUPT prior cache file must still proceed —
+        # refresh exists to overwrite a bad cache. The prior-cache probe must not
+        # let a json.JSONDecodeError abort the export.
+        with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
+            store = CacheStore()
+            store._space_file("TEST").write_text("{ this is not valid json")
+            client = MagicMock()
+            client.returns_archived_pages = False
+            client.get_pages_in_space.return_value = []
+            client.get_attachments.return_value = []
+
+            result = store.refresh(client, _make_space())  # must not raise
+
+            assert result.pages == []
+            assert store.load("TEST").pages == []  # corrupt file overwritten with valid JSON
+
     def test_zero_pages_with_no_prior_cache_proceeds(self, tmp_path):
         with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
             store = CacheStore()

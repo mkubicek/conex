@@ -12,10 +12,21 @@ a case-insensitive filesystem still get distinct, stable paths.
 
 from __future__ import annotations
 
+import unicodedata
 from pathlib import PurePosixPath
 
 from confluence_export.converter import MAX_FILENAME_LEN, sanitize_filename
 from confluence_export.types import PageNode
+
+
+def _fold(segment: str) -> str:
+    """Collision key folding the two axes a normalizing filesystem merges but
+    distinct byte strings do not: Unicode form (NFC) and case (casefold). Two
+    siblings whose sanitized titles are NFC-equivalent (e.g. distinct precomposed
+    codepoints with the same canonical form) or case-equivalent then collide and
+    get a disambiguating suffix, instead of mapping to one path and silently
+    overwriting on a normalizing filesystem like APFS (the issue-#11 class)."""
+    return unicodedata.normalize("NFC", segment).casefold()
 
 
 def _truncate_with_suffix(segment: str, suffix: str) -> str:
@@ -37,21 +48,22 @@ def _truncate_with_suffix(segment: str, suffix: str) -> str:
 def _allocate_segment(title: str, page_id: str, taken: dict[str, str]) -> str:
     """Allocate a collision-free path segment within one parent's namespace.
 
-    ``taken`` maps ``casefold(segment) -> page_id`` of the claimant. The first
+    ``taken`` maps ``_fold(segment) -> page_id`` of the claimant. The first
     sibling (in allocation order) to want a name keeps the bare sanitized form;
-    any later sibling colliding under casefold gets a numeric ``-2``/``-3``/...
-    suffix, with length reserved so the suffixed name never exceeds the cap.
+    any later sibling colliding under the NFC+casefold fold gets a numeric
+    ``-2``/``-3``/... suffix, with length reserved so the suffixed name never
+    exceeds the cap.
     """
     base = sanitize_filename(title)
-    if base.casefold() not in taken:
-        taken[base.casefold()] = page_id
+    if _fold(base) not in taken:
+        taken[_fold(base)] = page_id
         return base
 
     n = 2
     while True:
         candidate = _truncate_with_suffix(base, f"-{n}")
-        if candidate.casefold() not in taken:
-            taken[candidate.casefold()] = page_id
+        if _fold(candidate) not in taken:
+            taken[_fold(candidate)] = page_id
             return candidate
         n += 1
 

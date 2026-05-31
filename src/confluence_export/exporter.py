@@ -16,7 +16,12 @@ from confluence_export.drawio import (
     find_drawio_attachments,
     render_drawio_to_png,
 )
-from confluence_export.media import WORKSPACE_DIR_NAME, download_attachments, ensure_media_dir
+from confluence_export.media import (
+    MEDIA_DIR_NAME,
+    WORKSPACE_DIR_NAME,
+    download_attachments,
+    ensure_media_dir,
+)
 from confluence_export.tree import (
     build_tree,
     collect_subtree,
@@ -332,6 +337,13 @@ class Exporter:
         # Build page path
         path = page_path(cs.pages, page.id)
 
+        # Snapshot media present BEFORE this run so a convert failure can clean up
+        # only what IT newly created, never a previously-committed file's copy.
+        _media_dir = page_dir / MEDIA_DIR_NAME
+        pre_existing_media = (
+            {p.resolve() for p in _media_dir.rglob("*")} if _media_dir.is_dir() else set()
+        )
+
         # Download media
         written: list[Path] = []
         media_dir: Path | None = None
@@ -375,6 +387,15 @@ class Exporter:
         except Exception as exc:
             print(f"  Warning: could not convert {page.title}: {exc}", file=sys.stderr)
             self._skipped_paths.append(page_dir)
+            # Don't leave this run's freshly downloaded/rendered media orphaned for
+            # a page that produced no markdown — but only remove files THIS run
+            # created (a pre-existing path may be a previously-committed copy).
+            for p in written:
+                if p.resolve() not in pre_existing_media:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
             return []
 
         # Write markdown file. Same allocated segment as the page directory

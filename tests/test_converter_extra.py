@@ -249,10 +249,9 @@ def test_profile_picture_empty_then_second_ri_user_does_not_crash():
 
 def test_profile_picture_inside_ac_link_keeps_mention():
     # Regression guard: a profile-picture wrapped in an ac:link must keep its
-    # mention. Resolving the macro to a bare <span> while it is still inside the
-    # link left the later ac:link pass with a link whose only child is a plain
-    # span -> it fell through to decompose and silently dropped the mention (the
-    # exact failure class #5 fixes). Retargeting the enclosing ac:link survives it.
+    # mention. Resolving the macro to a bare <span> leaves the link holding only
+    # that span; the ac:link pass unwraps such a link (keeping the mention inline)
+    # rather than decomposing it, which would silently drop the mention (#5).
     html = (
         "<p><ac:link><ac:structured-macro ac:name=\"profile-picture\">"
         '<ac:parameter ac:name="U"><ri:user ri:account-id="abc"/></ac:parameter>'
@@ -261,6 +260,53 @@ def test_profile_picture_inside_ac_link_keeps_mention():
     result = _preprocess_html(html, [], user_resolver=lambda aid: {"displayName": "Alice"})
     assert "@Alice" in result
     assert "Confluence dynamic content" not in result
+
+
+def test_two_profile_pictures_in_one_ac_link_keep_both_mentions():
+    # Two avatars sharing a single ac:link: each profile-picture must resolve.
+    # Replacing the whole link on the first macro detached the second; resolving
+    # each macro in place and unwrapping the link keeps both mentions.
+    html = (
+        "<p><ac:link>"
+        '<ac:structured-macro ac:name="profile-picture"><ac:parameter ac:name="U">'
+        '<ri:user ri:account-id="u1"/></ac:parameter></ac:structured-macro>'
+        '<ac:structured-macro ac:name="profile-picture"><ac:parameter ac:name="U">'
+        '<ri:user ri:account-id="u2"/></ac:parameter></ac:structured-macro>'
+        "</ac:link></p>"
+    )
+    result = _preprocess_html(html, [], user_resolver=lambda aid: {"displayName": f"N-{aid}"})
+    assert "@N-u1" in result
+    assert "@N-u2" in result
+
+
+def test_drawio_nested_in_panel_still_renders():
+    # A drawio diagram inside an info/panel body must still emit its real <img>.
+    # _convert_panel re-parsed the body into a fresh soup, detaching the inner
+    # macro from the dispatch snapshot so it was silently dropped; moving the live
+    # body children keeps it attached and converted.
+    html = (
+        '<ac:structured-macro ac:name="info"><ac:rich-text-body>'
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">arch</ac:parameter>'
+        "</ac:structured-macro></ac:rich-text-body></ac:structured-macro>"
+    )
+    atts = [Attachment(id="a", title="arch.drawio", media_type="application/x-drawio")]
+    result = _preprocess_html(html, atts, rendered={"arch.drawio": Path(".media/arch.drawio.png")})
+    assert 'src=".media/arch.drawio.png"' in result
+    assert "[drawio:" not in result
+
+
+def test_view_file_nested_in_expand_still_renders():
+    # Same nested-macro class for view-file inside an expand body.
+    html = (
+        '<ac:structured-macro ac:name="expand"><ac:rich-text-body>'
+        '<ac:structured-macro ac:name="view-file">'
+        '<ri:attachment ri:filename="report.pdf"/>'
+        "</ac:structured-macro></ac:rich-text-body></ac:structured-macro>"
+    )
+    atts = [Attachment(id="b", title="report.pdf", media_type="application/pdf")]
+    result = _preprocess_html(html, atts)
+    assert ".media/report.pdf" in result
 
 
 # -- Full pipeline test: HTML → markdown with frontmatter --------------------
