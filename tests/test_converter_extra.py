@@ -378,6 +378,23 @@ def test_drawio_no_media_omits_dead_source_link():
     assert "not rendered" in result
 
 
+def test_drawio_matches_uppercase_drawio_extension():
+    # RF-D: a diagramName with an upper/mixed-case .drawio extension must still
+    # match an attachment titled with a lowercase .drawio (the suffix strip must
+    # be case-insensitive, not removesuffix-before-casefold).
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">Arch.DRAWIO</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    atts = [Attachment(id="a", title="Arch.drawio", media_type="application/x-drawio")]
+    result = _preprocess_html(
+        html, atts, rendered={"Arch.drawio": Path(".media/Arch.drawio.png")}
+    )
+    assert "not rendered" not in result
+    assert "Arch.drawio.png" in result
+
+
 def test_drawio_source_link_uses_real_attachment_title():
     # F6: the source link must use the actual on-disk attachment title, not a
     # reconstructed bare+'.drawio'. Here the drawio attachment (by media-type)

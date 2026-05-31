@@ -587,7 +587,9 @@ def _match_drawio_attachment(
             return attach_map[title]
 
     def _norm(s: str) -> str:
-        return re.sub(r"\s+", " ", s.strip()).removesuffix(".drawio").casefold()
+        # Casefold BEFORE stripping the extension so an upper/mixed-case
+        # ".DRAWIO" suffix is removed too (RF-D).
+        return re.sub(r"\s+", " ", s.strip()).casefold().removesuffix(".drawio")
 
     target = _norm(diagram_name)
     for title, att in attach_map.items():
