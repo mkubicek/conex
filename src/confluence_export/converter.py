@@ -78,6 +78,7 @@ def convert_page(
     attachments: list[Attachment] | None = None,
     user_resolver: UserResolver = None,
     rendered: dict[str, Path] | None = None,
+    media_downloaded: bool = True,
 ) -> str:
     """Convert a Confluence page to markdown with YAML frontmatter.
 
@@ -89,7 +90,8 @@ def convert_page(
 
     # Pre-process Confluence-specific HTML
     html = _preprocess_html(
-        html, attachments or [], user_resolver=user_resolver, rendered=rendered or {}
+        html, attachments or [], user_resolver=user_resolver, rendered=rendered or {},
+        media_downloaded=media_downloaded,
     )
 
     # Convert to markdown using markdownify
@@ -180,6 +182,7 @@ def _preprocess_html(
     attachments: list[Attachment],
     user_resolver: UserResolver = None,
     rendered: dict[str, Path] | None = None,
+    media_downloaded: bool = True,
 ) -> str:
     """Pre-process Confluence storage HTML before markdownify."""
     soup = BeautifulSoup(html, "html.parser")
@@ -316,7 +319,9 @@ def _preprocess_html(
         elif macro_name == "code":
             _convert_code_block(soup, macro)
         elif macro_name in ("drawio", "inc-drawio"):
-            _convert_drawio_placeholder(soup, macro, rendered, attach_map)
+            _convert_drawio_placeholder(
+                soup, macro, rendered, attach_map, media_downloaded=media_downloaded
+            )
         elif macro_name == "profile":
             _convert_profile(soup, macro, user_resolver)
         elif macro_name == "profile-picture":
@@ -575,11 +580,35 @@ def _convert_view_file(soup: BeautifulSoup, macro: Tag) -> None:
         macro.decompose()
 
 
+def _match_drawio_attachment(
+    diagram_name: str, attach_map: dict[str, Attachment]
+) -> Attachment | None:
+    """Find the drawio Attachment a macro's diagramName refers to.
+
+    Tolerant of the ``.drawio`` extension and case/whitespace differences between
+    the macro's diagramName and the on-disk attachment title (F6/F7)."""
+    bare = diagram_name.removesuffix(".drawio")
+    for title in (diagram_name, f"{bare}.drawio", bare):
+        if title in attach_map:
+            return attach_map[title]
+
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", s.strip()).removesuffix(".drawio").casefold()
+
+    target = _norm(diagram_name)
+    for title, att in attach_map.items():
+        if _norm(title) == target:
+            return att
+    return None
+
+
 def _convert_drawio_placeholder(
     soup: BeautifulSoup,
     macro: Tag,
     rendered: dict[str, Path],
     attach_map: dict[str, Attachment],
+    *,
+    media_downloaded: bool = True,
 ) -> None:
     """Replace a drawio/inc-drawio macro with its rendered PNG (image + source
     link), or a graceful "not rendered" note when no PNG is available.
@@ -593,14 +622,26 @@ def _convert_drawio_placeholder(
     name_param = macro.find("ac:parameter", attrs={"ac:name": "diagramName"})
     diagram_name = name_param.get_text().strip() if name_param else "diagram"
     bare = diagram_name.removesuffix(".drawio")
-    drawio_filename = f"{bare}.drawio"
 
+    # F6/F7: resolve the diagramName to the real on-disk attachment, tolerant of
+    # the .drawio extension and case/whitespace, rather than reconstructing a name.
+    matched = _match_drawio_attachment(diagram_name, attach_map)
+    source_name = matched.title if matched is not None else f"{bare}.drawio"
+
+    # Rendered-PNG lookup: the exporter keys rendered[att.title]; try the matched
+    # title first, then the reconstructed names (F7).
     png_path = None
-    for key in (diagram_name, drawio_filename, bare):
+    for key in ([matched.title] if matched is not None else []) + [
+        diagram_name, f"{bare}.drawio", bare,
+    ]:
         if key in rendered:
             png_path = rendered[key]
             break
-    source_tracked = drawio_filename in attach_map or diagram_name in attach_map
+
+    # F5: a source link only when the source is actually on disk — a tracked
+    # attachment AND media was downloaded this run (--no-media leaves a dead
+    # .media/<name>.drawio link otherwise).
+    source_tracked = matched is not None and media_downloaded
 
     # diagramName is API-controlled and can contain spaces / parens / brackets.
     # Once markdownify renders the emitted <img>/<a>, an unencoded URL with a space
@@ -619,14 +660,14 @@ def _convert_drawio_placeholder(
         ))
     else:
         em = soup.new_tag("em")
-        em.string = f"[Draw.io diagram not rendered: {_label(drawio_filename)}]"
+        em.string = f"[Draw.io diagram not rendered: {_label(source_name)}]"
         p.append(em)
     if source_tracked:
         p.append(soup.new_tag("br"))
         src_em = soup.new_tag("em")
         src_em.append("Draw.io source: ")
-        link = soup.new_tag("a", href=f"{MEDIA_DIR_NAME}/{urllib.parse.quote(drawio_filename)}")
-        link.string = _label(drawio_filename)
+        link = soup.new_tag("a", href=f"{MEDIA_DIR_NAME}/{urllib.parse.quote(source_name)}")
+        link.string = _label(source_name)
         src_em.append(link)
         p.append(src_em)
     macro.replace_with(p)

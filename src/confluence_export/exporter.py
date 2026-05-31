@@ -425,6 +425,7 @@ class Exporter:
                 attachments=attachments,
                 user_resolver=self._resolve_user,
                 rendered=rendered,
+                media_downloaded=self.download_media,
             )
         except Exception as exc:
             print(f"  Warning: could not convert {page.title}: {exc}", file=sys.stderr)

@@ -347,6 +347,52 @@ def test_drawio_nested_in_panel_still_renders():
     assert "[drawio:" not in result
 
 
+def test_drawio_rendered_lookup_is_case_and_space_insensitive():
+    # F7: the exporter keys rendered[att.title]; a diagramName differing only in
+    # case/whitespace from the attachment title must still find the PNG, not fall
+    # through to a "not rendered" note.
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">my  diagram</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    atts = [Attachment(id="a", title="My Diagram.drawio", media_type="application/x-drawio")]
+    result = _preprocess_html(
+        html, atts, rendered={"My Diagram.drawio": Path(".media/My Diagram.drawio.png")}
+    )
+    assert "not rendered" not in result
+    assert "My%20Diagram.drawio.png" in result
+
+
+def test_drawio_no_media_omits_dead_source_link():
+    # F5: on a --no-media run the .drawio source is not on disk, so a source link
+    # to .media/<name>.drawio would be dead. It must be omitted.
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">arch</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    atts = [Attachment(id="a", title="arch.drawio", media_type="application/x-drawio")]
+    result = _preprocess_html(html, atts, rendered={}, media_downloaded=False)
+    assert "Draw.io source" not in result
+    assert "not rendered" in result
+
+
+def test_drawio_source_link_uses_real_attachment_title():
+    # F6: the source link must use the actual on-disk attachment title, not a
+    # reconstructed bare+'.drawio'. Here the drawio attachment (by media-type)
+    # has no .drawio extension, so reconstruction would point at a missing file.
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">arch</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    atts = [Attachment(id="a", title="arch", media_type="application/x-drawio")]
+    result = _preprocess_html(html, atts, rendered={})
+    assert '.media/arch"' in result          # links to the real title "arch"
+    assert ".media/arch.drawio" not in result  # not the reconstructed name
+
+
 def test_view_file_nested_in_expand_still_renders():
     # Same nested-macro class for view-file inside an expand body.
     html = (
