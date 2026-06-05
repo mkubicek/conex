@@ -19,6 +19,7 @@ from confluence_export.config import (
     ConnectionProfileError,
     resolve_cloud_id,
 )
+from confluence_export.exporter import ExportResult
 from confluence_export.types import CachedSpace, Page, Space, Version
 
 def _space(key="TEST", name="Test Space"):
@@ -279,6 +280,118 @@ class TestExportCommand:
 
         assert not (Path(out) / ".git").exists()
 
+    def test_git_runs_for_full_export_with_only_protected_paths(self, tmp_path):
+        """A moved page can fail before writing any file, but still needs the
+        post-export git path to restore tracked deletions under skipped paths."""
+        client = _mock_client()
+        export_result = ExportResult(
+            count=0,
+            written_files=[],
+            skipped_paths=[tmp_path / "out" / "Old" / "Page"],
+            preserved_page_paths=[tmp_path / "out" / "_archived" / "Known"],
+            preserved_paths=[tmp_path / "out" / "_archived"],
+            prune_media_dirs=[tmp_path / "out" / "Page" / ".media"],
+        )
+        exporter = MagicMock()
+        exporter.export_space.return_value = export_result
+        out = str(tmp_path / "out")
+
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.Exporter", return_value=exporter), \
+             patch("confluence_export.git.git_available", return_value=True), \
+             patch("confluence_export.git.ensure_repo", return_value=True), \
+             patch("confluence_export.git.commit_local_changes"), \
+             patch("confluence_export.git.commit_export") as commit_export:
+            main()
+
+        commit_export.assert_called_once()
+        # Routing: archived pages page-EXACT (protected_dirs); skipped pages join
+        # the RECURSIVE group (protected_subtree_dirs) alongside blind subtrees.
+        assert commit_export.call_args.kwargs["protected_dirs"] == export_result.preserved_page_paths
+        assert commit_export.call_args.kwargs["protected_subtree_dirs"] == (
+            export_result.preserved_paths + export_result.skipped_paths
+        )
+        assert commit_export.call_args.kwargs["prune_media_dirs"] == export_result.prune_media_dirs
+
+    def test_git_skips_full_export_with_only_preserved_subtrees(self, tmp_path):
+        """An empty current-only export must not prune all live files merely
+        because an existing archived subtree is being preserved."""
+        client = _mock_client()
+        export_result = ExportResult(
+            count=0,
+            written_files=[],
+            preserved_paths=[tmp_path / "out" / "_archived"],
+        )
+        exporter = MagicMock()
+        exporter.export_space.return_value = export_result
+        out = str(tmp_path / "out")
+
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.Exporter", return_value=exporter), \
+             patch("confluence_export.git.git_available", return_value=True), \
+             patch("confluence_export.git.ensure_repo", return_value=True), \
+             patch("confluence_export.git.commit_local_changes"), \
+             patch("confluence_export.git.commit_export") as commit_export:
+            main()
+
+        commit_export.assert_not_called()
+
+    def test_git_skips_authoritative_archived_only_to_preserve_live_pages(self, tmp_path):
+        """DATA-SAFETY DECISION 1 (fix ①): even when the cache AUTHORITATIVELY sees
+        only archived pages (a v2 run that returned the archived set but ZERO
+        current pages), a zero-live-write run must NOT prune. The empty live set is
+        ambiguous (genuinely emptied OR a transient/pagination artifact), and
+        pruning would git-rm the committed live pages. Archived-preservation sets
+        are pure protection inputs — they never independently open the prune gate."""
+        client = _mock_client()
+        export_result = ExportResult(
+            count=0,
+            written_files=[],
+            preserved_page_paths=[tmp_path / "out" / "_archived" / "Known"],
+        )
+        exporter = MagicMock()
+        exporter.export_space.return_value = export_result
+        out = str(tmp_path / "out")
+
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.Exporter", return_value=exporter), \
+             patch("confluence_export.git.git_available", return_value=True), \
+             patch("confluence_export.git.ensure_repo", return_value=True), \
+             patch("confluence_export.git.commit_local_changes"), \
+             patch("confluence_export.git.commit_export") as commit_export:
+            main()
+
+        commit_export.assert_not_called()
+
+    def test_git_skips_emptied_full_export_to_preserve_committed_pages(self, tmp_path):
+        """DATA-SAFETY DECISION: a full export that returns ZERO pages with nothing
+        to protect must NOT prune the previously-committed export. A zero-page
+        result (genuinely emptied space OR a transient/auth failure) keeps the
+        prior export rather than risk deleting it on a bad response."""
+        client = _mock_client()
+        export_result = ExportResult(count=0, written_files=[])  # nothing at all
+        exporter = MagicMock()
+        exporter.export_space.return_value = export_result
+        out = str(tmp_path / "out")
+
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.Exporter", return_value=exporter), \
+             patch("confluence_export.git.git_available", return_value=True), \
+             patch("confluence_export.git.ensure_repo", return_value=True), \
+             patch("confluence_export.git.commit_local_changes"), \
+             patch("confluence_export.git.commit_export") as commit_export:
+            main()
+
+        commit_export.assert_not_called()
+
     def test_no_author_lookup_flag_propagates_to_exporter(self, tmp_path):
         client = _mock_client()
         cache = MagicMock()
@@ -367,6 +480,18 @@ class TestConfigureCommand:
 
         assert not config_file.exists()
         assert "OAuth gateway" in capsys.readouterr().err
+
+    def test_http_site_url_exits(self, capsys, tmp_path):
+        inputs = iter(["http://x.atlassian.net", "a@b.com", "tok"])
+        config_file = tmp_path / "config.json"
+        with patch("sys.argv", ["confluence-export", "configure"]), \
+             patch("builtins.input", side_effect=inputs), \
+             patch("confluence_export.cli.config_path", return_value=config_file):
+            with pytest.raises(SystemExit):
+                main()
+
+        assert not config_file.exists()
+        assert "HTTPS" in capsys.readouterr().err
 
     def test_bearer_mode_when_no_email(self, capsys, tmp_path):
         config_file = tmp_path / "config.json"

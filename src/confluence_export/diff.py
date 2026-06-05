@@ -22,6 +22,7 @@ class ExportedPage:
     path: str
     file_path: Path
     space_key: str = ""
+    status: str = ""
 
 
 @dataclass
@@ -95,6 +96,8 @@ def scan_export_dir_grouped(
     for dirpath, dirnames, filenames in os.walk(export_dir):
         dirnames[:] = [d for d in dirnames if d not in _NON_PAGE_DIRS]
         for filename in filenames:
+            if filename.startswith("."):
+                continue
             if not filename.endswith(".md"):
                 continue
             md_file = Path(dirpath) / filename
@@ -117,6 +120,7 @@ def scan_export_dir_grouped(
                     path=fm.get("path", ""),
                     file_path=md_file,
                     space_key=file_space,
+                    status=str(fm.get("status", "") or ""),
                 )
             )
 

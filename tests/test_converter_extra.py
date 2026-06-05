@@ -378,6 +378,27 @@ def test_drawio_no_media_omits_dead_source_link():
     assert "not rendered" in result
 
 
+def test_drawio_source_link_uses_actual_available_media():
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">arch</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    atts = [Attachment(id="a", title="arch.drawio", media_type="application/x-drawio")]
+
+    no_media_with_source = _preprocess_html(
+        html, atts, rendered={}, media_downloaded=False,
+        available_media={"arch.drawio"},
+    )
+    failed_download = _preprocess_html(
+        html, atts, rendered={}, media_downloaded=True,
+        available_media=set(),
+    )
+
+    assert "Draw.io source" in no_media_with_source
+    assert "Draw.io source" not in failed_download
+
+
 def test_drawio_matches_uppercase_drawio_extension():
     # RF-D: a diagramName with an upper/mixed-case .drawio extension must still
     # match an attachment titled with a lowercase .drawio (the suffix strip must
@@ -408,6 +429,46 @@ def test_drawio_source_link_uses_real_attachment_title():
     result = _preprocess_html(html, atts, rendered={})
     assert '.media/arch"' in result          # links to the real title "arch"
     assert ".media/arch.drawio" not in result  # not the reconstructed name
+
+
+def test_drawio_match_prefers_diagram_attachment_over_same_name_file():
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">arch</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    atts = [
+        Attachment(id="plain", title="arch", media_type="text/plain"),
+        Attachment(id="drawio", title="arch.drawio", media_type="application/x-drawio"),
+    ]
+
+    result = _preprocess_html(
+        html,
+        atts,
+        rendered={"arch.drawio": Path(".media/arch.drawio.png")},
+    )
+
+    assert 'src=".media/arch.drawio.png"' in result
+    assert 'href=".media/arch.drawio"' in result
+    assert 'href=".media/arch"' not in result
+
+
+def test_drawio_match_accepts_mixed_case_drawio_extension():
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">Arch</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    atts = [Attachment(id="a", title="Arch.DRAWIO", media_type="application/octet-stream")]
+
+    result = _preprocess_html(
+        html,
+        atts,
+        rendered={"Arch.DRAWIO": Path(".media/Arch.DRAWIO.png")},
+    )
+
+    assert "not rendered" not in result
+    assert "Arch.DRAWIO.png" in result
 
 
 def test_view_file_nested_in_expand_still_renders():

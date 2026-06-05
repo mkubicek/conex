@@ -270,7 +270,7 @@ class TestConnectionProfile:
 
     def test_scoped_token_to_internal_url_does_not_request_cloud_id(self):
         with patch("confluence_export.config.requests.get") as mock_get:
-            with pytest.raises(ConnectionProfileError, match="cloud ID"):
+            with pytest.raises(ConnectionProfileError, match="HTTPS"):
                 load_connection_profile(
                     site_url="http://169.254.169.254",
                     email="a@b.com",
@@ -527,6 +527,647 @@ class TestConnectionProfile:
         assert profile.site_url == "https://local.atlassian.net"
         assert profile.auth_mode is AuthMode.COOKIE
         assert profile.config_source.endswith("docs/.conex/config.json")
+
+    def test_local_host_override_cannot_borrow_global_credentials(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            auth=AuthConfig(
+                type=AuthMode.BASIC_API_TOKEN,
+                email="user@example.com",
+                token="global-secret",
+            ),
+            path=global_config,
+        )
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://evil.example.com",
+            "auth": {"type": "basic_api_token"},
+        }))
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        with pytest.raises(ConnectionProfileError, match="email and API token"):
+            load_connection_profile(
+                start_dir=tmp_path / "docs" / "export",
+                interactive=False,
+            )
+
+    def test_local_host_override_with_partial_auth_cannot_borrow_secret(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            auth=AuthConfig(
+                type=AuthMode.BASIC_API_TOKEN,
+                email="user@example.com",
+                token="global-secret",
+            ),
+            path=global_config,
+        )
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://evil.example.com",
+            "auth": {"type": "basic_api_token", "email": "attacker@example.com"},
+        }))
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        with pytest.raises(ConnectionProfileError, match="email and API token"):
+            load_connection_profile(
+                start_dir=tmp_path / "docs" / "export",
+                interactive=False,
+            )
+
+    def test_local_origin_override_cannot_borrow_global_credentials(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            auth=AuthConfig(
+                type=AuthMode.BASIC_API_TOKEN,
+                email="user@example.com",
+                token="global-secret",
+            ),
+            path=global_config,
+        )
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://global.atlassian.net:8443",
+            "auth": {"type": "basic_api_token"},
+        }))
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        with pytest.raises(ConnectionProfileError, match="email and API token"):
+            load_connection_profile(
+                start_dir=tmp_path / "docs" / "export",
+                interactive=False,
+            )
+
+    def test_cli_route_override_cannot_borrow_global_credentials(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            auth=AuthConfig(
+                type=AuthMode.BASIC_API_TOKEN,
+                email="user@example.com",
+                token="global-secret",
+            ),
+            path=global_config,
+        )
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        with pytest.raises(ConnectionProfileError, match="authentication credentials"):
+            load_connection_profile(
+                site_url="https://evil.example.com",
+                interactive=False,
+            )
+
+    def test_env_route_override_cannot_borrow_global_credentials(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            auth=AuthConfig(
+                type=AuthMode.BASIC_API_TOKEN,
+                email="user@example.com",
+                token="global-secret",
+            ),
+            path=global_config,
+        )
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+        monkeypatch.setenv("CONFLUENCE_SITE_URL", "https://evil.example.com")
+
+        with pytest.raises(ConnectionProfileError, match="authentication credentials"):
+            load_connection_profile(interactive=False)
+
+    def test_env_token_cannot_attach_to_local_site_override(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            auth=AuthConfig(
+                type=AuthMode.BASIC_API_TOKEN,
+                email="user@example.com",
+                token="global-secret",
+            ),
+            path=global_config,
+        )
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://evil.example.com",
+            "auth": {"type": "basic_api_token", "email": "attacker@example.com"},
+        }))
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+        monkeypatch.setenv("CONFLUENCE_API_TOKEN", "env-secret")
+
+        with pytest.raises(ConnectionProfileError, match="credential-only"):
+            load_connection_profile(
+                start_dir=tmp_path / "docs" / "export",
+                interactive=False,
+            )
+
+    def test_env_token_with_matching_site_url_can_complete_local_config(
+        self, tmp_path, monkeypatch
+    ):
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://docs.mycompany.com",
+            "auth": {"type": "basic_api_token", "email": "user@example.com"},
+        }))
+        monkeypatch.setenv("CONFLUENCE_SITE_URL", "https://docs.mycompany.com")
+        monkeypatch.setenv("CONFLUENCE_API_TOKEN", "env-secret")
+
+        profile = load_connection_profile(
+            start_dir=tmp_path / "docs" / "export",
+            interactive=False,
+        )
+
+        assert profile.site_url == "https://docs.mycompany.com"
+        assert profile.auth.token == "env-secret"
+
+    def test_env_credentials_can_pair_with_cli_site_url(self, monkeypatch):
+        monkeypatch.setenv("CONFLUENCE_EMAIL", "user@example.com")
+        monkeypatch.setenv("CONFLUENCE_API_TOKEN", "env-secret")
+
+        profile = load_connection_profile(
+            site_url="https://docs.mycompany.com",
+            interactive=False,
+        )
+
+        assert profile.site_url == "https://docs.mycompany.com"
+        assert profile.auth.type is AuthMode.BASIC_API_TOKEN
+        assert profile.auth.email == "user@example.com"
+        assert profile.auth.token == "env-secret"
+
+    def test_env_credentials_can_pair_with_cli_site_url_over_local_config(
+        self, tmp_path, monkeypatch
+    ):
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://local.example.com",
+            "auth": {"type": "basic_api_token"},
+        }))
+        monkeypatch.setenv("CONFLUENCE_EMAIL", "user@example.com")
+        monkeypatch.setenv("CONFLUENCE_API_TOKEN", "env-secret")
+
+        profile = load_connection_profile(
+            site_url="https://cli.example.com",
+            start_dir=tmp_path / "docs" / "export",
+            interactive=False,
+        )
+
+        assert profile.site_url == "https://cli.example.com"
+        assert profile.auth.type is AuthMode.BASIC_API_TOKEN
+        assert profile.auth.email == "user@example.com"
+        assert profile.auth.token == "env-secret"
+
+    def test_env_credentials_with_only_cli_cloud_id_cannot_attach_to_local_site(
+        self, tmp_path, monkeypatch
+    ):
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://local.example.com",
+            "auth": {"type": "basic_api_token"},
+        }))
+        monkeypatch.setenv("CONFLUENCE_EMAIL", "user@example.com")
+        monkeypatch.setenv("CONFLUENCE_API_TOKEN", "env-secret")
+
+        with pytest.raises(ConnectionProfileError, match="credential-only"):
+            load_connection_profile(
+                cloud_id="cloud-from-cli",
+                start_dir=tmp_path / "docs" / "export",
+                interactive=False,
+            )
+
+    def test_env_credentials_with_only_env_cloud_id_cannot_attach_to_local_site(
+        self, tmp_path, monkeypatch
+    ):
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://local.example.com",
+            "auth": {"type": "basic_api_token"},
+        }))
+        monkeypatch.setenv("CONFLUENCE_EMAIL", "user@example.com")
+        monkeypatch.setenv("CONFLUENCE_API_TOKEN", "env-secret")
+        monkeypatch.setenv("CONFLUENCE_CLOUD_ID", "cloud-from-env")
+
+        with pytest.raises(ConnectionProfileError, match="credential-only"):
+            load_connection_profile(
+                start_dir=tmp_path / "docs" / "export",
+                interactive=False,
+            )
+
+    def test_route_less_global_credentials_do_not_attach_to_local_site(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        global_config.write_text(json.dumps({
+            "version": 2,
+            "site_url": "",
+            "auth": {
+                "type": "basic_api_token",
+                "email": "user@example.com",
+                "token": "global-secret",
+            },
+        }))
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://local.example.com",
+            "auth": {"type": "basic_api_token"},
+        }))
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        with pytest.raises(ConnectionProfileError, match="email and API token"):
+            load_connection_profile(
+                start_dir=tmp_path / "docs" / "export",
+                interactive=False,
+            )
+
+    def test_route_less_global_credentials_can_pair_with_cli_site_url(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        global_config.write_text(json.dumps({
+            "version": 2,
+            "site_url": "",
+            "auth": {
+                "type": "basic_api_token",
+                "email": "user@example.com",
+                "token": "global-secret",
+            },
+        }))
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        profile = load_connection_profile(
+            site_url="https://cli.example.com",
+            interactive=False,
+        )
+
+        assert profile.site_url == "https://cli.example.com"
+        assert profile.auth.email == "user@example.com"
+        assert profile.auth.token == "global-secret"
+
+    def test_env_route_allows_cli_token_over_local_config(
+        self, tmp_path, monkeypatch
+    ):
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://local.example.com",
+            "auth": {"type": "basic_api_token"},
+        }))
+        monkeypatch.setenv("CONFLUENCE_SITE_URL", "https://cli.example.com")
+        monkeypatch.setenv("CONFLUENCE_EMAIL", "user@example.com")
+
+        profile = load_connection_profile(
+            api_token="cli-secret",
+            start_dir=tmp_path / "docs" / "export",
+            interactive=False,
+        )
+
+        assert profile.site_url == "https://cli.example.com"
+        assert profile.auth.type is AuthMode.BASIC_API_TOKEN
+        assert profile.auth.email == "user@example.com"
+        assert profile.auth.token == "cli-secret"
+
+    def test_default_https_port_is_same_credential_scope(self, tmp_path, monkeypatch):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            auth=AuthConfig(
+                type=AuthMode.BASIC_API_TOKEN,
+                email="user@example.com",
+                token="global-secret",
+            ),
+            path=global_config,
+        )
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://global.atlassian.net:443",
+            "auth": {"type": "basic_api_token"},
+        }))
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        profile = load_connection_profile(
+            start_dir=tmp_path / "docs" / "export",
+            interactive=False,
+        )
+
+        assert profile.auth.token == "global-secret"
+
+    def test_malformed_override_port_raises_connection_profile_error(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            auth=AuthConfig(
+                type=AuthMode.BASIC_API_TOKEN,
+                email="user@example.com",
+                token="global-secret",
+            ),
+            path=global_config,
+        )
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://local.atlassian.net:bad",
+            "auth": {"type": "basic_api_token"},
+        }))
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        with pytest.raises(ConnectionProfileError, match="site_url must be an HTTPS URL"):
+            load_connection_profile(
+                start_dir=tmp_path / "docs" / "export",
+                interactive=False,
+            )
+
+    def test_malformed_ipv6_url_raises_connection_profile_error(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            auth=AuthConfig(
+                type=AuthMode.BASIC_API_TOKEN,
+                email="user@example.com",
+                token="global-secret",
+            ),
+            path=global_config,
+        )
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        with pytest.raises(ConnectionProfileError, match="site_url must be an HTTPS URL"):
+            load_connection_profile(
+                site_url="https://[::1",
+                auth_type=AuthMode.BASIC_API_TOKEN,
+                email="user@example.com",
+                api_token="cli-secret",
+                interactive=False,
+            )
+
+    def test_local_gateway_cloud_override_cannot_borrow_scoped_token(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            cloud_id="cloud-old",
+            api_base_url=gateway_url("cloud-old"),
+            auth=AuthConfig(
+                type=AuthMode.SCOPED_API_TOKEN,
+                email="user@example.com",
+                token="ATATT3x_dummy=ADA123",
+            ),
+            path=global_config,
+        )
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://global.atlassian.net",
+            "api_base_url": gateway_url("cloud-evil"),
+            "auth": {"type": "scoped_api_token"},
+        }))
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        with pytest.raises(ConnectionProfileError, match="email and API token"):
+            load_connection_profile(
+                start_dir=tmp_path / "docs" / "export",
+                interactive=False,
+            )
+
+    def test_cli_cloud_id_can_complete_global_scoped_token_profile(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            auth=AuthConfig(
+                type=AuthMode.SCOPED_API_TOKEN,
+                email="user@example.com",
+                token="ATATT3x_dummy=ADA123",
+            ),
+            path=global_config,
+        )
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        profile = load_connection_profile(
+            cloud_id="cloud-new",
+            interactive=False,
+        )
+
+        assert profile.auth.token == "ATATT3x_dummy=ADA123"
+        assert profile.cloud_id == "cloud-new"
+        assert profile.api_base_url == gateway_url("cloud-new")
+
+    def test_cli_cloud_id_can_complete_local_scoped_token_with_own_credentials(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            cloud_id="cloud-old",
+            api_base_url=gateway_url("cloud-old"),
+            auth=AuthConfig(
+                type=AuthMode.SCOPED_API_TOKEN,
+                email="global@example.com",
+                token="ATATT3x_dummy=GLOBAL",
+            ),
+            path=global_config,
+        )
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        save_connection_config(
+            site_url="https://docs.mycompany.com",
+            auth=AuthConfig(
+                type=AuthMode.SCOPED_API_TOKEN,
+                email="local@example.com",
+                token="ATATT3x_dummy=LOCAL",
+            ),
+            path=local_dir / "config.json",
+        )
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        profile = load_connection_profile(
+            start_dir=tmp_path / "docs" / "export",
+            cloud_id="cloud-local",
+            interactive=False,
+            resolve_cloud=lambda _site: None,
+        )
+
+        assert profile.site_url == "https://docs.mycompany.com"
+        assert profile.auth.email == "local@example.com"
+        assert profile.auth.token == "ATATT3x_dummy=LOCAL"
+        assert profile.cloud_id == "cloud-local"
+        assert profile.api_base_url == gateway_url("cloud-local")
+
+    def test_env_cloud_id_survives_env_credentials_with_cli_site_url(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("CONFLUENCE_EMAIL", "user@example.com")
+        monkeypatch.setenv("CONFLUENCE_API_TOKEN", "ATATT3x_dummy=ADA123")
+        monkeypatch.setenv("CONFLUENCE_CLOUD_ID", "cloud-env")
+
+        profile = load_connection_profile(
+            site_url="https://docs.example.com",
+            interactive=False,
+            resolve_cloud=lambda _site: None,
+        )
+
+        assert profile.cloud_id == "cloud-env"
+        assert profile.api_base_url == gateway_url("cloud-env")
+
+    def test_cli_cloud_id_rebuilds_stale_gateway_route(self, tmp_path, monkeypatch):
+        global_config = tmp_path / "global.json"
+        global_config.write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://global.atlassian.net",
+            "api_base_url": gateway_url("cloud-old"),
+            "auth": {
+                "type": "scoped_api_token",
+                "email": "user@example.com",
+                "token": "ATATT3x_dummy=ADA123",
+            },
+        }))
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        profile = load_connection_profile(
+            cloud_id="cloud-new",
+            interactive=False,
+        )
+
+        assert profile.cloud_id == "cloud-new"
+        assert profile.api_base_url == gateway_url("cloud-new")
+
+    def test_local_cloud_id_fill_cannot_borrow_global_scoped_token_without_cloud(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            auth=AuthConfig(
+                type=AuthMode.SCOPED_API_TOKEN,
+                email="user@example.com",
+                token="ATATT3x_dummy=ADA123",
+            ),
+            path=global_config,
+        )
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://global.atlassian.net",
+            "cloud_id": "cloud-evil",
+            "auth": {"type": "scoped_api_token"},
+        }))
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        with pytest.raises(ConnectionProfileError, match="email and API token"):
+            load_connection_profile(
+                start_dir=tmp_path / "docs" / "export",
+                interactive=False,
+            )
+
+    def test_local_cloud_id_override_cannot_borrow_scoped_token(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            cloud_id="cloud-old",
+            api_base_url=gateway_url("cloud-old"),
+            auth=AuthConfig(
+                type=AuthMode.SCOPED_API_TOKEN,
+                email="user@example.com",
+                token="ATATT3x_dummy=ADA123",
+            ),
+            path=global_config,
+        )
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://global.atlassian.net",
+            "cloud_id": "cloud-evil",
+            "auth": {"type": "scoped_api_token", "email": "attacker@example.com"},
+        }))
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        with pytest.raises(ConnectionProfileError, match="email and API token"):
+            load_connection_profile(
+                start_dir=tmp_path / "docs" / "export",
+                interactive=False,
+            )
+
+    def test_non_https_site_url_is_rejected_for_basic_auth(self):
+        with pytest.raises(ConnectionProfileError, match="HTTPS"):
+            load_connection_profile(
+                site_url="http://x.atlassian.net",
+                email="a@b.com",
+                api_token="legacy-token",
+                interactive=False,
+            )
+
+    def test_local_custom_domain_with_own_credentials_is_allowed(
+        self, tmp_path, monkeypatch
+    ):
+        global_config = tmp_path / "global.json"
+        save_connection_config(
+            site_url="https://global.atlassian.net",
+            auth=AuthConfig(
+                type=AuthMode.BASIC_API_TOKEN,
+                email="user@example.com",
+                token="global-secret",
+            ),
+            path=global_config,
+        )
+        local_dir = tmp_path / "docs" / ".conex"
+        local_dir.mkdir(parents=True)
+        save_connection_config(
+            site_url="https://docs.mycompany.com",
+            auth=AuthConfig(type=AuthMode.COOKIE, cookie_header="tenant.session=abc"),
+            path=local_dir / "config.json",
+        )
+        monkeypatch.setattr("confluence_export.config.config_path", lambda: global_config)
+
+        profile = load_connection_profile(
+            start_dir=tmp_path / "docs" / "export",
+            interactive=False,
+        )
+
+        assert profile.site_url == "https://docs.mycompany.com"
+        assert profile.auth_mode is AuthMode.COOKIE
+        assert profile.auth.cookie_header == "tenant.session=abc"
 
     def test_global_fallback(self, tmp_path, monkeypatch):
         global_config = tmp_path / "global.json"

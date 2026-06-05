@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from confluence_export.media import (
     _VERSIONS_FILE,
+    _save_versions,
+    available_attachment_names,
     download_attachments,
     ensure_media_dir,
+    materialize_existing_attachments,
     migrate_media_dirs,
 )
+from confluence_export.paths import attachment_identity, plan_attachment_names
 from confluence_export.types import Attachment, Version
 
 
@@ -42,13 +49,25 @@ class TestEnsureMediaDir:
         assert media.exists()
         assert media.name == ".media"
 
+    def test_rejects_symlinked_media_dir(self, tmp_path):
+        page_dir = tmp_path / "page"
+        page_dir.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (page_dir / ".media").symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(ValueError, match="symlink"):
+            ensure_media_dir(page_dir)
+
 
 class TestDownloadAttachments:
     def test_skip_when_version_matches(self, tmp_path):
         media_dir = tmp_path / ".media"
         media_dir.mkdir()
         (media_dir / "img.png").write_bytes(b"x" * 100)
-        (media_dir / _VERSIONS_FILE).write_text('{"img.png": 3}')
+        (media_dir / _VERSIONS_FILE).write_text(
+            '{"img.png": {"version": 3, "id": "att1", "title": "img.png"}}'
+        )
 
         client = MagicMock()
         result = download_attachments(client, [_att(version=3)], media_dir)
@@ -88,7 +107,100 @@ class TestDownloadAttachments:
         download_attachments(client, [_att(title="new.png", version=5)], media_dir)
 
         versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
-        assert versions["new.png"] == 5
+        assert versions["new.png"]["version"] == 5
+        assert versions["new.png"]["id"] == "att1"
+
+    def test_download_uses_umask_mode_for_new_file(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = (
+            lambda _path, dest: Path(dest).write_bytes(b"new")
+        )
+        old_umask = os.umask(0o027)
+        try:
+            download_attachments(client, [_att(title="new.png", version=1)], media_dir)
+        finally:
+            os.umask(old_umask)
+
+        assert (media_dir / "new.png").stat().st_mode & 0o777 == 0o640
+
+    def test_download_preserves_existing_file_mode_on_replace(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        target = media_dir / "img.png"
+        target.write_bytes(b"old")
+        target.chmod(0o640)
+        (media_dir / _VERSIONS_FILE).write_text(
+            '{"img.png": {"version": 1, "id": "att1", "title": "img.png"}}'
+        )
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = (
+            lambda _path, dest: Path(dest).write_bytes(b"new")
+        )
+
+        download_attachments(client, [_att(title="img.png", version=2)], media_dir)
+
+        assert target.read_bytes() == b"new"
+        assert target.stat().st_mode & 0o777 == 0o640
+
+    def test_download_computes_default_mode_once_before_worker_pool(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        attachments = [
+            _att(title="a.png", att_id="a", version=1),
+            _att(title="b.png", att_id="b", version=1),
+        ]
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = (
+            lambda _path, dest: Path(dest).write_bytes(b"new")
+        )
+
+        with patch("confluence_export.media.default_file_mode", return_value=0o640) as mode:
+            download_attachments(client, attachments, media_dir)
+
+        mode.assert_called_once()
+        assert (media_dir / "a.png").stat().st_mode & 0o777 == 0o640
+        assert (media_dir / "b.png").stat().st_mode & 0o777 == 0o640
+
+    def test_save_versions_uses_umask_mode_for_new_manifest(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        old_umask = os.umask(0o027)
+        try:
+            _save_versions(media_dir, {"img.png": {"version": 1}})
+        finally:
+            os.umask(old_umask)
+
+        assert (media_dir / _VERSIONS_FILE).stat().st_mode & 0o777 == 0o640
+
+    def test_save_versions_preserves_existing_manifest_mode(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        manifest = media_dir / _VERSIONS_FILE
+        manifest.write_text("{}")
+        manifest.chmod(0o640)
+
+        _save_versions(media_dir, {"img.png": {"version": 1}})
+
+        assert manifest.stat().st_mode & 0o777 == 0o640
+
+    def test_save_versions_is_atomic_on_dump_failure(self, tmp_path, monkeypatch):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        manifest = media_dir / _VERSIONS_FILE
+        manifest.write_text('{"img.png": 1}')
+
+        def fail_dump(_versions, file_obj, **_kwargs):
+            file_obj.write('{"partial"')
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr("confluence_export.media.json.dump", fail_dump)
+
+        with pytest.raises(RuntimeError):
+            _save_versions(media_dir, {"img.png": 2})
+
+        assert manifest.read_text() == '{"img.png": 1}'
 
     def test_downloads_new(self, tmp_path):
         media_dir = tmp_path / ".media"
@@ -99,6 +211,75 @@ class TestDownloadAttachments:
 
         assert len(_attachment_paths(result)) == 1
         client.download_attachment_to_file.assert_called_once()
+
+    def test_sanitized_name_collisions_get_unique_destinations(self, tmp_path):
+        """Different raw titles can sanitize to the same component; downloads must
+        not race onto one path or collapse one attachment in the manifest."""
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        attachments = [
+            _att(title="a/b.png", att_id="att1"),
+            _att(title="a-b.png", att_id="att2"),
+        ]
+        client = MagicMock()
+
+        result = download_attachments(client, attachments, media_dir)
+
+        paths = _attachment_paths(result)
+        assert len(paths) == 2
+        assert len({p.name for p in paths}) == 2
+        destinations = [Path(call.args[1]) for call in client.download_attachment_to_file.call_args_list]
+        assert len({p.name for p in destinations}) == 2
+
+    def test_collision_with_legacy_manifest_redownloads_same_version(self, tmp_path):
+        """A filename-only legacy manifest cannot prove which colliding
+        attachment owns the bytes, so same-version collisions must download."""
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "a-b.png").write_bytes(b"old")
+        (media_dir / _VERSIONS_FILE).write_text('{"a-b.png": 1}')
+        attachments = [
+            _att(title="a/b.png", att_id="att1", version=1),
+            _att(title="a-b.png", att_id="att2", version=1),
+        ]
+        client = MagicMock()
+
+        download_attachments(client, attachments, media_dir)
+
+        assert client.download_attachment_to_file.call_count == 2
+
+    def test_legacy_manifest_with_id_redownloads_before_claiming_owner(self, tmp_path):
+        """A legacy integer manifest proves only the title/version, not the
+        attachment id. Redownload once before writing owner metadata."""
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "img.png").write_bytes(b"old")
+        (media_dir / _VERSIONS_FILE).write_text('{"img.png": 3}')
+        client = MagicMock()
+
+        download_attachments(client, [_att(version=3)], media_dir)
+
+        client.download_attachment_to_file.assert_called_once()
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert versions["img.png"]["version"] == 3
+        assert versions["img.png"]["id"] == "att1"
+
+    def test_casefold_collision_with_legacy_manifest_redownloads(self, tmp_path):
+        """The planner treats case-only names as colliding for cross-platform
+        stability, so a legacy manifest cannot prove ownership there either."""
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "Report.pdf").write_bytes(b"old")
+        (media_dir / _VERSIONS_FILE).write_text('{"Report.pdf": 1}')
+        attachments = [
+            _att(title="Report.pdf", att_id="att1", version=1),
+            _att(title="report.pdf", att_id="att2", version=1),
+        ]
+        client = MagicMock()
+
+        download_attachments(client, attachments, media_dir)
+
+        assert client.download_attachment_to_file.call_count == 2
 
     def test_includes_manifest_in_result(self, tmp_path):
         media_dir = tmp_path / ".media"
@@ -132,6 +313,503 @@ class TestDownloadAttachments:
         assert len(_attachment_paths(result)) == 0
         assert "failed to download" in capsys.readouterr().err
 
+    def test_failed_redownload_does_not_advance_manifest(self, tmp_path):
+        """A failed version bump leaves old bytes on disk, so the manifest must
+        keep the old version and retry on the next run."""
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "img.png").write_bytes(b"old")
+        (media_dir / _VERSIONS_FILE).write_text('{"img.png": 1}')
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = Exception("network error")
+
+        download_attachments(client, [_att(version=2)], media_dir)
+
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert versions["img.png"] == 1
+
+    def test_failed_redownload_returns_existing_file_to_protect_from_prune(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "img.png").write_bytes(b"old")
+        (media_dir / _VERSIONS_FILE).write_text(
+            '{"img.png": {"version": 1, "id": "att1", "title": "img.png"}}'
+        )
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = Exception("network error")
+
+        result = download_attachments(client, [_att(version=2)], media_dir)
+
+        assert media_dir / "img.png" in _attachment_paths(result)
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert versions["img.png"]["version"] == 1
+
+    def test_failed_redownload_does_not_corrupt_existing_file(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        dest = media_dir / "img.png"
+        dest.write_bytes(b"old-good")
+        (media_dir / _VERSIONS_FILE).write_text(
+            '{"img.png": {"version": 1, "id": "att1", "title": "img.png"}}'
+        )
+        client = MagicMock()
+
+        def partial_write_then_fail(_download_path, output_path):
+            Path(output_path).write_bytes(b"partial")
+            raise Exception("network error")
+
+        client.download_attachment_to_file.side_effect = partial_write_then_fail
+
+        result = download_attachments(client, [_att(version=2)], media_dir)
+
+        assert dest in _attachment_paths(result)
+        assert dest.read_bytes() == b"old-good"
+
+    def test_atomic_download_handles_long_attachment_names(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        title = "a" * 240 + ".png"
+        client = MagicMock()
+
+        result = download_attachments(client, [_att(title=title, att_id="long")], media_dir)
+
+        assert media_dir / title in _attachment_paths(result)
+        client.download_attachment_to_file.assert_called_once()
+
+    def test_legacy_failed_redownload_preserves_existing_file_without_owner_upgrade(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        dest = media_dir / "img.png"
+        dest.write_bytes(b"old-good")
+        (media_dir / _VERSIONS_FILE).write_text('{"img.png": 1}')
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = Exception("network error")
+
+        result = download_attachments(client, [_att(version=2)], media_dir)
+
+        assert dest in _attachment_paths(result)
+        assert dest.read_bytes() == b"old-good"
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert versions["img.png"] == 1
+
+    def test_forced_failed_redownload_preserves_existing_manifest(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        dest = media_dir / "img.png"
+        dest.write_bytes(b"old-good")
+        (media_dir / _VERSIONS_FILE).write_text(
+            '{"img.png": {"version": 1, "id": "att1", "title": "img.png"}}'
+        )
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = Exception("network error")
+
+        result = download_attachments(client, [_att(version=2)], media_dir, skip_existing=False)
+
+        assert dest in _attachment_paths(result)
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert versions["img.png"]["version"] == 1
+        assert versions["img.png"]["id"] == "att1"
+
+    def test_no_id_collision_manifest_skips_existing_files(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        attachments = [
+            _att(title="same.png", att_id="", version=1, download_link="/wiki/a"),
+            _att(title="same.png", att_id="", version=1, download_link="/wiki/b"),
+        ]
+        name_plan = plan_attachment_names(attachments)
+        versions = {}
+        for att in attachments:
+            name = name_plan.for_attachment(att)
+            (media_dir / name).write_bytes(b"old")
+            versions[name] = {
+                "version": 1,
+                "id": "",
+                "title": att.title,
+                "key": attachment_identity(att),
+            }
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps(versions))
+        client = MagicMock()
+
+        result = download_attachments(client, attachments, media_dir)
+
+        assert set(_attachment_paths(result)) == {
+            media_dir / name_plan.for_attachment(att) for att in attachments
+        }
+        client.download_attachment_to_file.assert_not_called()
+
+    def test_no_id_structured_manifest_key_mismatch_redownloads(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "same.png").write_bytes(b"old")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "same.png": {
+                "version": 1,
+                "id": "",
+                "title": "same.png",
+                "key": "different",
+            }
+        }))
+        client = MagicMock()
+
+        download_attachments(
+            client,
+            [_att(title="same.png", att_id="", version=1, download_link="/wiki/a")],
+            media_dir,
+        )
+
+        client.download_attachment_to_file.assert_called_once()
+
+    def test_no_id_collision_failed_redownload_preserves_keyed_file(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        attachments = [
+            _att(title="same.png", att_id="", version=2, download_link="/wiki/a"),
+            _att(title="same.png", att_id="", version=2, download_link="/wiki/b"),
+        ]
+        name_plan = plan_attachment_names(attachments)
+        versions = {}
+        for att in attachments:
+            name = name_plan.for_attachment(att)
+            (media_dir / name).write_bytes(b"old")
+            versions[name] = {
+                "version": 1,
+                "id": "",
+                "title": att.title,
+                "key": attachment_identity(att),
+            }
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps(versions))
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = Exception("network error")
+
+        result = download_attachments(client, attachments, media_dir)
+
+        assert set(_attachment_paths(result)) == {
+            media_dir / name_plan.for_attachment(att) for att in attachments
+        }
+
+    def test_no_id_rename_preserves_by_stable_key(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        current = _att(title="new.png", att_id="", version=2, download_link="/wiki/a")
+        old_name = "old.png"
+        new_name = plan_attachment_names([current]).for_attachment(current)
+        (media_dir / old_name).write_bytes(b"old-good")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            old_name: {
+                "version": 1,
+                "id": "",
+                "title": "old.png",
+                "key": attachment_identity(current),
+            }
+        }))
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = Exception("network error")
+
+        result = download_attachments(client, [current], media_dir)
+
+        assert media_dir / new_name in _attachment_paths(result)
+        assert (media_dir / new_name).read_bytes() == b"old-good"
+
+    def test_failed_redownload_copies_last_good_file_when_plan_name_changes(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        moved = _att(title="a/b.png", att_id="att1", version=2)
+        new_collision = _att(title="a-b.png", att_id="att2", version=1, download_link="")
+        name_plan = plan_attachment_names([moved, new_collision])
+        old_name = "a-b.png"
+        new_name = name_plan.for_attachment(moved)
+        assert new_name != old_name
+        (media_dir / old_name).write_bytes(b"old-good")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            old_name: {
+                "version": 1,
+                "id": "att1",
+                "title": moved.title,
+                "key": attachment_identity(moved),
+            }
+        }))
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = Exception("network error")
+
+        result = download_attachments(client, [moved, new_collision], media_dir)
+
+        assert media_dir / new_name in _attachment_paths(result)
+        assert (media_dir / new_name).read_bytes() == b"old-good"
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert versions[new_name]["id"] == "att1"
+        assert versions[new_name]["version"] == 1
+
+    def test_failed_redownload_preserves_swapped_last_good_files(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        a_now_b = _att(title="b.png", att_id="att1", version=2)
+        b_now_a = _att(title="a.png", att_id="att2", version=2)
+        (media_dir / "a.png").write_bytes(b"att1-last-good")
+        (media_dir / "b.png").write_bytes(b"att2-last-good")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "a.png": {
+                "version": 1,
+                "id": "att1",
+                "title": "a.png",
+                "key": attachment_identity(a_now_b),
+            },
+            "b.png": {
+                "version": 1,
+                "id": "att2",
+                "title": "b.png",
+                "key": attachment_identity(b_now_a),
+            },
+        }))
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = Exception("network error")
+
+        result = download_attachments(client, [a_now_b, b_now_a], media_dir)
+
+        assert set(_attachment_paths(result)) == {
+            media_dir / "a.png",
+            media_dir / "b.png",
+        }
+        assert (media_dir / "a.png").read_bytes() == b"att2-last-good"
+        assert (media_dir / "b.png").read_bytes() == b"att1-last-good"
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert versions["a.png"]["id"] == "att2"
+        assert versions["b.png"]["id"] == "att1"
+
+    def test_failed_redownload_does_not_return_snapshot_when_destination_is_directory(
+        self, tmp_path
+    ):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        moved = _att(title="new.png", att_id="att1", version=2)
+        old_name = "old.png"
+        (media_dir / old_name).write_bytes(b"last-good")
+        (media_dir / "new.png").mkdir()
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            old_name: {
+                "version": 1,
+                "id": "att1",
+                "title": "old.png",
+                "key": attachment_identity(moved),
+            }
+        }))
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = Exception("network error")
+
+        result = download_attachments(client, [moved], media_dir)
+
+        assert _attachment_paths(result) == []
+        assert (media_dir / old_name).read_bytes() == b"last-good"
+
+    def test_no_link_owner_manifest_directory_is_not_returned(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "img.png").mkdir()
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "img.png": {"version": 1, "id": "att1", "title": "img.png"}
+        }))
+        client = MagicMock()
+
+        result = download_attachments(
+            client,
+            [_att(title="img.png", version=2, download_link="")],
+            media_dir,
+        )
+
+        assert _attachment_paths(result) == []
+
+    def test_failed_redownload_replaces_unmanifested_destination_when_owned_old_exists(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        moved = _att(title="new.png", att_id="att1", version=2)
+        old_name = "old.png"
+        new_name = plan_attachment_names([moved]).for_attachment(moved)
+        (media_dir / old_name).write_bytes(b"last-good")
+        (media_dir / new_name).write_bytes(b"stray")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            old_name: {
+                "version": 1,
+                "id": "att1",
+                "title": "old.png",
+                "key": attachment_identity(moved),
+            }
+        }))
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = Exception("network error")
+
+        result = download_attachments(client, [moved], media_dir)
+
+        assert media_dir / new_name in _attachment_paths(result)
+        assert (media_dir / old_name).read_bytes() == b"last-good"
+        assert (media_dir / new_name).read_bytes() == b"last-good"
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert versions[new_name]["id"] == "att1"
+
+    def test_failed_redownload_ignores_symlinked_old_manifest_entry(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        outside = tmp_path / "secret.txt"
+        outside.write_text("secret")
+        (media_dir / "old.png").symlink_to(outside)
+        moved = _att(title="new.png", att_id="att1", version=2)
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "old.png": {
+                "version": 1,
+                "id": "att1",
+                "title": "old.png",
+                "key": attachment_identity(moved),
+            }
+        }))
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = Exception("network error")
+
+        result = download_attachments(client, [moved], media_dir)
+
+        assert media_dir / "new.png" not in _attachment_paths(result)
+        assert not (media_dir / "new.png").exists()
+        assert outside.read_text() == "secret"
+
+    def test_no_link_attachment_returns_existing_file_when_owner_matches(self, tmp_path, capsys):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "img.png").write_bytes(b"old")
+        (media_dir / _VERSIONS_FILE).write_text(
+            '{"img.png": {"version": 3, "id": "att1", "title": "img.png"}}'
+        )
+        client = MagicMock()
+
+        result = download_attachments(client, [_att(version=4, download_link="")], media_dir)
+
+        assert media_dir / "img.png" in _attachment_paths(result)
+        assert "no download link" in capsys.readouterr().err
+        client.download_attachment_to_file.assert_not_called()
+
+    def test_no_link_unmanifested_exact_file_is_returned_to_protect_prune(
+        self, tmp_path
+    ):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "img.png").write_bytes(b"present")
+        client = MagicMock()
+
+        result = download_attachments(client, [_att(download_link="")], media_dir)
+
+        assert media_dir / "img.png" in _attachment_paths(result)
+
+    @pytest.mark.parametrize("old_name", [".hidden.png", "-dash.png"])
+    def test_no_link_legacy_unsafe_manifest_name_copied_to_safe_name(
+        self, tmp_path, old_name
+    ):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        current = _att(title=old_name, att_id="att1", version=1, download_link="")
+        new_name = plan_attachment_names([current]).for_attachment(current)
+        assert new_name != old_name
+        (media_dir / old_name).write_bytes(b"last-good")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            old_name: {
+                "version": 1,
+                "id": "att1",
+                "title": old_name,
+                "key": attachment_identity(current),
+            }
+        }))
+        client = MagicMock()
+
+        result = download_attachments(client, [current], media_dir)
+
+        assert media_dir / new_name in _attachment_paths(result)
+        assert (media_dir / new_name).read_bytes() == b"last-good"
+
+    @pytest.mark.parametrize("old_name", [".hidden.png", "-dash.png"])
+    def test_no_link_legacy_unsafe_integer_manifest_name_copied_to_safe_name(
+        self, tmp_path, old_name
+    ):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        current = _att(title=old_name, att_id="att1", version=1, download_link="")
+        new_name = plan_attachment_names([current]).for_attachment(current)
+        assert new_name != old_name
+        (media_dir / old_name).write_bytes(b"last-good")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({old_name: 1}))
+        client = MagicMock()
+
+        result = download_attachments(client, [current], media_dir)
+
+        assert media_dir / new_name in _attachment_paths(result)
+        assert (media_dir / new_name).read_bytes() == b"last-good"
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert versions[new_name] == 1
+
+    def test_case_only_owned_file_kept_without_unlink_before_download(
+        self, tmp_path, monkeypatch
+    ):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        old_name = "Report.pdf"
+        new_name = "report.pdf"
+        old_path = media_dir / old_name
+        dest = media_dir / new_name
+        old_path.write_bytes(b"old-good")
+        try:
+            os.link(old_path, dest)
+        except FileExistsError:
+            pass
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            old_name: {"version": 1, "id": "att1", "title": old_name}
+        }))
+        current = _att(
+            title=new_name,
+            att_id="att1",
+            version=1,
+            download_link="",
+        )
+        real_unlink = Path.unlink
+
+        def fail_if_dest_unlinked(path, *args, **kwargs):
+            if path == dest:
+                raise AssertionError("case-only destination was unlinked")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_if_dest_unlinked)
+        client = MagicMock()
+
+        result = download_attachments(client, [current], media_dir)
+
+        assert dest in _attachment_paths(result)
+        assert dest.read_bytes() == b"old-good"
+        client.download_attachment_to_file.assert_not_called()
+
+    def test_failed_download_unmanifested_exact_file_is_returned_to_protect_prune(
+        self, tmp_path
+    ):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "img.png").write_bytes(b"present")
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = Exception("network error")
+
+        result = download_attachments(client, [_att(version=2)], media_dir)
+
+        assert media_dir / "img.png" in _attachment_paths(result)
+
+    def test_legacy_no_link_attachment_preserves_non_colliding_file(self, tmp_path):
+        """When there is no download link, a non-colliding legacy entry is the
+        only last-good copy we can preserve."""
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "a-b.png").write_bytes(b"old")
+        (media_dir / _VERSIONS_FILE).write_text('{"a-b.png": 1}')
+        client = MagicMock()
+
+        result = download_attachments(
+            client,
+            [_att(title="a-b.png", att_id="att2", version=1, download_link="")],
+            media_dir,
+        )
+
+        assert media_dir / "a-b.png" in _attachment_paths(result)
+
     def test_uses_v1_content_attachment_endpoint(self, tmp_path):
         """The download path is built from page_id + att_id, ignoring the
         legacy `_links.download` URL — the v1 REST endpoint works on both
@@ -163,6 +841,257 @@ class TestDownloadAttachments:
         download_attachments(client, [att], media_dir)
         path = client.download_attachment_to_file.call_args[0][0]
         assert path.startswith("/wiki/download/attachments/")
+
+    def test_no_media_materialization_removes_wrong_owner_destination(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        moved = _att(title="a/b.png", att_id="att1", version=1)
+        moved.created_at = "2025-01-01"
+        current_owner = _att(title="a-b.png", att_id="att2", version=1, download_link="")
+        current_owner.created_at = "2024-01-01"
+        name_plan = plan_attachment_names([moved, current_owner])
+        old_name = "a-b.png"
+        moved_name = name_plan.for_attachment(moved)
+        assert name_plan.for_attachment(current_owner) == old_name
+        assert moved_name != old_name
+        (media_dir / old_name).write_bytes(b"att1-last-good")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            old_name: {
+                "version": 1,
+                "id": "att1",
+                "title": moved.title,
+                "key": attachment_identity(moved),
+            }
+        }))
+
+        written = materialize_existing_attachments([moved, current_owner], media_dir)
+
+        assert media_dir / moved_name in written
+        assert (media_dir / moved_name).read_bytes() == b"att1-last-good"
+        assert not (media_dir / old_name).exists()
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert moved_name in versions
+        assert old_name not in versions
+
+    def test_no_media_materialization_preserves_swapped_last_good_files(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        a_now_b = _att(title="b.png", att_id="att1", version=2)
+        b_now_a = _att(title="a.png", att_id="att2", version=2)
+        (media_dir / "a.png").write_bytes(b"att1-last-good")
+        (media_dir / "b.png").write_bytes(b"att2-last-good")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "a.png": {
+                "version": 1,
+                "id": "att1",
+                "title": "a.png",
+                "key": attachment_identity(a_now_b),
+            },
+            "b.png": {
+                "version": 1,
+                "id": "att2",
+                "title": "b.png",
+                "key": attachment_identity(b_now_a),
+            },
+        }))
+
+        written = materialize_existing_attachments([a_now_b, b_now_a], media_dir)
+
+        assert {media_dir / "a.png", media_dir / "b.png"} <= set(written)
+        assert (media_dir / "a.png").read_bytes() == b"att2-last-good"
+        assert (media_dir / "b.png").read_bytes() == b"att1-last-good"
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert versions["a.png"]["id"] == "att2"
+        assert versions["b.png"]["id"] == "att1"
+
+    def test_no_media_materialization_replaces_unmanifested_destination_when_owned_old_exists(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        moved = _att(title="new.png", att_id="att1", version=1)
+        old_name = "old.png"
+        new_name = plan_attachment_names([moved]).for_attachment(moved)
+        (media_dir / old_name).write_bytes(b"last-good")
+        (media_dir / new_name).write_bytes(b"stray")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            old_name: {
+                "version": 1,
+                "id": "att1",
+                "title": "old.png",
+                "key": attachment_identity(moved),
+            }
+        }))
+
+        written = materialize_existing_attachments([moved], media_dir)
+
+        assert media_dir / new_name in written
+        assert (media_dir / old_name).read_bytes() == b"last-good"
+        assert (media_dir / new_name).read_bytes() == b"last-good"
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert versions[new_name]["id"] == "att1"
+
+    def test_no_media_case_only_owned_file_kept_without_unlink(
+        self, tmp_path, monkeypatch
+    ):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        old_name = "Report.pdf"
+        new_name = "report.pdf"
+        old_path = media_dir / old_name
+        dest = media_dir / new_name
+        old_path.write_bytes(b"old-good")
+        try:
+            os.link(old_path, dest)
+        except FileExistsError:
+            pass
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            old_name: {"version": 1, "id": "att1", "title": old_name}
+        }))
+        moved = _att(title=new_name, att_id="att1", version=1)
+        real_unlink = Path.unlink
+
+        def fail_if_dest_unlinked(path, *args, **kwargs):
+            if path == dest:
+                raise AssertionError("case-only destination was unlinked")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_if_dest_unlinked)
+
+        written = materialize_existing_attachments([moved], media_dir)
+
+        assert dest in written
+        assert dest.read_bytes() == b"old-good"
+
+    def test_no_media_materialization_does_not_return_manifest_directory(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "img.png").mkdir()
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "img.png": {"version": 1, "id": "att1", "title": "img.png"}
+        }))
+
+        written = materialize_existing_attachments(
+            [_att(att_id="att1", version=1)],
+            media_dir,
+        )
+
+        assert media_dir / "img.png" not in written
+
+    def test_available_names_rejects_unmanifested_when_owned_old_exists(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        moved = _att(title="new.png", att_id="att1", version=1)
+        (media_dir / "old.png").write_bytes(b"last-good")
+        (media_dir / "new.png").write_bytes(b"stray")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "old.png": {
+                "version": 1,
+                "id": "att1",
+                "title": "old.png",
+                "key": attachment_identity(moved),
+            }
+        }))
+
+        available = available_attachment_names([moved], media_dir)
+
+        assert "new.png" not in available
+
+    def test_available_names_rejects_manifest_directory(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "img.png").mkdir()
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "img.png": {"version": 1, "id": "att1", "title": "img.png"}
+        }))
+
+        available = available_attachment_names([_att(att_id="att1", version=1)], media_dir)
+
+        assert "img.png" not in available
+
+    def test_no_media_materialization_replaces_wrong_owner_destination(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        moved = _att(title="new.png", att_id="att1", version=1)
+        old_name = "old.png"
+        new_name = plan_attachment_names([moved]).for_attachment(moved)
+        (media_dir / old_name).write_bytes(b"last-good")
+        (media_dir / new_name).write_bytes(b"wrong-owner")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            old_name: {
+                "version": 1,
+                "id": "att1",
+                "title": "old.png",
+                "key": attachment_identity(moved),
+            },
+            new_name: {
+                "version": 1,
+                "id": "other",
+                "title": "new.png",
+                "key": "other-id",
+            },
+        }))
+
+        written = materialize_existing_attachments([moved], media_dir)
+
+        assert media_dir / new_name in written
+        assert (media_dir / new_name).read_bytes() == b"last-good"
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert versions[new_name]["id"] == "att1"
+
+    def test_no_media_materialization_preserves_unrelated_manifest_entries(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        current = _att(title="current.png", att_id="current", version=1)
+        (media_dir / "current.png").write_bytes(b"current")
+        (media_dir / "other.png").write_bytes(b"other")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "current.png": {"version": 1, "id": "current", "title": "current.png"},
+            "other.png": {"version": 1, "id": "other", "title": "other.png"},
+        }))
+
+        materialize_existing_attachments([current], media_dir)
+
+        assert (media_dir / "other.png").read_bytes() == b"other"
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert "other.png" in versions
+
+    def test_no_media_materialization_ignores_symlinked_old_manifest_entry(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        outside = tmp_path / "secret.txt"
+        outside.write_text("secret")
+        (media_dir / "old.png").symlink_to(outside)
+        moved = _att(title="new.png", att_id="att1", version=1)
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "old.png": {
+                "version": 1,
+                "id": "att1",
+                "title": "old.png",
+                "key": attachment_identity(moved),
+            }
+        }))
+
+        written = materialize_existing_attachments([moved], media_dir)
+
+        assert media_dir / "new.png" not in written
+        assert not (media_dir / "new.png").exists()
+
+    def test_no_media_materialization_ignores_overlong_manifest_entry(self, tmp_path):
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        moved = _att(title="new.png", att_id="att1", version=1)
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            ("x" * 300) + ".png": {
+                "version": 1,
+                "id": "att1",
+                "title": "old.png",
+                "key": attachment_identity(moved),
+            }
+        }))
+
+        written = materialize_existing_attachments([moved], media_dir)
+
+        assert media_dir / "new.png" not in written
+        assert not (media_dir / "new.png").exists()
 
 
 class TestMigrateMediaDirs:
@@ -266,6 +1195,20 @@ def test_load_versions_returns_empty_on_corrupt_json(tmp_path):
     from confluence_export.media import _VERSIONS_FILE, _load_versions
 
     (tmp_path / _VERSIONS_FILE).write_text("{ not valid json")
+    assert _load_versions(tmp_path) == {}
+
+
+def test_load_versions_returns_empty_on_invalid_utf8(tmp_path):
+    from confluence_export.media import _VERSIONS_FILE, _load_versions
+
+    (tmp_path / _VERSIONS_FILE).write_bytes(b"\xff\xfe{")
+    assert _load_versions(tmp_path) == {}
+
+
+def test_load_versions_returns_empty_on_non_object_json(tmp_path):
+    from confluence_export.media import _VERSIONS_FILE, _load_versions
+
+    (tmp_path / _VERSIONS_FILE).write_text("[]")
     assert _load_versions(tmp_path) == {}
 
 

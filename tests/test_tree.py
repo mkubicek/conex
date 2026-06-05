@@ -143,6 +143,23 @@ def test_build_tree_archived_orphan():
     assert any(r.page.title == "_archived" for r in roots)
 
 
+def test_build_tree_archived_child_grouped_under_archived_root():
+    pages = [
+        Page(id="1", title="Live", parent_type="space", position=0),
+        Page(
+            id="2", title="Old Child", parent_id="1", parent_type="page",
+            position=0, status="archived",
+        ),
+    ]
+
+    roots = build_tree(pages)
+
+    live = next(r for r in roots if r.page.id == "1")
+    assert live.children == []
+    archived = next(r for r in roots if r.page.id == "__archived__")
+    assert [child.page.id for child in archived.children] == ["2"]
+
+
 def test_page_path_unknown_id(sample_pages):
     assert page_path(sample_pages, "999") == "/"
 

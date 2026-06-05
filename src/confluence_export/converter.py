@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 from markdownify import markdownify as md
 
 from confluence_export.media import MEDIA_DIR_NAME
+from confluence_export.paths import AttachmentNamePlan, plan_attachment_names, safe_attachment_name
 
 from typing import Callable
 
@@ -18,6 +19,15 @@ from confluence_export.types import Attachment, Page
 
 # Optional callback: account_id -> {"displayName": ..., "email": ...} or None
 UserResolver = Callable[[str], dict | None] | None
+
+
+def _markdown_media_url(name: str) -> str:
+    return f"{MEDIA_DIR_NAME}/{urllib.parse.quote(name, safe='')}"
+
+
+def _markdown_label(text: str) -> str:
+    return re.sub(r"[\[\]()\r\n]", "", str(text))
+
 
 # Confluence emoticon name -> Unicode emoji
 _EMOTICON_MAP = {
@@ -78,6 +88,7 @@ def convert_page(
     user_resolver: UserResolver = None,
     rendered: dict[str, Path] | None = None,
     media_downloaded: bool = True,
+    available_media: set[str] | None = None,
 ) -> str:
     """Convert a Confluence page to markdown with YAML frontmatter.
 
@@ -90,7 +101,7 @@ def convert_page(
     # Pre-process Confluence-specific HTML
     html = _preprocess_html(
         html, attachments or [], user_resolver=user_resolver, rendered=rendered or {},
-        media_downloaded=media_downloaded,
+        media_downloaded=media_downloaded, available_media=available_media,
     )
 
     # Convert to markdown using markdownify
@@ -136,6 +147,8 @@ def _build_frontmatter(
         "last_modified": page.version.created_at,
         "version": page.version.number,
     }
+    if page.status == "archived":
+        meta["status"] = "archived"
 
     if attachments:
         meta["attachments"] = [
@@ -182,6 +195,7 @@ def _preprocess_html(
     user_resolver: UserResolver = None,
     rendered: dict[str, Path] | None = None,
     media_downloaded: bool = True,
+    available_media: set[str] | None = None,
 ) -> str:
     """Pre-process Confluence storage HTML before markdownify."""
     soup = BeautifulSoup(html, "html.parser")
@@ -189,6 +203,7 @@ def _preprocess_html(
 
     # Build attachment lookup
     attach_map = {a.title: a for a in attachments}
+    name_plan = plan_attachment_names(attachments)
 
     # --- ADF (Atlassian Document Format) elements ---
     # Remove adf-fallback (duplicate of adf-content) and adf-attribute (metadata
@@ -299,11 +314,11 @@ def _preprocess_html(
 
     # --- ac:image ---
     for img_tag in list(soup.find_all("ac:image")):
-        _replace_ac_image(soup, img_tag, attach_map)
+        _replace_ac_image(soup, img_tag, name_plan, available_media)
 
     # --- ac:link (attachment and page links) ---
     for link_tag in list(soup.find_all("ac:link")):
-        _replace_ac_link(soup, link_tag, attach_map)
+        _replace_ac_link(soup, link_tag, name_plan, available_media)
 
     # --- Structured macros ---
     for macro in list(soup.find_all("ac:structured-macro")):
@@ -319,7 +334,8 @@ def _preprocess_html(
             _convert_code_block(soup, macro)
         elif macro_name in ("drawio", "inc-drawio"):
             _convert_drawio_placeholder(
-                soup, macro, rendered, attach_map, media_downloaded=media_downloaded
+                soup, macro, rendered, attach_map, name_plan,
+                media_downloaded=media_downloaded, available_media=available_media,
             )
         elif macro_name == "profile":
             _convert_profile(soup, macro, user_resolver)
@@ -340,7 +356,7 @@ def _preprocess_html(
         elif macro_name == "jira":
             _convert_jira(soup, macro)
         elif macro_name == "view-file":
-            _convert_view_file(soup, macro)
+            _convert_view_file(soup, macro, name_plan, available_media)
         elif macro_name in ("excerpt", "section", "column"):
             # Pure layout/wrapper — keep body, drop wrapper, no placeholder
             body = macro.find("ac:rich-text-body")
@@ -374,13 +390,36 @@ def _preprocess_html(
     return str(soup)
 
 
-def _replace_ac_image(soup: BeautifulSoup, tag: Tag, attach_map: dict[str, Attachment]) -> None:
+def _media_is_available(local_name: str, available_media: set[str] | None) -> bool:
+    return available_media is None or local_name in available_media
+
+
+def _missing_attachment_node(soup: BeautifulSoup, label: str) -> Tag:
+    span = soup.new_tag("span")
+    span.string = f"Missing attachment: {_markdown_label(label)}"
+    return span
+
+
+def _replace_ac_image(
+    soup: BeautifulSoup,
+    tag: Tag,
+    name_plan: AttachmentNamePlan,
+    available_media: set[str] | None,
+) -> None:
     """Replace <ac:image><ri:attachment ri:filename="..."/></ac:image> with <img>."""
     ri = tag.find("ri:attachment")
     if ri:
         filename = ri.get("ri:filename", "")
         if filename:
-            img = soup.new_tag("img", src=f"{MEDIA_DIR_NAME}/{filename}", alt=filename)
+            local_name = _attachment_local_name(ri, name_plan, filename)
+            if not _media_is_available(local_name, available_media):
+                tag.replace_with(_missing_attachment_node(soup, filename))
+                return
+            img = soup.new_tag(
+                "img",
+                src=_markdown_media_url(local_name),
+                alt=_markdown_label(filename),
+            )
             tag.replace_with(img)
             return
     # Fallback: external image URL
@@ -394,7 +433,12 @@ def _replace_ac_image(soup: BeautifulSoup, tag: Tag, attach_map: dict[str, Attac
     tag.decompose()
 
 
-def _replace_ac_link(soup: BeautifulSoup, tag: Tag, attach_map: dict[str, Attachment]) -> None:
+def _replace_ac_link(
+    soup: BeautifulSoup,
+    tag: Tag,
+    name_plan: AttachmentNamePlan,
+    available_media: set[str] | None,
+) -> None:
     """Replace <ac:link> attachment references with <a> tags."""
     ri = tag.find("ri:attachment")
     if ri:
@@ -402,8 +446,12 @@ def _replace_ac_link(soup: BeautifulSoup, tag: Tag, attach_map: dict[str, Attach
         label_tag = tag.find("ac:plain-text-link-body") or tag.find("ac:link-body")
         label = label_tag.get_text().strip() if label_tag else filename
         if filename:
-            a = soup.new_tag("a", href=f"{MEDIA_DIR_NAME}/{filename}")
-            a.string = label or filename
+            local_name = _attachment_local_name(ri, name_plan, filename)
+            if not _media_is_available(local_name, available_media):
+                tag.replace_with(_missing_attachment_node(soup, label or filename))
+                return
+            a = soup.new_tag("a", href=_markdown_media_url(local_name))
+            a.string = _markdown_label(label or filename)
             tag.replace_with(a)
             return
 
@@ -556,7 +604,12 @@ def _convert_jira(soup: BeautifulSoup, macro: Tag) -> None:
         macro.decompose()
 
 
-def _convert_view_file(soup: BeautifulSoup, macro: Tag) -> None:
+def _convert_view_file(
+    soup: BeautifulSoup,
+    macro: Tag,
+    name_plan: AttachmentNamePlan,
+    available_media: set[str] | None,
+) -> None:
     """Convert view-file macro to a link to the attachment."""
     name_param = macro.find("ac:parameter", attrs={"ac:name": "name"})
     ri = macro.find("ri:attachment")
@@ -567,8 +620,12 @@ def _convert_view_file(soup: BeautifulSoup, macro: Tag) -> None:
         filename = name_param.get_text().strip()
 
     if filename:
-        a = soup.new_tag("a", href=f"{MEDIA_DIR_NAME}/{filename}")
-        a.string = filename
+        local_name = _attachment_local_name(ri, name_plan, filename)
+        if not _media_is_available(local_name, available_media):
+            macro.replace_with(_missing_attachment_node(soup, filename))
+            return
+        a = soup.new_tag("a", href=_markdown_media_url(local_name))
+        a.string = _markdown_label(filename)
         macro.replace_with(a)
     else:
         macro.decompose()
@@ -581,10 +638,23 @@ def _match_drawio_attachment(
 
     Tolerant of the ``.drawio`` extension and case/whitespace differences between
     the macro's diagramName and the on-disk attachment title (F6/F7)."""
+    def _is_drawio(att: Attachment) -> bool:
+        title = att.title.casefold()
+        media_type = att.media_type.casefold()
+        return (
+            title.endswith(".drawio")
+            or media_type == "application/x-drawio"
+            or "drawio" in media_type
+        )
+
+    drawio_map = {
+        title: att for title, att in attach_map.items()
+        if _is_drawio(att)
+    }
     bare = diagram_name.removesuffix(".drawio")
     for title in (diagram_name, f"{bare}.drawio", bare):
-        if title in attach_map:
-            return attach_map[title]
+        if title in drawio_map:
+            return drawio_map[title]
 
     def _norm(s: str) -> str:
         # Casefold BEFORE stripping the extension so an upper/mixed-case
@@ -592,10 +662,30 @@ def _match_drawio_attachment(
         return re.sub(r"\s+", " ", s.strip()).casefold().removesuffix(".drawio")
 
     target = _norm(diagram_name)
-    for title, att in attach_map.items():
+    for title, att in drawio_map.items():
         if _norm(title) == target:
             return att
     return None
+
+
+def _attachment_local_name(
+    ri: Tag | None,
+    name_plan: AttachmentNamePlan,
+    filename: str,
+) -> str:
+    attachment_id = ""
+    if ri is not None:
+        for attr in (
+            "ri:content-id",
+            "ri:contentId",
+            "ri:attachment-id",
+            "ri:attachmentId",
+            "ri:id",
+        ):
+            attachment_id = str(ri.get(attr, "") or "")
+            if attachment_id:
+                break
+    return name_plan.for_reference(filename, attachment_id or None)
 
 
 def _convert_drawio_placeholder(
@@ -603,8 +693,10 @@ def _convert_drawio_placeholder(
     macro: Tag,
     rendered: dict[str, Path],
     attach_map: dict[str, Attachment],
+    name_plan: AttachmentNamePlan,
     *,
     media_downloaded: bool = True,
+    available_media: set[str] | None = None,
 ) -> None:
     """Replace a drawio/inc-drawio macro with its rendered PNG (image + source
     link), or a graceful "not rendered" note when no PNG is available.
@@ -623,6 +715,11 @@ def _convert_drawio_placeholder(
     # the .drawio extension and case/whitespace, rather than reconstructing a name.
     matched = _match_drawio_attachment(diagram_name, attach_map)
     source_name = matched.title if matched is not None else f"{bare}.drawio"
+    source_local_name = (
+        name_plan.for_attachment(matched)
+        if matched is not None
+        else safe_attachment_name(source_name)
+    )
 
     # Rendered-PNG lookup: the exporter keys rendered[att.title]; try the matched
     # title first, then the reconstructed names (F7).
@@ -634,36 +731,33 @@ def _convert_drawio_placeholder(
             png_path = rendered[key]
             break
 
-    # F5: a source link only when the source is actually on disk — a tracked
-    # attachment AND media was downloaded this run (--no-media leaves a dead
-    # .media/<name>.drawio link otherwise).
-    source_tracked = matched is not None and media_downloaded
-
-    # diagramName is API-controlled and can contain spaces / parens / brackets.
-    # Once markdownify renders the emitted <img>/<a>, an unencoded URL with a space
-    # or `(` truncates, and a `]` in the visible text closes the image/link syntax
-    # early (broken output, and a `](javascript:…)`-style injection vector). So
-    # percent-encode the URL path and strip markdown-structural chars from labels.
-    def _label(text: str) -> str:
-        return re.sub(r"[\[\]()\r\n]", "", text)
+    # F5: a source link only when the source is actually on disk.
+    source_tracked = (
+        matched is not None
+        and (
+            source_local_name in available_media
+            if available_media is not None
+            else media_downloaded
+        )
+    )
 
     p = soup.new_tag("p")
     if png_path is not None:
         p.append(soup.new_tag(
             "img",
-            src=f"{MEDIA_DIR_NAME}/{urllib.parse.quote(png_path.name)}",
-            alt=_label(bare),
+            src=_markdown_media_url(png_path.name),
+            alt=_markdown_label(bare),
         ))
     else:
         em = soup.new_tag("em")
-        em.string = f"[Draw.io diagram not rendered: {_label(source_name)}]"
+        em.string = f"[Draw.io diagram not rendered: {_markdown_label(source_name)}]"
         p.append(em)
     if source_tracked:
         p.append(soup.new_tag("br"))
         src_em = soup.new_tag("em")
         src_em.append("Draw.io source: ")
-        link = soup.new_tag("a", href=f"{MEDIA_DIR_NAME}/{urllib.parse.quote(source_name)}")
-        link.string = _label(source_name)
+        link = soup.new_tag("a", href=_markdown_media_url(source_local_name))
+        link.string = _markdown_label(source_name)
         src_em.append(link)
         p.append(src_em)
     macro.replace_with(p)

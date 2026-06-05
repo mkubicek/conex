@@ -125,6 +125,17 @@ def test_scan_grouped_excludes_conex_and_git(tmp_path: Path):
     assert set(grouped) == {"real"}
 
 
+def test_scan_grouped_excludes_dotfile_markdown_temps(tmp_path: Path):
+    # A crash-stranded atomic-write temp must not compete with the canonical page
+    # markdown or reconcile can choose the dotfile and delete the real page copy.
+    _write_page(tmp_path, "P/P.md", "real", 1)
+    _write_page(tmp_path, "P/.P.md.stranded.md", "real", 1)
+
+    grouped = scan_export_dir_grouped(tmp_path, "TST")
+
+    assert [entry.file_path.name for entry in grouped["real"]] == ["P.md"]
+
+
 def test_scan_grouped_skips_other_space_with_warning(tmp_path: Path, capsys):
     _write_page(tmp_path, "A/A.md", "1", 1, space_key="TST")
     _write_page(tmp_path, "B/B.md", "9", 1, space_key="OTHER")

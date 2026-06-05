@@ -254,6 +254,106 @@ class TestCommitExport:
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
         assert "Page/.media/img.png" in ls, "committed media pruned on --no-media export"
 
+    def test_no_media_prunes_deleted_attachment_when_current_media_is_known(self, tmp_path):
+        """When the exporter materializes current no-media attachments, stale
+        attachments under that same page are known-deleted and should be pruned."""
+        self._init_repo(tmp_path)
+        page = tmp_path / "Page"
+        media = page / ".media"
+        media.mkdir(parents=True)
+        md = page / "Page.md"
+        kept = media / "kept.png"
+        gone = media / "gone.png"
+        md.write_text("# Page")
+        kept.write_bytes(b"kept")
+        gone.write_bytes(b"gone")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        commit_export(
+            tmp_path,
+            [md, kept],
+            "TEST",
+            is_full=True,
+            preserve_media=True,
+        )
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Page/.media/kept.png" in ls
+        assert "Page/.media/gone.png" not in ls
+
+    def test_no_media_prunes_all_media_for_empty_attachment_list(self, tmp_path):
+        """A page whose current attachment list is empty should prune stale media
+        when the exporter marks that media dir as authoritative."""
+        self._init_repo(tmp_path)
+        page = tmp_path / "Page"
+        media = page / ".media"
+        media.mkdir(parents=True)
+        md = page / "Page.md"
+        gone = media / "gone.png"
+        md.write_text("# Page")
+        gone.write_bytes(b"gone")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        commit_export(
+            tmp_path,
+            [md],
+            "TEST",
+            is_full=True,
+            preserve_media=True,
+            prune_media_dirs=[media],
+        )
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Page/Page.md" in ls
+        assert "Page/.media/gone.png" not in ls
+
+    def test_no_media_prunes_media_for_deleted_pages(self, tmp_path):
+        """--no-media preserves media only for pages still in the export plan; a
+        page deleted upstream must not leave its tracked .media subtree behind."""
+        self._init_repo(tmp_path)
+        live = tmp_path / "Live"
+        live.mkdir()
+        (live / "Live.md").write_text("# Live")
+        deleted = tmp_path / "Deleted"
+        deleted_media = deleted / ".media"
+        deleted_media.mkdir(parents=True)
+        (deleted / "Deleted.md").write_text("# Deleted")
+        (deleted_media / "img.png").write_bytes(b"\x89PNG")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        # Full --no-media export after Deleted disappeared upstream: only Live
+        # is written, so Deleted's markdown and media should both be pruned.
+        commit_export(tmp_path, [live / "Live.md"], "TEST", is_full=True, preserve_media=True)
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Live/Live.md" in ls
+        assert "Deleted/Deleted.md" not in ls
+        assert "Deleted/.media/img.png" not in ls
+
+    def test_no_media_prunes_media_for_deleted_nested_pages(self, tmp_path):
+        """A live parent must not preserve a deleted child's media just because
+        page directories are nested under the parent path."""
+        self._init_repo(tmp_path)
+        parent = tmp_path / "Parent"
+        child = parent / "DeletedChild"
+        child_media = child / ".media"
+        child_media.mkdir(parents=True)
+        (parent / "Parent.md").write_text("# Parent")
+        (child / "DeletedChild.md").write_text("# Deleted child")
+        (child_media / "img.png").write_bytes(b"\x89PNG")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        commit_export(tmp_path, [parent / "Parent.md"], "TEST", is_full=True, preserve_media=True)
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Parent/Parent.md" in ls
+        assert "Parent/DeletedChild/DeletedChild.md" not in ls
+        assert "Parent/DeletedChild/.media/img.png" not in ls
+
     def test_full_export_with_media_still_prunes_orphaned_media(self, tmp_path):
         """Counterpart: a normal full export (media downloaded) still prunes an
         attachment deleted upstream — preserve_media defaults False."""
@@ -295,6 +395,31 @@ class TestCommitExport:
 
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
         assert "P/.media/img.png" not in ls, "deleted media left tracked under --no-media"
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=tmp_path, capture_output=True, text=True
+        ).stdout
+        assert status.strip() == "", f"dirty tree after export: {status!r}"
+
+    def test_no_media_prunes_tracked_media_file_replaced_by_directory(self, tmp_path):
+        self._init_repo(tmp_path)
+        page = tmp_path / "Page"
+        media = page / ".media"
+        media.mkdir(parents=True)
+        md = page / "Page.md"
+        img = media / "img.png"
+        md.write_text("# Page")
+        img.write_bytes(b"old")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first"], cwd=tmp_path, capture_output=True)
+
+        img.unlink()
+        img.mkdir()
+        (img / "nested.txt").write_text("not media")
+
+        commit_export(tmp_path, [md], "TEST", is_full=True, preserve_media=True)
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Page/.media/img.png" not in ls
         status = subprocess.run(
             ["git", "status", "--porcelain"], cwd=tmp_path, capture_output=True, text=True
         ).stdout
@@ -352,6 +477,316 @@ class TestCommitExport:
         assert "P/P.md" in ls  # skipped page's last-good copy preserved
         assert (tmp_path / "P" / "P.md").exists()  # and still on disk
         assert "Gone/Gone.md" not in ls  # genuine upstream deletion still pruned
+
+    def test_protected_dirs_protect_page_exactly_not_child(self, tmp_path):
+        """protected_dirs is page-EXACT (e.g. an archived page whose precise target
+        is known, M1-exact): it preserves the page's own files but NOT a nested
+        child that is gone this run — the child is still reconciled by the stale
+        prune. (Skipped pages use the recursive protected_subtree_dirs instead.)"""
+        self._init_repo(tmp_path)
+        parent = tmp_path / "Parent"
+        child = parent / "Child"
+        child.mkdir(parents=True)
+        (parent / "Parent.md").write_text("# Parent")
+        (child / "Child.md").write_text("# Child")
+        live = tmp_path / "Live"
+        live.mkdir()
+        (live / "Live.md").write_text("# Live")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        (child / "Child.md").unlink()
+        # A live page IS written, so the stale prune runs; Parent is protected
+        # page-exactly (its own file kept, its absent child reconciled away).
+        commit_export(
+            tmp_path, [live / "Live.md"], "TEST",
+            is_full=True, protected_dirs=[parent],
+        )
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Parent/Parent.md" in ls
+        assert "Live/Live.md" in ls
+        assert "Parent/Child/Child.md" not in ls
+
+    def test_skipped_parent_protects_vanished_child_recursively(self, tmp_path):
+        """Fix ②: a page SKIPPED this run is protected RECURSIVELY (it flows through
+        protected_subtree_dirs). A committed child that transiently vanishes under
+        it — not written this run, not a known deletion — is preserved, not pruned;
+        page-exact protection would wrongly git-rm it (the regression vs main)."""
+        self._init_repo(tmp_path)
+        parent = tmp_path / "Parent"
+        child = parent / "Child"
+        child.mkdir(parents=True)
+        (parent / "Parent.md").write_text("# Parent last-good")
+        (child / "Child.md").write_text("# Child last-good")
+        live = tmp_path / "Live"
+        live.mkdir()
+        (live / "Live.md").write_text("# Live")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        # Live written; Parent skipped (transient) -> recursive protection; Child
+        # is absent from this run's tree (neither written nor an upstream deletion).
+        commit_export(
+            tmp_path, [live / "Live.md"], "TEST",
+            is_full=True, protected_subtree_dirs=[parent],
+        )
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Parent/Parent.md" in ls
+        assert "Parent/Child/Child.md" in ls  # child preserved recursively
+        assert "Live/Live.md" in ls
+
+    def test_writeless_full_export_prunes_nothing(self, tmp_path):
+        """Fix ① / Decision 1 at the git layer: a full export that wrote NO live
+        pages must not prune, even with a protected archived dir. A zero-live-write
+        run (a v2 space that returned its archived set but zero current pages, or a
+        transient empty response) keeps the committed live pages and heals on the
+        next successful export."""
+        self._init_repo(tmp_path)
+        live = tmp_path / "OldLive"
+        live.mkdir()
+        (live / "OldLive.md").write_text("# committed live page")
+        archived = tmp_path / "_archived" / "Arch"
+        archived.mkdir(parents=True)
+        (archived / "Arch.md").write_text("# archived")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        # Zero live pages written; only the archived dir is protected (page-exact).
+        commit_export(
+            tmp_path, [], "TEST",
+            is_full=True, protected_dirs=[archived],
+        )
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "OldLive/OldLive.md" in ls  # NOT pruned despite zero writes
+        assert "_archived/Arch/Arch.md" in ls
+
+    def test_protected_subtree_dirs_survive_prune_recursively(self, tmp_path):
+        """Preserved export subtrees, such as _archived, are intentionally
+        omitted wholesale and must be protected recursively."""
+        self._init_repo(tmp_path)
+        live = tmp_path / "Live"
+        archived = tmp_path / "_archived"
+        old = archived / "Old"
+        old.mkdir(parents=True)
+        live.mkdir()
+        (live / "Live.md").write_text("# Live")
+        (old / "Old.md").write_text("# Old archived")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        commit_export(
+            tmp_path,
+            [live / "Live.md"],
+            "TEST",
+            is_full=True,
+            protected_subtree_dirs=[archived],
+        )
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Live/Live.md" in ls
+        assert "_archived/Old/Old.md" in ls
+
+    def test_protected_subtree_deletion_restored_without_page_protection(self, tmp_path):
+        """A subtree-only protection must also restore tracked deletions so the
+        next local-changes commit cannot drop the preserved subtree."""
+        ensure_repo(tmp_path)
+        live = tmp_path / "Live"
+        archived = tmp_path / "_archived"
+        old = archived / "Old"
+        old.mkdir(parents=True)
+        live.mkdir()
+        (live / "Live.md").write_text("# Live")
+        (old / "Old.md").write_text("# Old archived")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        (old / "Old.md").unlink()
+        commit_export(
+            tmp_path,
+            [live / "Live.md"],
+            "TEST",
+            is_full=True,
+            protected_subtree_dirs=[archived],
+        )
+        commit_local_changes(tmp_path)
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "_archived/Old/Old.md" in ls
+        assert (old / "Old.md").exists()
+
+    def test_protected_subtree_restore_does_not_resurrect_conex_secret(self, tmp_path):
+        """The restore path must honor the same .conex secret boundary as
+        staging and stale-prune."""
+        ensure_repo(tmp_path)
+        archived = tmp_path / "_archived"
+        secret_dir = archived / ".conex"
+        secret_dir.mkdir(parents=True)
+        secret = secret_dir / "config.json"
+        secret.write_text('{"token":"secret"}')
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "tracked secret fixture"], cwd=tmp_path, capture_output=True)
+
+        secret.unlink()
+        commit_export(
+            tmp_path,
+            [],
+            "TEST",
+            is_full=True,
+            protected_subtree_dirs=[archived],
+        )
+
+        assert not secret.exists()
+
+    def test_protected_symlink_dir_is_not_restored_through_target(self, tmp_path):
+        import shutil
+
+        ensure_repo(tmp_path)
+        page = tmp_path / "Page"
+        page.mkdir()
+        (page / "Page.md").write_text("# last good")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+        shutil.rmtree(page)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        page.symlink_to(outside, target_is_directory=True)
+
+        commit_export(
+            tmp_path,
+            [],
+            "TEST",
+            is_full=True,
+            protected_dirs=[page],
+        )
+
+        assert not (outside / "Page.md").exists()
+        assert page.is_dir()
+        assert not page.is_symlink()
+        assert (page / "Page.md").read_text() == "# last good"
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=tmp_path,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        assert status.stdout == ""
+
+    def test_protected_symlink_dir_restores_all_deleted_owned_files(self, tmp_path):
+        import shutil
+
+        ensure_repo(tmp_path)
+        page = tmp_path / "Page"
+        media = page / ".media"
+        media.mkdir(parents=True)
+        (page / "Page.md").write_text("# last good")
+        (media / "img.png").write_bytes(b"PNG")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+        shutil.rmtree(page)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        page.symlink_to(outside, target_is_directory=True)
+
+        commit_export(
+            tmp_path,
+            [],
+            "TEST",
+            is_full=True,
+            protected_dirs=[page],
+        )
+
+        assert not (outside / "Page.md").exists()
+        assert not (outside / ".media" / "img.png").exists()
+        assert not page.is_symlink()
+        assert (page / "Page.md").read_text() == "# last good"
+        assert (media / "img.png").read_bytes() == b"PNG"
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=tmp_path,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        assert status.stdout == ""
+
+    def test_protected_symlink_media_dir_is_not_pruned_through_target(self, tmp_path):
+        import shutil
+
+        ensure_repo(tmp_path)
+        page = tmp_path / "Page"
+        media = page / ".media"
+        media.mkdir(parents=True)
+        (page / "Page.md").write_text("# last good")
+        (media / "img.png").write_bytes(b"PNG")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+        shutil.rmtree(media)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        media.symlink_to(outside, target_is_directory=True)
+
+        commit_export(
+            tmp_path,
+            [],
+            "TEST",
+            is_full=True,
+            protected_dirs=[page],
+        )
+
+        assert not (outside / "img.png").exists()
+        assert not media.is_symlink()
+        assert (media / "img.png").read_bytes() == b"PNG"
+        ls = subprocess.run(
+            ["git", "ls-files"],
+            cwd=tmp_path,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        assert "Page/.media/img.png" in ls.stdout
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=tmp_path,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        assert status.stdout == ""
+
+    def test_exact_archived_subtree_protection_does_not_restore_moved_out_page(self, tmp_path):
+        """Only still-archived page roots should be protected recursively. A page
+        that moved out of _archived must be pruned even while a sibling archived
+        subtree is preserved."""
+        self._init_repo(tmp_path)
+        old_live = tmp_path / "_archived" / "OldLive"
+        stay = tmp_path / "_archived" / "Stay"
+        new_live = tmp_path / "OldLive"
+        old_live.mkdir(parents=True)
+        stay.mkdir(parents=True)
+        (old_live / "OldLive.md").write_text("# old archived copy")
+        (stay / "Stay.md").write_text("# still archived")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+        (old_live / "OldLive.md").unlink()
+        new_live.mkdir()
+        (new_live / "OldLive.md").write_text("# now live")
+
+        commit_export(
+            tmp_path,
+            [new_live / "OldLive.md"],
+            "TEST",
+            is_full=True,
+            protected_subtree_dirs=[stay],
+        )
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "OldLive/OldLive.md" in ls
+        assert "_archived/Stay/Stay.md" in ls
+        assert "_archived/OldLive/OldLive.md" not in ls
 
     def test_removes_renamed_page(self, tmp_path):
         """A page renamed upstream: old name removed, new name added."""
@@ -897,16 +1332,12 @@ class TestGitDefensiveBranches:
         assert "survived the prune" not in capsys.readouterr().err
 
 
-def test_case_probe_sweeps_stranded_probe(tmp_path):
-    """S2: a .conex-case-* probe stranded by a prior hard-kill is swept on the
-    next probe, not left as working-tree clutter."""
+def test_case_probe_does_not_delete_existing_prefix_files(tmp_path):
     from confluence_export.git import _fs_is_case_insensitive
 
-    stranded = tmp_path / ".conex-case-OLD"
-    stranded.write_text("")
+    user_file = tmp_path / ".conex-case-user-file"
+    user_file.write_text("keep")
 
     _fs_is_case_insensitive(tmp_path)
 
-    assert not stranded.exists()
-    # No fresh probe is left behind either.
-    assert list(tmp_path.glob(".conex-case-*")) == []
+    assert user_file.read_text() == "keep"

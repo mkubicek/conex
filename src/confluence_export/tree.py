@@ -14,20 +14,21 @@ def build_tree(pages: list[Page]) -> list[PageNode]:
     roots: list[PageNode] = []
     archived_roots: list[PageNode] = []
     for node in node_map.values():
-        if not node.page.parent_id:
-            if node.page.status == "archived":
-                archived_roots.append(node)
+        if node.page.status == "archived":
+            parent = node_map.get(node.page.parent_id) if node.page.parent_id else None
+            if parent and parent.page.status == "archived":
+                parent.children.append(node)
             else:
-                roots.append(node)
+                archived_roots.append(node)
+            continue
+        if not node.page.parent_id:
+            roots.append(node)
             continue
         parent = node_map.get(node.page.parent_id)
         if parent:
             parent.children.append(node)
         else:
-            if node.page.status == "archived":
-                archived_roots.append(node)
-            else:
-                roots.append(node)
+            roots.append(node)
 
     # Group archived root pages under a synthetic _archived node
     if archived_roots:

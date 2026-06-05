@@ -79,7 +79,14 @@ def _walk(nodes: list[PageNode], parent_dir: PurePosixPath, plan: dict[str, Pure
     ``conex tree`` output, which keep ``build_tree``'s position ordering.
     """
     taken: dict[str, str] = {}
-    for node in sorted(nodes, key=lambda n: (n.page.position, n.page.id)):
+    def allocation_key(node: PageNode) -> tuple[int, int, str]:
+        return (
+            0 if node.page.id == "__archived__" else 1,
+            node.page.position,
+            node.page.id,
+        )
+
+    for node in sorted(nodes, key=allocation_key):
         segment = _allocate_segment(node.page.title, node.page.id, taken)
         target_dir = parent_dir / segment
         plan[node.page.id] = target_dir

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path, PurePosixPath
 from unittest.mock import MagicMock, patch
 
 import yaml
 
-from confluence_export.exporter import ExportResult, Exporter
+from confluence_export.exporter import ExportResult, Exporter, _write_text_atomic
+from confluence_export.media import _VERSIONS_FILE
+from confluence_export.paths import attachment_identity, plan_attachment_names
 from confluence_export.types import (
     Attachment,
     CachedSpace,
@@ -90,6 +94,27 @@ class TestExportWritesCorrectMarkdown:
         assert html_path.exists()
         assert "<strong>world</strong>" in html_path.read_text()
 
+    def test_atomic_text_write_preserves_existing_mode(self, tmp_path):
+        target = tmp_path / "Page.md"
+        target.write_text("old")
+        target.chmod(0o640)
+
+        _write_text_atomic(target, "new")
+
+        assert target.read_text() == "new"
+        assert target.stat().st_mode & 0o777 == 0o640
+
+    def test_atomic_text_write_uses_umask_for_new_file(self, tmp_path):
+        target = tmp_path / "Page.md"
+        old_umask = os.umask(0o027)
+        try:
+            _write_text_atomic(target, "new")
+        finally:
+            os.umask(old_umask)
+
+        assert target.read_text() == "new"
+        assert target.stat().st_mode & 0o777 == 0o640
+
 
 class TestConvertFailureIsolated:
     def test_one_bad_page_does_not_abort_export(self, tmp_path):
@@ -137,6 +162,276 @@ class TestConvertFailureIsolated:
             exporter.export_space(_make_space(), tmp_path)
 
         assert not (tmp_path / "Bad-Page" / ".media" / "img.png").exists()
+
+    def test_convert_failure_restores_existing_media_and_manifest(self, tmp_path):
+        exporter, _, cache = _make_exporter(download_media=True)
+        cache.ensure_loaded.return_value = _make_cached_space(
+            pages=[_make_page(id="bad", title="Bad Page")],
+            attachments={"bad": [Attachment(id="x", title="img.png", media_type="image/png", file_size=3)]},
+        )
+        media_dir = tmp_path / "Bad-Page" / ".media"
+        media_dir.mkdir(parents=True)
+        image = media_dir / "img.png"
+        manifest = media_dir / _VERSIONS_FILE
+        image.write_bytes(b"old-good")
+        manifest.write_text('{"img.png": {"version": 1, "id": "x", "title": "img.png"}}')
+
+        def fake_download(client, attachments, media_dir):
+            p = media_dir / "img.png"
+            p.write_bytes(b"new-partial")
+            m = media_dir / _VERSIONS_FILE
+            m.write_text('{"img.png": {"version": 2, "id": "x", "title": "img.png"}}')
+            return [p, m]
+
+        with patch("confluence_export.exporter.download_attachments", side_effect=fake_download), \
+             patch("confluence_export.exporter.convert_page", side_effect=ValueError("boom")):
+            exporter.export_space(_make_space(), tmp_path)
+
+        assert image.read_bytes() == b"old-good"
+        assert json.loads(manifest.read_text())["img.png"]["version"] == 1
+
+    def test_no_media_convert_failure_restores_materialization_deletions(self, tmp_path):
+        exporter, _, cache = _make_exporter(download_media=False)
+        moved = Attachment(id="att1", title="a/b.png", page_id="bad", version=Version(number=1))
+        moved.created_at = "2025-01-01"
+        current_owner = Attachment(
+            id="att2", title="a-b.png", page_id="bad", version=Version(number=1)
+        )
+        current_owner.created_at = "2024-01-01"
+        cache.ensure_loaded.return_value = _make_cached_space(
+            pages=[_make_page(id="bad", title="Bad Page")],
+            attachments={"bad": [moved, current_owner]},
+        )
+        media_dir = tmp_path / "Bad-Page" / ".media"
+        media_dir.mkdir(parents=True)
+        old = media_dir / "a-b.png"
+        old.write_bytes(b"att1-last-good")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "a-b.png": {
+                "version": 1,
+                "id": "att1",
+                "title": moved.title,
+                "key": attachment_identity(moved),
+            }
+        }))
+
+        with patch("confluence_export.exporter.convert_page", side_effect=ValueError("boom")):
+            exporter.export_space(_make_space(), tmp_path)
+
+        assert old.read_bytes() == b"att1-last-good"
+        manifest = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert manifest["a-b.png"]["id"] == "att1"
+
+    def test_no_media_convert_failure_restores_removed_stale_media(self, tmp_path):
+        exporter, _, cache = _make_exporter(download_media=False)
+        current = Attachment(
+            id="current", title="current.png", page_id="bad", version=Version(number=1)
+        )
+        cache.ensure_loaded.return_value = _make_cached_space(
+            pages=[_make_page(id="bad", title="Bad Page")],
+            attachments={"bad": [current]},
+        )
+        media_dir = tmp_path / "Bad-Page" / ".media"
+        media_dir.mkdir(parents=True)
+        (media_dir / "current.png").write_bytes(b"current")
+        stale = media_dir / "stale.png"
+        stale.write_bytes(b"stale-last-good")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "current.png": {"version": 1, "id": "current", "title": "current.png"},
+            "stale.png": {"version": 1, "id": "stale", "title": "stale.png"},
+        }))
+
+        with patch("confluence_export.exporter.convert_page", side_effect=ValueError("boom")):
+            exporter.export_space(_make_space(), tmp_path)
+
+        assert stale.read_bytes() == b"stale-last-good"
+        manifest = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert "stale.png" in manifest
+
+    def test_media_value_error_restores_downloaded_media_and_manifest(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=True, render_drawio=True)
+        att = Attachment(
+            id="a1",
+            title="arch.drawio",
+            media_type="application/x-drawio",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/a1",
+            version=Version(number=2),
+        )
+        page = _make_page()
+        cs = _make_cached_space(attachments={"p1": [att]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        source = media_dir / "arch.drawio"
+        manifest = media_dir / _VERSIONS_FILE
+        source.write_text("old-source")
+        manifest.write_text(json.dumps({
+            "arch.drawio": {"version": 1, "id": "a1", "title": "arch.drawio"}
+        }))
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(b"outside")
+        (media_dir / "arch.drawio.png").symlink_to(outside)
+
+        def fake_download(_client, _attachments, _media_dir):
+            source.write_text("new-source")
+            manifest.write_text(json.dumps({
+                "arch.drawio": {"version": 2, "id": "a1", "title": "arch.drawio"}
+            }))
+            return [source, manifest]
+
+        with patch("confluence_export.exporter.download_attachments", side_effect=fake_download):
+            result = exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert result == []
+        assert source.read_text() == "old-source"
+        assert json.loads(manifest.read_text())["arch.drawio"]["version"] == 1
+        assert outside.read_bytes() == b"outside"
+
+    def test_markdown_write_failure_restores_downloaded_media_and_manifest(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=True)
+        att = Attachment(
+            id="a1",
+            title="img.png",
+            media_type="image/png",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/a1",
+            version=Version(number=2),
+        )
+        page = _make_page(body='<ac:image><ri:attachment ri:filename="img.png"/></ac:image>')
+        cs = _make_cached_space(attachments={"p1": [att]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        image = media_dir / "img.png"
+        manifest = media_dir / _VERSIONS_FILE
+        image.write_bytes(b"old-image")
+        manifest.write_text(json.dumps({
+            "img.png": {"version": 1, "id": "a1", "title": "img.png"}
+        }))
+
+        def fake_download(_client, _attachments, _media_dir):
+            image.write_bytes(b"new-image")
+            manifest.write_text(json.dumps({
+                "img.png": {"version": 2, "id": "a1", "title": "img.png"}
+            }))
+            return [image, manifest]
+
+        original_write_text = Path.write_text
+
+        def fail_markdown_write(path, *args, **kwargs):
+            if path.name.startswith(".Test-Page.md."):
+                raise OSError("disk full")
+            return original_write_text(path, *args, **kwargs)
+
+        with patch("confluence_export.exporter.download_attachments", side_effect=fake_download), \
+             patch("pathlib.Path.write_text", new=fail_markdown_write):
+            result = exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert result == []
+        assert image.read_bytes() == b"old-image"
+        assert json.loads(manifest.read_text())["img.png"]["version"] == 1
+
+    def test_rollback_unlinks_swapped_symlink_not_target(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=True)
+        att = Attachment(
+            id="a1",
+            title="img.png",
+            media_type="image/png",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/a1",
+            version=Version(number=2),
+        )
+        page = _make_page(body='<ac:image><ri:attachment ri:filename="img.png"/></ac:image>')
+        cs = _make_cached_space(attachments={"p1": [att]})
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(b"outside")
+
+        def fake_download(_client, _attachments, media_dir):
+            image = media_dir / "img.png"
+            image.write_bytes(b"new-image")
+            image.unlink()
+            image.symlink_to(outside)
+            return [image]
+
+        with patch("confluence_export.exporter.download_attachments", side_effect=fake_download), \
+             patch("confluence_export.exporter.convert_page", side_effect=ValueError("boom")):
+            result = exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert result == []
+        assert outside.read_bytes() == b"outside"
+        assert not (tmp_path / ".media" / "img.png").exists()
+
+    def test_rollback_restores_file_without_following_swapped_symlink(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=True)
+        att = Attachment(
+            id="a1",
+            title="img.png",
+            media_type="image/png",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/a1",
+            version=Version(number=2),
+        )
+        page = _make_page(body='<ac:image><ri:attachment ri:filename="img.png"/></ac:image>')
+        cs = _make_cached_space(attachments={"p1": [att]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        image = media_dir / "img.png"
+        image.write_bytes(b"old-image")
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(b"outside")
+
+        def fake_download(_client, _attachments, _media_dir):
+            image.unlink()
+            image.symlink_to(outside)
+            return [image]
+
+        with patch("confluence_export.exporter.download_attachments", side_effect=fake_download), \
+             patch("confluence_export.exporter.convert_page", side_effect=ValueError("boom")):
+            result = exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert result == []
+        assert outside.read_bytes() == b"outside"
+        assert image.read_bytes() == b"old-image"
+        assert not image.is_symlink()
+
+    def test_media_phase_exception_restores_mutations_before_written_paths_return(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=True)
+        att = Attachment(
+            id="a1",
+            title="img.png",
+            media_type="image/png",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/a1",
+            version=Version(number=2),
+        )
+        page = _make_page(body='<ac:image><ri:attachment ri:filename="img.png"/></ac:image>')
+        cs = _make_cached_space(attachments={"p1": [att]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        image = media_dir / "img.png"
+        manifest = media_dir / _VERSIONS_FILE
+        image.write_bytes(b"old-image")
+        manifest.write_text(json.dumps({
+            "img.png": {"version": 1, "id": "a1", "title": "img.png"}
+        }))
+
+        def mutate_then_raise(_client, _attachments, _media_dir):
+            image.write_bytes(b"new-image")
+            manifest.write_text(json.dumps({
+                "img.png": {"version": 2, "id": "a1", "title": "img.png"}
+            }))
+            raise OSError("manifest write failed")
+
+        with patch("confluence_export.exporter.download_attachments", side_effect=mutate_then_raise):
+            result = exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert result == []
+        assert image.read_bytes() == b"old-image"
+        assert json.loads(manifest.read_text())["img.png"]["version"] == 1
 
 
 class TestTreeExport:
@@ -194,6 +489,140 @@ class TestTreeExport:
 
         result = exporter.export_space(_make_space(), tmp_path, no_children=True)
         assert result.count == 1  # only the root
+
+    def test_symlinked_page_dir_is_skipped(self, tmp_path, capsys):
+        exporter, _, cache = _make_exporter()
+        cache.ensure_loaded.return_value = _make_cached_space(
+            pages=[_make_page(id="p1", title="Page", body="<p>safe</p>")]
+        )
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (tmp_path / "Page").symlink_to(outside, target_is_directory=True)
+
+        result = exporter.export_space(_make_space(), tmp_path)
+
+        assert result.count == 0
+        assert not (outside / "Page.md").exists()
+        assert (tmp_path / "Page") in result.skipped_paths
+        assert "symlinked page directory" in capsys.readouterr().err
+
+    def test_symlinked_page_dir_skips_descendants(self, tmp_path):
+        exporter, _, cache = _make_exporter()
+        parent = _make_page(id="p", title="Parent", body="<p>parent</p>")
+        child = _make_page(
+            id="c", title="Child", parent_id="p", parent_type="page",
+            body="<p>child</p>",
+        )
+        cache.ensure_loaded.return_value = _make_cached_space(pages=[parent, child])
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (tmp_path / "Parent").symlink_to(outside, target_is_directory=True)
+
+        result = exporter.export_space(_make_space(), tmp_path)
+
+        skipped = {p.resolve() for p in result.skipped_paths}
+        assert (tmp_path / "Parent").resolve() in skipped
+        assert (tmp_path / "Parent" / "Child").resolve() in skipped
+
+    def test_symlinked_media_dir_skips_only_that_page(self, tmp_path, capsys):
+        attachment = Attachment(
+            id="att1", title="img.png", page_id="bad", version=Version(number=1),
+            download_link="/wiki/download/img.png",
+        )
+        bad = _make_page(id="bad", title="Bad Page", body="<p>bad</p>")
+        good = _make_page(id="good", title="Good Page", body="<p>good</p>")
+        exporter, _, cache = _make_exporter(download_media=True)
+        cache.ensure_loaded.return_value = _make_cached_space(
+            pages=[bad, good],
+            attachments={"bad": [attachment]},
+        )
+        bad_dir = tmp_path / "Bad-Page"
+        bad_dir.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (bad_dir / ".media").symlink_to(outside, target_is_directory=True)
+
+        result = exporter.export_space(_make_space(), tmp_path)
+
+        assert result.count == 1
+        assert (tmp_path / "Good-Page" / "Good-Page.md").exists()
+        assert bad_dir in result.skipped_paths
+        assert "symlinked media directory" in capsys.readouterr().err
+
+    def test_symlinked_media_dir_is_rejected_before_snapshot_walk(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        attachment = Attachment(
+            id="att1", title="img.png", page_id="bad", version=Version(number=1),
+            download_link="/wiki/download/img.png",
+        )
+        bad = _make_page(id="bad", title="Bad Page", body="<p>bad</p>")
+        good = _make_page(id="good", title="Good Page", body="<p>good</p>")
+        exporter, _, cache = _make_exporter(download_media=True)
+        cache.ensure_loaded.return_value = _make_cached_space(
+            pages=[bad, good],
+            attachments={"bad": [attachment]},
+        )
+        bad_dir = tmp_path / "Bad-Page"
+        bad_dir.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (bad_dir / ".media").symlink_to(outside, target_is_directory=True)
+
+        original_rglob = Path.rglob
+
+        def fail_if_symlinked_media_root_is_walked(path, pattern):
+            if path.name == ".media" and path.is_symlink():
+                raise AssertionError("snapshot walked symlinked media root")
+            return original_rglob(path, pattern)
+
+        monkeypatch.setattr(Path, "rglob", fail_if_symlinked_media_root_is_walked)
+
+        result = exporter.export_space(_make_space(), tmp_path)
+
+        assert result.count == 1
+        assert (tmp_path / "Good-Page" / "Good-Page.md").exists()
+        assert bad_dir in result.skipped_paths
+        assert "symlinked media directory" in capsys.readouterr().err
+
+    def test_symlinked_media_file_skips_page_without_touching_target(self, tmp_path, capsys):
+        attachment = Attachment(
+            id="att1", title="img.png", page_id="bad", version=Version(number=1),
+        )
+        exporter, _, cache = _make_exporter(download_media=False)
+        cache.ensure_loaded.return_value = _make_cached_space(
+            pages=[_make_page(id="bad", title="Bad Page", body="<p>bad</p>")],
+            attachments={"bad": [attachment]},
+        )
+        media_dir = tmp_path / "Bad-Page" / ".media"
+        media_dir.mkdir(parents=True)
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(b"outside")
+        (media_dir / "img.png").symlink_to(outside)
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "img.png": {"version": 1, "id": "att1", "title": "img.png"}
+        }))
+
+        result = exporter.export_space(_make_space(), tmp_path)
+
+        assert result.count == 0
+        assert outside.read_bytes() == b"outside"
+        assert "symlinked path component" in capsys.readouterr().err
+
+    def test_no_media_empty_attachment_list_marks_existing_media_for_prune(self, tmp_path):
+        exporter, _, cache = _make_exporter(download_media=False)
+        cache.ensure_loaded.return_value = _make_cached_space(
+            pages=[_make_page(id="p1", title="Page", body="<p>safe</p>")],
+            attachments={"p1": []},
+        )
+        media_dir = tmp_path / "Page" / ".media"
+        media_dir.mkdir(parents=True)
+        (media_dir / "gone.png").write_bytes(b"gone")
+
+        result = exporter.export_space(_make_space(), tmp_path)
+
+        assert (tmp_path / "Page" / "Page.md").exists()
+        assert media_dir.resolve() in {p.resolve() for p in result.prune_media_dirs}
 
 
 class TestCollisionHandling:
@@ -288,6 +717,173 @@ class TestMediaDownload:
             # Verify media dir was created and passed
             assert mock_dl.call_args[0][2].name == ".media"
 
+    def test_no_media_materializes_planned_name_from_existing_manifest(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=False)
+        moved = Attachment(
+            id="att1",
+            title="a/b.png",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/att1",
+        )
+        collision = Attachment(
+            id="att2",
+            title="a-b.png",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/att2",
+        )
+        page = _make_page(body='<ac:image><ri:attachment ri:filename="a/b.png"/></ac:image>')
+        cs = _make_cached_space(attachments={"p1": [moved, collision]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        old_name = "a-b.png"
+        new_name = plan_attachment_names([moved, collision]).for_attachment(moved)
+        assert new_name != old_name
+        (media_dir / old_name).write_bytes(b"old-good")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            old_name: {
+                "version": 1,
+                "id": "att1",
+                "title": moved.title,
+                "key": attachment_identity(moved),
+            }
+        }))
+
+        exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        md = list(tmp_path.glob("*.md"))[0].read_text()
+        assert f".media/{new_name}" in md
+        assert (media_dir / new_name).read_bytes() == b"old-good"
+
+    def test_no_media_links_recovered_old_owner_when_planned_name_occupied(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=False)
+        moved = Attachment(
+            id="att1",
+            title="new.png",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/att1",
+        )
+        page = _make_page(body='<ac:image><ri:attachment ri:filename="new.png"/></ac:image>')
+        cs = _make_cached_space(attachments={"p1": [moved]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "old.png").write_bytes(b"last-good")
+        (media_dir / "new.png").write_bytes(b"wrong-owner")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "old.png": {
+                "version": 1,
+                "id": "att1",
+                "title": "old.png",
+                "key": attachment_identity(moved),
+            },
+            "new.png": {
+                "version": 1,
+                "id": "other",
+                "title": "new.png",
+            },
+        }))
+
+        exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        md = list(tmp_path.glob("*.md"))[0].read_text()
+        assert ".media/new.png" in md
+        assert (media_dir / "new.png").read_bytes() == b"last-good"
+
+    def test_no_media_links_present_unmanifested_attachment_without_collision(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=False)
+        att = Attachment(
+            id="att1",
+            title="img.png",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/att1",
+        )
+        page = _make_page(body='<ac:image><ri:attachment ri:filename="img.png"/></ac:image>')
+        cs = _make_cached_space(attachments={"p1": [att]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "img.png").write_bytes(b"present")
+
+        exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        md = list(tmp_path.glob("*.md"))[0].read_text()
+        assert ".media/img.png" in md
+        assert "Missing attachment" not in md
+
+    def test_failed_download_links_recovered_old_owner_when_planned_name_occupied(self, tmp_path):
+        exporter, client, _ = _make_exporter(download_media=True)
+        moved = Attachment(
+            id="att1",
+            title="new.png",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/att1",
+            version=Version(number=2),
+        )
+        page = _make_page(body='<ac:image><ri:attachment ri:filename="new.png"/></ac:image>')
+        cs = _make_cached_space(attachments={"p1": [moved]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "old.png").write_bytes(b"last-good")
+        (media_dir / "new.png").write_bytes(b"wrong-owner")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "old.png": {
+                "version": 1,
+                "id": "att1",
+                "title": "old.png",
+                "key": attachment_identity(moved),
+            },
+            "new.png": {
+                "version": 1,
+                "id": "other",
+                "title": "new.png",
+            },
+        }))
+        client.download_attachment_to_file.side_effect = Exception("network error")
+
+        exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        md = list(tmp_path.glob("*.md"))[0].read_text()
+        assert ".media/new.png" in md
+        assert (media_dir / "new.png").read_bytes() == b"last-good"
+
+    def test_no_media_materialization_rolls_back_when_conversion_fails(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=False)
+        moved = Attachment(
+            id="att1", title="a/b.png", file_size=100, page_id="p1",
+            download_link="/wiki/download/att1",
+        )
+        collision = Attachment(
+            id="att2", title="a-b.png", file_size=100, page_id="p1",
+            download_link="/wiki/download/att2",
+        )
+        page = _make_page(body="<p>bad</p>")
+        cs = _make_cached_space(attachments={"p1": [moved, collision]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        old_name = "a-b.png"
+        new_name = plan_attachment_names([moved, collision]).for_attachment(moved)
+        (media_dir / old_name).write_bytes(b"old-good")
+        manifest = media_dir / _VERSIONS_FILE
+        original_manifest = json.dumps({
+            old_name: {
+                "version": 1,
+                "id": "att1",
+                "title": moved.title,
+                "key": attachment_identity(moved),
+            }
+        })
+        manifest.write_text(original_manifest)
+
+        with patch("confluence_export.exporter.convert_page", side_effect=Exception("bad")):
+            result = exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert result == []
+        assert manifest.read_text() == original_manifest
+        assert not (media_dir / new_name).exists()
+
 
 class TestDrawioRendering:
     def test_drawio_placeholder_replaced_in_markdown(self, tmp_path):
@@ -314,6 +910,231 @@ class TestDrawioRendering:
         md = list(tmp_path.glob("*.md"))[0].read_text()
         assert "arch.drawio.png" in md
         assert "arch.drawio" in md
+
+    def test_drawio_render_output_avoids_attachment_name_collision(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=True, render_drawio=True)
+        drawio = Attachment(
+            id="draw",
+            title="arch.drawio",
+            media_type="application/x-drawio",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/draw",
+        )
+        colliding_png = Attachment(
+            id="png",
+            title="arch.drawio.png",
+            media_type="image/png",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/png",
+        )
+        page = _make_page(body=(
+            '<ac:structured-macro ac:name="drawio">'
+            '<ac:parameter ac:name="diagramName">arch.drawio</ac:parameter>'
+            "</ac:structured-macro>"
+        ))
+        cs = _make_cached_space(attachments={"p1": [drawio, colliding_png]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "arch.drawio").write_text("<xml/>")
+        (media_dir / "arch.drawio.png").write_bytes(b"real attachment")
+
+        def fake_render(_drawio_file, output_path=None, **_kwargs):
+            assert output_path is not None
+            assert output_path.name != "arch.drawio.png"
+            output_path.write_bytes(b"rendered")
+            return output_path
+
+        with patch("confluence_export.exporter.download_attachments", return_value=[]), \
+             patch("confluence_export.exporter.render_drawio_to_png", side_effect=fake_render):
+            exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        md = list(tmp_path.glob("*.md"))[0].read_text()
+        assert ".media/arch-draw-render.drawio.png" in md
+        assert "](.media/arch.drawio.png)" not in md
+
+    def test_drawio_render_forces_existing_non_attachment_output_when_source_is_newer(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=True, render_drawio=True)
+        drawio = Attachment(
+            id="draw",
+            title="arch.drawio",
+            media_type="application/x-drawio",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/draw",
+        )
+        page = _make_page(body=(
+            '<ac:structured-macro ac:name="drawio">'
+            '<ac:parameter ac:name="diagramName">arch.drawio</ac:parameter>'
+            "</ac:structured-macro>"
+        ))
+        cs = _make_cached_space(attachments={"p1": [drawio]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        source = media_dir / "arch.drawio"
+        source.write_text("<xml/>")
+        stale_png = media_dir / "arch.drawio.png"
+        stale_png.write_bytes(b"stale attachment")
+        os.utime(stale_png, (source.stat().st_mtime - 10, source.stat().st_mtime - 10))
+
+        with patch("confluence_export.exporter.download_attachments", return_value=[]), \
+             patch("confluence_export.exporter.render_drawio_to_png", return_value=stale_png) as render:
+            exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert render.call_args.kwargs["force"] is True
+
+    def test_drawio_render_reuses_existing_fresh_output(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=True, render_drawio=True)
+        drawio = Attachment(
+            id="draw",
+            title="arch.drawio",
+            media_type="application/x-drawio",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/draw",
+        )
+        page = _make_page(body=(
+            '<ac:structured-macro ac:name="drawio">'
+            '<ac:parameter ac:name="diagramName">arch.drawio</ac:parameter>'
+            "</ac:structured-macro>"
+        ))
+        cs = _make_cached_space(attachments={"p1": [drawio]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        source = media_dir / "arch.drawio"
+        source.write_text("<xml/>")
+        png = media_dir / "arch.drawio.png"
+        png.write_bytes(b"fresh render")
+        os.utime(png, (source.stat().st_mtime + 10, source.stat().st_mtime + 10))
+
+        with patch("confluence_export.exporter.download_attachments", return_value=[]), \
+             patch("confluence_export.exporter.render_drawio_to_png", return_value=png) as render:
+            exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert render.call_args.kwargs["force"] is False
+
+    def test_drawio_render_skips_wrong_owner_source_file(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=False, render_drawio=True)
+        drawio = Attachment(
+            id="draw",
+            title="arch.drawio",
+            media_type="application/x-drawio",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/draw",
+        )
+        page = _make_page(body=(
+            '<ac:structured-macro ac:name="drawio">'
+            '<ac:parameter ac:name="diagramName">arch.drawio</ac:parameter>'
+            "</ac:structured-macro>"
+        ))
+        cs = _make_cached_space(attachments={"p1": [drawio]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "arch.drawio").write_text("<old xml/>")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "arch.drawio": {
+                "version": 1,
+                "id": "other",
+                "title": "arch.drawio",
+            }
+        }))
+
+        with patch("confluence_export.exporter.render_drawio_to_png") as render:
+            exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        render.assert_not_called()
+        md = list(tmp_path.glob("*.md"))[0].read_text()
+        assert "arch.drawio.png" not in md
+        assert "Draw.io diagram not rendered: arch.drawio" in md
+        assert "Draw.io source:" not in md
+
+    def test_drawio_render_avoids_deleted_attachment_manifest_name(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=False, render_drawio=True)
+        drawio = Attachment(
+            id="draw",
+            title="arch.drawio",
+            media_type="application/x-drawio",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/draw",
+            version=Version(number=1),
+        )
+        page = _make_page(body=(
+            '<ac:structured-macro ac:name="drawio">'
+            '<ac:parameter ac:name="diagramName">arch.drawio</ac:parameter>'
+            "</ac:structured-macro>"
+        ))
+        cs = _make_cached_space(attachments={"p1": [drawio]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / "arch.drawio").write_text("<xml/>")
+        stale_deleted_attachment = media_dir / "arch.drawio.png"
+        stale_deleted_attachment.write_bytes(b"old attachment")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            "arch.drawio": {
+                "version": 1,
+                "id": "draw",
+                "title": "arch.drawio",
+                "key": attachment_identity(drawio),
+            },
+            "arch.drawio.png": {
+                "version": 1,
+                "id": "deleted",
+                "title": "arch.drawio.png",
+            },
+        }))
+
+        def fake_render(_drawio_file, output_path=None, **_kwargs):
+            assert output_path is not None
+            assert output_path.name != "arch.drawio.png"
+            output_path.write_bytes(b"rendered")
+            return output_path
+
+        with patch("confluence_export.exporter.render_drawio_to_png", side_effect=fake_render):
+            exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        md = list(tmp_path.glob("*.md"))[0].read_text()
+        assert ".media/arch-draw-render.drawio.png" in md
+        assert ".media/arch.drawio.png" not in md
+        assert stale_deleted_attachment.read_bytes() == b"old attachment"
+
+    def test_forced_drawio_render_rolls_back_when_conversion_fails(self, tmp_path):
+        exporter, _, _ = _make_exporter(download_media=True, render_drawio=True)
+        drawio = Attachment(
+            id="draw",
+            title="arch.drawio",
+            media_type="application/x-drawio",
+            file_size=100,
+            page_id="p1",
+            download_link="/wiki/download/draw",
+        )
+        page = _make_page(body=(
+            '<ac:structured-macro ac:name="drawio">'
+            '<ac:parameter ac:name="diagramName">arch.drawio</ac:parameter>'
+            "</ac:structured-macro>"
+        ))
+        cs = _make_cached_space(attachments={"p1": [drawio]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        source = media_dir / "arch.drawio"
+        source.write_text("<xml/>")
+        png = media_dir / "arch.drawio.png"
+        png.write_bytes(b"stale")
+        os.utime(png, (source.stat().st_mtime - 10, source.stat().st_mtime - 10))
+
+        def fake_render(_drawio_file, output_path=None, **_kwargs):
+            output_path.write_bytes(b"fresh")
+            return output_path
+
+        with patch("confluence_export.exporter.download_attachments", return_value=[]), \
+             patch("confluence_export.exporter.render_drawio_to_png", side_effect=fake_render), \
+             patch("confluence_export.exporter.convert_page", side_effect=Exception("bad")):
+            result = exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert result == []
+        assert png.read_bytes() == b"stale"
 
 
 class TestUserResolution:
@@ -628,7 +1449,8 @@ class TestReconcileWriterHandshake:
         r2 = exporter.export_space(_make_space(), tmp_path, force_refresh=True)
         commit_export(
             tmp_path, r2.written_files, "TEST",
-            protected_dirs=r2.skipped_paths + r2.preserved_paths,
+            protected_dirs=r2.preserved_page_paths,
+            protected_subtree_dirs=r2.preserved_paths + r2.skipped_paths,
         )
 
         ls = subprocess.run(
@@ -641,8 +1463,8 @@ class TestReconcileWriterHandshake:
         # __archived__ container (gets "_archived-2"). The reconcile plan must
         # agree with the write-walk plan on its target, or it churns its workspace.
         exporter, _, cache = _make_exporter()
-        _seed_export_page(tmp_path, "_archived-2", "r", workspace="keep")
-        live = _make_page(id="r", title="_archived", body="<p>real</p>")
+        _seed_export_page(tmp_path, "_archived-2", "123", workspace="keep")
+        live = _make_page(id="123", title="_archived", body="<p>real</p>")
         archived = _make_page(id="z", title="Zarch", body="<p>old</p>")
         archived.status = "archived"
         cache.refresh.return_value = _make_cached_space(pages=[live, archived])
@@ -655,8 +1477,9 @@ class TestReconcileWriterHandshake:
     def test_full_export_without_archived_preserves_archived_subtree(self, tmp_path):
         # M1: a full export WITHOUT --include-archived does not write archived
         # pages, so their committed files are absent from written_files. The
-        # exporter surfaces the archived subtree root in preserved_paths so the
-        # git prune does not delete a prior --include-archived export.
+        # exporter surfaces exact archived page dirs in preserved_page_paths so
+        # the git prune does not delete a prior --include-archived export while
+        # still allowing descendants that moved live to be pruned.
         exporter, _, cache = _make_exporter()
         live = _make_page(id="p1", title="Live")
         archived = _make_page(id="z", title="Zarch", body="<p>old</p>")
@@ -665,8 +1488,102 @@ class TestReconcileWriterHandshake:
 
         result = exporter.export_space(_make_space(), tmp_path)  # no include_archived
 
-        preserved = [p.resolve() for p in result.preserved_paths]
-        assert (tmp_path / "_archived").resolve() in preserved
+        preserved = [p.resolve() for p in result.preserved_page_paths]
+        assert (tmp_path / "_archived" / "Zarch").resolve() in preserved
+        assert result.preserved_paths == []
+
+    def test_archived_only_export_preserves_archived_pages(self, tmp_path):
+        # ARCH-ONLY: every page is archived and authoritative, so a default export
+        # writes nothing but must surface the archived dirs exactly so they are
+        # protected if a later run does prune. Per Decision 1 a write-less run does
+        # NOT itself prune committed live pages (see the cli/git prune gate).
+        exporter, _, cache = _make_exporter()
+        archived = _make_page(id="z", title="Zarch", body="<p>old</p>")
+        archived.status = "archived"
+        cache.ensure_loaded.return_value = _make_cached_space(pages=[archived])
+
+        result = exporter.export_space(_make_space(), tmp_path)  # no include_archived
+
+        assert result.count == 0
+        assert result.written_files == []
+        assert result.preserved_page_paths
+        assert result.preserved_paths == []
+
+    def test_default_export_omits_archived_descendant_under_live_parent(self, tmp_path):
+        exporter, _, cache = _make_exporter()
+        live = _make_page(id="p1", title="Live")
+        archived = _make_page(
+            id="z", title="Old Child", parent_id="p1", parent_type="page",
+            body="<p>old</p>",
+        )
+        archived.status = "archived"
+        cache.ensure_loaded.return_value = _make_cached_space(pages=[live, archived])
+
+        result = exporter.export_space(_make_space(), tmp_path)
+
+        assert result.count == 1
+        assert (tmp_path / "Live" / "Live.md").exists()
+        assert not (tmp_path / "Live" / "Old-Child").exists()
+        assert (tmp_path / "_archived" / "Old-Child").resolve() in {
+            p.resolve() for p in result.preserved_page_paths
+        }
+
+    def test_default_export_preserves_legacy_archived_descendant_path(self, tmp_path):
+        import subprocess
+
+        from confluence_export.git import commit_export, ensure_repo
+
+        ensure_repo(tmp_path)
+        old_dir = _seed_export_page(tmp_path, "Live/Old-Child", "z")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "archived child old layout"], cwd=tmp_path, capture_output=True)
+
+        exporter, _, cache = _make_exporter()
+        live = _make_page(id="p1", title="Live")
+        archived = _make_page(
+            id="z", title="Old Child", parent_id="p1", parent_type="page",
+            body="<p>old</p>",
+        )
+        archived.status = "archived"
+        cache.refresh.return_value = _make_cached_space(pages=[live, archived])
+
+        result = exporter.export_space(_make_space(), tmp_path, force_refresh=True)
+        commit_export(
+            tmp_path,
+            result.written_files,
+            "TEST",
+            is_full=True,
+            protected_dirs=result.preserved_page_paths,
+            protected_subtree_dirs=result.preserved_paths,
+        )
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Live/Old-Child/Old-Child.md" in ls
+        assert old_dir.exists()
+
+    def test_archived_old_path_reused_by_live_page_is_not_preserved(self, tmp_path):
+        old_dir = _seed_export_page(tmp_path, "Live/Old-Child", "z")
+        (old_dir / ".media").mkdir()
+        (old_dir / ".media" / "archived.png").write_bytes(b"archived")
+        exporter, _, cache = _make_exporter()
+        live = _make_page(id="p1", title="Live")
+        live_child = _make_page(
+            id="new", title="Old Child", parent_id="p1", parent_type="page",
+            body="<p>new</p>",
+        )
+        archived = _make_page(
+            id="z", title="Old Child", parent_id="p1", parent_type="page",
+            body="<p>old</p>",
+        )
+        archived.status = "archived"
+        cache.refresh.return_value = _make_cached_space(pages=[live, live_child, archived])
+
+        result = exporter.export_space(_make_space(), tmp_path, force_refresh=True)
+
+        assert old_dir.resolve() not in {
+            p.resolve() for p in result.preserved_page_paths
+        }
+        assert old_dir.resolve() not in {p.resolve() for p in result.preserved_paths}
 
     def test_no_archived_pages_means_no_preserved_paths(self, tmp_path):
         exporter, _, cache = _make_exporter()
@@ -674,6 +1591,7 @@ class TestReconcileWriterHandshake:
         cs.include_archived = True  # cache provably covers archived; none exist
         cache.ensure_loaded.return_value = cs
         result = exporter.export_space(_make_space(), tmp_path)
+        assert result.preserved_page_paths == []
         assert result.preserved_paths == []
 
     def test_archived_preserved_when_cache_omits_archived(self, tmp_path):
@@ -693,6 +1611,191 @@ class TestReconcileWriterHandshake:
         preserved = [p.resolve() for p in result.preserved_paths]
         assert (tmp_path / "_archived").resolve() in preserved
 
+    def test_cache_without_archived_exports_to_missing_output_dir(self, tmp_path):
+        exporter, _, cache = _make_exporter()
+        cs = _make_cached_space(pages=[_make_page(id="p1", title="Live")])
+        cs.include_archived = False
+        cache.ensure_loaded.return_value = cs
+        output_dir = tmp_path / "new-export"
+
+        result = exporter.export_space(_make_space(), output_dir)
+
+        assert result.count == 1
+        assert (output_dir / "Live" / "Live.md").exists()
+
+    def test_collision_suffixed_archived_preserved_when_cache_omits_archived(self, tmp_path):
+        exporter, _, cache = _make_exporter()
+        live = _make_page(id="live", title="_archived")
+        cs = _make_cached_space(pages=[live])
+        cs.include_archived = False
+        cache.ensure_loaded.return_value = cs
+        (tmp_path / "_archived-2" / "Old").mkdir(parents=True)
+        (tmp_path / "_archived-2" / "Old" / "Old.md").write_text("# Old")
+
+        result = exporter.export_space(_make_space(), tmp_path)
+
+        preserved = [p.resolve() for p in result.preserved_paths]
+        assert (tmp_path / "_archived-2").resolve() in preserved
+        assert (tmp_path / "_archived").resolve() not in preserved
+
+    def test_live_archived_named_page_not_preserved_as_archived_subtree(self, tmp_path):
+        exporter, _, cache = _make_exporter()
+        live = _make_page(id="live", title="_archived", body="<p>live</p>")
+        cs = _make_cached_space(pages=[live])
+        cs.include_archived = False
+        cache.ensure_loaded.return_value = cs
+        (tmp_path / "_archived" / "Stale").mkdir(parents=True)
+        (tmp_path / "_archived" / "Stale" / "Stale.md").write_text("# stale")
+
+        result = exporter.export_space(_make_space(), tmp_path)
+
+        assert result.preserved_paths == []
+
+    def test_real_archived_root_preserved_when_live_page_claims_archived_name(self, tmp_path):
+        exporter, _, cache = _make_exporter()
+        live = _make_page(id="live", title="_archived", body="<p>live</p>")
+        cs = _make_cached_space(pages=[live])
+        cs.include_archived = False
+        cache.ensure_loaded.return_value = cs
+        archived_dir = tmp_path / "_archived" / "Old"
+        archived_dir.mkdir(parents=True)
+        (archived_dir / "Old.md").write_text(
+            "---\n"
+            "title: Old\n"
+            "page_id: old\n"
+            "space_key: TEST\n"
+            "path: /_archived/Old\n"
+            "status: archived\n"
+            "version: 1\n"
+            "---\n\n# Old\n"
+        )
+
+        result = exporter.export_space(_make_space(), tmp_path)
+
+        assert archived_dir.resolve() in {
+            p.resolve() for p in result.preserved_paths
+        }
+        assert (tmp_path / "_archived").resolve() not in {
+            p.resolve() for p in result.preserved_paths
+        }
+
+    def test_legacy_archived_root_with_original_path_preserved_on_live_name_conflict(
+        self, tmp_path
+    ):
+        exporter, _, cache = _make_exporter()
+        live = _make_page(id="live", title="_archived", body="<p>live</p>")
+        cs = _make_cached_space(pages=[live])
+        cs.include_archived = False
+        cache.ensure_loaded.return_value = cs
+        archived_dir = tmp_path / "_archived" / "Old"
+        archived_dir.mkdir(parents=True)
+        (archived_dir / "Old.md").write_text(
+            "---\n"
+            "title: Old\n"
+            "page_id: old\n"
+            "space_key: TEST\n"
+            "path: /Original/Old\n"
+            "version: 1\n"
+            "---\n\n# Old\n"
+        )
+
+        result = exporter.export_space(_make_space(), tmp_path)
+
+        assert archived_dir.resolve() in {
+            p.resolve() for p in result.preserved_paths
+        }
+
+    def test_archived_preservation_does_not_protect_live_archived_root_from_prune(
+        self, tmp_path
+    ):
+        import subprocess
+
+        from confluence_export.git import commit_export, ensure_repo
+
+        ensure_repo(tmp_path)
+        stale_file = tmp_path / "_archived" / "stale.txt"
+        stale_file.parent.mkdir(parents=True)
+        stale_file.write_text("stale")
+        archived_dir = tmp_path / "_archived" / "Old"
+        archived_dir.mkdir(parents=True)
+        (archived_dir / "Old.md").write_text(
+            "---\n"
+            "title: Old\n"
+            "page_id: old\n"
+            "space_key: TEST\n"
+            "path: /_archived/Old\n"
+            "status: archived\n"
+            "version: 1\n"
+            "---\n\n# Old\n"
+        )
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "seed"], cwd=tmp_path, capture_output=True)
+
+        exporter, _, cache = _make_exporter()
+        live = _make_page(id="live", title="_archived", body="<p>live</p>")
+        cs = _make_cached_space(pages=[live])
+        cs.include_archived = False
+        cache.refresh.return_value = cs
+
+        result = exporter.export_space(_make_space(), tmp_path, force_refresh=True)
+        commit_export(
+            tmp_path,
+            result.written_files,
+            "TEST",
+            is_full=True,
+            protected_subtree_dirs=result.preserved_paths,
+        )
+
+        ls = subprocess.run(
+            ["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True
+        ).stdout
+        assert "_archived/Old/Old.md" in ls
+        assert "_archived/stale.txt" not in ls
+
+    def test_archived_parent_preservation_does_not_keep_child_moved_live(
+        self, tmp_path
+    ):
+        import subprocess
+
+        from confluence_export.git import commit_export, ensure_repo
+
+        ensure_repo(tmp_path)
+        parent_dir = _seed_export_page(tmp_path, "_archived/Parent", "parent")
+        child_dir = _seed_export_page(tmp_path, "_archived/Parent/Child", "child")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "seed archived tree"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+
+        exporter, _, cache = _make_exporter()
+        archived_parent = _make_page(id="parent", title="Parent")
+        archived_parent.status = "archived"
+        live_child = _make_page(id="child", title="Child", body="<p>now live</p>")
+        cache.refresh.return_value = _make_cached_space(
+            pages=[archived_parent, live_child]
+        )
+
+        result = exporter.export_space(_make_space(), tmp_path, force_refresh=True)
+        commit_export(
+            tmp_path,
+            result.written_files,
+            "TEST",
+            is_full=True,
+            protected_dirs=result.preserved_page_paths,
+            protected_subtree_dirs=result.preserved_paths + result.skipped_paths,
+        )
+
+        ls = subprocess.run(
+            ["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True
+        ).stdout
+        assert "Child/Child.md" in ls
+        assert "_archived/Parent/Parent.md" in ls
+        assert "_archived/Parent/Child/Child.md" not in ls
+        assert parent_dir.exists()
+        assert not child_dir.exists()
+
     def test_include_archived_does_not_preserve(self, tmp_path):
         # When archived pages ARE written, there is nothing to preserve.
         exporter, _, cache = _make_exporter()
@@ -702,7 +1805,24 @@ class TestReconcileWriterHandshake:
         result = exporter.export_space(
             _make_space(), tmp_path, force_refresh=True, include_archived=True
         )
+        assert result.preserved_page_paths == []
         assert result.preserved_paths == []
+
+    def test_include_archived_frontmatter_uses_planned_archive_path(self, tmp_path):
+        exporter, _, cache = _make_exporter()
+        live = _make_page(id="p1", title="Live")
+        archived = _make_page(
+            id="z", title="Old Child", parent_id="p1", parent_type="page",
+            body="<p>old</p>",
+        )
+        archived.status = "archived"
+        cache.refresh.return_value = _make_cached_space(pages=[live, archived])
+
+        exporter.export_space(_make_space(), tmp_path, force_refresh=True, include_archived=True)
+
+        md = (tmp_path / "_archived" / "Old-Child" / "Old-Child.md").read_text()
+        frontmatter = yaml.safe_load(md.split("---", 2)[1])
+        assert frontmatter["path"] == "/_archived/Old-Child"
 
     def test_reconcile_failure_does_not_abort_export(self, tmp_path):
         # A reconcile exception must never abort the export; the write walk still
