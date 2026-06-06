@@ -257,19 +257,11 @@ def _preprocess_html(
             ul.append(li)
         task_list.replace_with(ul)
 
-    # --- Decision lists ---
-    for tag in list(soup.find_all(lambda t: t.name == "ac:adf-node" and t.get("type") in ("decisionList", "decision-list"))):
-        tag.unwrap()
-    for tag in list(soup.find_all(lambda t: t.name == "ac:adf-node" and t.get("type") in ("decisionItem", "decision-item"))):
-        state = tag.get("state", tag.get("localId", ""))
-        # Just preserve the text content
-        text = tag.get_text().strip()
-        if text:
-            p = soup.new_tag("p")
-            p.string = text
-            tag.replace_with(p)
-        else:
-            tag.decompose()
+    # NOTE: decision lists (ac:adf-node type="decisionList"/"decisionItem") are not
+    # specially handled — the generic ac:adf-node unwrap above already strips every
+    # adf-node, so their text content survives as plain markdown. A dedicated
+    # decision-list handler used to live here but was dead (shadowed by that unwrap);
+    # removed. If richer decision rendering is wanted, it must run BEFORE the unwrap.
 
     # --- User mentions (ri:user inside ac:link or standalone) ---
     for user_tag in list(soup.find_all("ri:user")):
