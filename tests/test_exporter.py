@@ -1544,6 +1544,72 @@ class TestReconcileWriterHandshake:
             p.resolve() for p in result.preserved_page_paths
         }
 
+    def test_default_export_writes_live_child_of_archived_parent(self, tmp_path):
+        # PR3: when the cache DOES see the archived parent (v2 / authoritative), a
+        # LIVE child of that archived parent must still be exported (surfaced to a
+        # root), not silently dropped with the omitted _archived subtree. The
+        # archived parent itself is still preserved, not written.
+        exporter, _, cache = _make_exporter()
+        archived_parent = _make_page(id="ap", title="Archived Parent", body="<p>old</p>")
+        archived_parent.status = "archived"
+        live_child = _make_page(
+            id="lc", title="Live Child", parent_id="ap", parent_type="page",
+            body="<p>current</p>",
+        )
+        cs = _make_cached_space(pages=[archived_parent, live_child])
+        cs.include_archived = True  # cache authoritatively sees archived pages
+        cache.ensure_loaded.return_value = cs
+
+        result = exporter.export_space(_make_space(), tmp_path)  # no --include-archived
+
+        # the live child is exported at top level (surfaced to a root), and the
+        # archived parent is preserved page-exact (not written under _archived).
+        assert (tmp_path / "Live-Child" / "Live-Child.md").exists()
+        assert not (tmp_path / "_archived" / "Archived-Parent").exists()
+        assert (tmp_path / "_archived" / "Archived-Parent").resolve() in {
+            p.resolve() for p in result.preserved_page_paths
+        }
+
+    def test_git_export_surfaces_buried_live_child_and_prunes_old_path(self, tmp_path):
+        # PR3 end-to-end WITH git: a live child previously committed under the buried
+        # path _archived/Archived-Parent/Live-Child surfaces to top-level Live-Child/
+        # on a v2 (authoritative) run, the archived parent stays preserved, and the
+        # old nested path is PRUNED — no data loss, no stale duplicate. This drives
+        # the exact PR3 branch (tree.py: live child whose parent IS present and
+        # archived), which the shape tests above and the empty-parent move tests
+        # below do not exercise.
+        import subprocess
+
+        from confluence_export.git import commit_export, ensure_repo
+
+        ensure_repo(tmp_path)
+        _seed_export_page(tmp_path, "_archived/Archived-Parent", "ap")
+        _seed_export_page(tmp_path, "_archived/Archived-Parent/Live-Child", "lc")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "buried live child"], cwd=tmp_path, capture_output=True)
+
+        exporter, _, cache = _make_exporter()
+        archived_parent = _make_page(id="ap", title="Archived Parent", body="<p>old</p>")
+        archived_parent.status = "archived"
+        live_child = _make_page(
+            id="lc", title="Live Child", parent_id="ap", parent_type="page",
+            body="<p>current</p>",
+        )
+        cs = _make_cached_space(pages=[archived_parent, live_child])
+        cs.include_archived = True  # v2 / authoritative: the archived parent IS fetched
+        cache.refresh.return_value = cs
+
+        result = exporter.export_space(_make_space(), tmp_path, force_refresh=True)
+        commit_export(
+            tmp_path, result.written_files, "TEST",
+            is_full=True, protection=result.protection(tmp_path),
+        )
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Live-Child/Live-Child.md" in ls  # surfaced to top level
+        assert "_archived/Archived-Parent/Archived-Parent.md" in ls  # parent preserved
+        assert "_archived/Archived-Parent/Live-Child/Live-Child.md" not in ls  # old path pruned
+
     def test_default_export_preserves_legacy_archived_descendant_path(self, tmp_path):
         import subprocess
 

@@ -25,9 +25,20 @@ def build_tree(pages: list[Page]) -> list[PageNode]:
             roots.append(node)
             continue
         parent = node_map.get(node.page.parent_id)
-        if parent:
+        if parent and parent.page.status != "archived":
             parent.children.append(node)
         else:
+            # PR3: a LIVE page is placed the same way whether or not its archived
+            # ancestor happened to be fetched this run. If its parent is archived
+            # (or absent), surface it as a root instead of burying it under the
+            # synthetic __archived__ subtree — a default export omits __archived__,
+            # so a current page nested there would be silently dropped. This mirrors
+            # what a current-only run already does when the archived parent is not
+            # returned by the API (the parent is simply missing from node_map). The
+            # mirror is in-memory PLACEMENT only: on a v2/authoritative run the old
+            # _archived/<parent>/<child> path is pruned, while a blind/current-only
+            # run leaves a transient duplicate until the next authoritative run (the
+            # deliberate Decision-1 prefer-stale residual, not introduced by PR3).
             roots.append(node)
 
     # Group archived root pages under a synthetic _archived node
