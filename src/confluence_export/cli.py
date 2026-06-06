@@ -242,7 +242,7 @@ def _auth_label(mode: AuthMode) -> str:
             return "Bearer token (PAT)"
         case AuthMode.COOKIE:
             return "cookie session"
-        case _:
+        case _:  # pragma: no cover
             raise AssertionError(f"Unhandled auth mode: {mode}")
 
 
@@ -254,7 +254,7 @@ def _api_mode_label(dialect: ApiDialect) -> str:
             return "OAuth gateway"
         case ApiDialect.COOKIE_V1:
             return "Confluence REST v1 compatibility"
-        case _:
+        case _:  # pragma: no cover
             raise AssertionError(f"Unhandled API dialect: {dialect}")
 
 

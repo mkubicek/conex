@@ -9,7 +9,12 @@ from unittest.mock import MagicMock, patch
 
 import yaml
 
-from confluence_export.exporter import ExportResult, Exporter, _write_text_atomic
+from confluence_export.exporter import (
+    ExportResult,
+    Exporter,
+    _drawio_output_is_stale,
+    _write_text_atomic,
+)
 from confluence_export.media import _VERSIONS_FILE
 from confluence_export.protection import (
     PageExactProtection,
@@ -1979,3 +1984,144 @@ class TestExporterDefensiveBranches:
         )
 
         assert result.count == 1  # only Root, children excluded
+
+
+class TestSymlinkedManifestAndMediaDirGuards:
+    """Defense-in-depth symlink guards that skip the page (returns [], warns)
+    instead of following a swapped link or trusting attacker-controlled state."""
+
+    def test_symlinked_versions_manifest_skips_page(self, tmp_path, capsys):
+        # download_media path snapshots `.media/.versions.json` before downloading.
+        # If that manifest is itself a symlink, snapshot_file refuses it: the page
+        # is skipped (no md written) with a warning, and no download is attempted.
+        exporter, _, _ = _make_exporter(download_media=True)
+        att = Attachment(
+            id="a1", title="img.png", media_type="image/png", file_size=3,
+            page_id="p1", download_link="/wiki/download/a1", version=Version(number=1),
+        )
+        page = _make_page()
+        cs = _make_cached_space(attachments={"p1": [att]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        outside = tmp_path / "outside.json"
+        outside.write_text("{}")
+        (media_dir / _VERSIONS_FILE).symlink_to(outside)
+
+        with patch("confluence_export.exporter.download_attachments") as mock_dl:
+            result = exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert result == []
+        mock_dl.assert_not_called()
+        assert list(tmp_path.glob("*.md")) == []
+        assert "refusing to use symlinked media file" in capsys.readouterr().err
+
+    def test_no_media_symlinked_media_dir_with_attachments_skips_page(self, tmp_path, capsys):
+        # --no-media path with attachments: an existing `.media` that is a symlink
+        # to a directory is refused (line guarding materialize_existing_attachments).
+        exporter, _, _ = _make_exporter(download_media=False)
+        att = Attachment(
+            id="a1", title="img.png", media_type="image/png", file_size=3,
+            page_id="p1", download_link="/wiki/download/a1", version=Version(number=1),
+        )
+        page = _make_page()
+        cs = _make_cached_space(attachments={"p1": [att]})
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (tmp_path / ".media").symlink_to(outside, target_is_directory=True)
+
+        result = exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert result == []
+        assert list(tmp_path.glob("*.md")) == []
+        assert not (outside / "img.png").exists()
+        assert "refusing to use symlinked media directory" in capsys.readouterr().err
+
+    def test_no_media_symlinked_media_dir_without_attachments_skips_page(self, tmp_path, capsys):
+        # --no-media path with NO attachments: still refuses a symlinked `.media`
+        # directory rather than adopting it as the page's media dir.
+        exporter, _, _ = _make_exporter(download_media=False)
+        page = _make_page()
+        cs = _make_cached_space(attachments={"p1": []})
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (tmp_path / ".media").symlink_to(outside, target_is_directory=True)
+
+        result = exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert result == []
+        assert list(tmp_path.glob("*.md")) == []
+        assert "refusing to use symlinked media directory" in capsys.readouterr().err
+
+
+class TestSnapshotCopyFailure:
+    def test_snapshot_copy_failure_skips_page_and_leaves_no_rollback_temp(self, tmp_path, capsys):
+        # If copying a pre-existing media file into its rollback backup fails,
+        # snapshot_file re-raises after cleaning up its temp file. The page is
+        # skipped (returns []) and no `.rollback-*.tmp` junk is left behind.
+        exporter, _, _ = _make_exporter(download_media=True)
+        att = Attachment(
+            id="a1", title="img.png", media_type="image/png", file_size=3,
+            page_id="p1", download_link="/wiki/download/a1", version=Version(number=1),
+        )
+        page = _make_page()
+        cs = _make_cached_space(attachments={"p1": [att]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / _VERSIONS_FILE).write_text("{}")
+        (media_dir / "img.png").write_bytes(b"existing")
+
+        with patch("confluence_export.exporter.shutil.copy2", side_effect=OSError("copy failed")), \
+             patch("confluence_export.exporter.download_attachments") as mock_dl:
+            result = exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert result == []
+        mock_dl.assert_not_called()  # failed during pre-download snapshot
+        assert list(tmp_path.glob("*.md")) == []
+        assert list(media_dir.glob(".rollback-*")) == []
+        assert "copy failed" in capsys.readouterr().err
+
+
+class TestDrawioStaleStatRace:
+    def test_stat_failure_treats_output_as_stale(self, tmp_path):
+        # If stat-ing the source raises mid-check (a filesystem race), the helper
+        # conservatively reports the rendered output as stale so it gets re-rendered.
+        source = tmp_path / "arch.drawio"
+        output = tmp_path / "arch.drawio.png"
+        source.write_text("<xml/>")
+        output.write_bytes(b"png")
+
+        real_stat = Path.stat
+
+        def stat_raises_for_source(self, *args, **kwargs):
+            if self == source:
+                raise OSError("stat race")
+            return real_stat(self, *args, **kwargs)
+
+        with patch.object(Path, "stat", new=stat_raises_for_source):
+            assert _drawio_output_is_stale(source, output) is True
+
+
+class TestDebugHtmlWriteFailure:
+    def test_debug_html_write_failure_keeps_markdown_and_warns(self, tmp_path, capsys):
+        # debug=True writes an .html alongside the .md. If the HTML write fails,
+        # the page is NOT skipped: the markdown is still returned and a warning is
+        # logged, but the html is absent from the written list and on disk.
+        exporter, _, _ = _make_exporter(debug=True)
+        page = _make_page()
+        cs = _make_cached_space(pages=[page])
+
+        real_write_atomic = _write_text_atomic
+
+        def fail_html_only(path, text, **kwargs):
+            if path.suffix == ".html":
+                raise OSError("disk full")
+            return real_write_atomic(path, text, **kwargs)
+
+        with patch("confluence_export.exporter._write_text_atomic", side_effect=fail_html_only):
+            result = exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        md_path = tmp_path / "Test-Page.md"
+        assert md_path in result
+        assert md_path.exists()
+        assert not (tmp_path / "Test-Page.html").exists()
+        assert "could not write debug HTML" in capsys.readouterr().err

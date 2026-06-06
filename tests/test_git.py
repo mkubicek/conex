@@ -776,6 +776,52 @@ class TestCommitExport:
         )
         assert status.stdout == ""
 
+    def test_symlink_ancestor_unlink_failure_blocks_restore_through_target(self, tmp_path):
+        """If the symlink ancestor of a protected deletion cannot be unlinked
+        (``ancestor.unlink()`` raises OSError), that file is excluded from the
+        restore batch — the restore must NOT proceed to write the last-good copy
+        through the dangling symlink into its target directory."""
+        import shutil
+
+        ensure_repo(tmp_path)
+        page = tmp_path / "Page"
+        media = page / ".media"
+        media.mkdir(parents=True)
+        (page / "Page.md").write_text("# last good")
+        (media / "img.png").write_bytes(b"PNG")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+        shutil.rmtree(media)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        media.symlink_to(outside, target_is_directory=True)
+
+        real_unlink = Path.unlink
+
+        def boom(self, *args, **kwargs):
+            if self.is_symlink():
+                raise OSError("cannot unlink symlink")
+            return real_unlink(self, *args, **kwargs)
+
+        with patch.object(Path, "unlink", boom):
+            commit_export(
+                tmp_path,
+                [],
+                "TEST",
+                is_full=True,
+                protection=_prot(page_exact=[page]),
+            )
+
+        # Restore was blocked: the symlink still stands, nothing was written into
+        # its target, and the file stays tracked-but-deleted (not resurrected
+        # through the symlink).
+        assert media.is_symlink()
+        assert not (outside / "img.png").exists()
+        ls = subprocess.run(
+            ["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True
+        ).stdout
+        assert "Page/.media/img.png" in ls  # still tracked, just not restored
+
     def test_exact_archived_subtree_protection_does_not_restore_moved_out_page(self, tmp_path):
         """Only still-archived page roots should be protected recursively. A page
         that moved out of _archived must be pruned even while a sibling archived
@@ -1230,6 +1276,18 @@ class TestGitDefensiveBranches:
         # mkstemp succeeds; the finally's probe.unlink() raises and is swallowed.
         monkeypatch.setattr(Path, "unlink", _boom)
         assert G._fs_is_case_insensitive(tmp_path) in (True, False)
+
+    def test_symlink_ancestor_returns_root_for_path_outside_output_dir(self, tmp_path):
+        """``_symlink_ancestor`` walks the dirs between output_dir and the file.
+        If the joined path escapes output_dir (an absolute rel_path makes
+        ``output_dir / rel_path`` resolve outside root), ``relative_to`` raises
+        ValueError and the helper falls back to returning root — so a downstream
+        symlink check is forced on the whole tree rather than silently skipped."""
+        from confluence_export.git import _symlink_ancestor
+
+        # An absolute path component replaces output_dir entirely, landing the
+        # joined path outside root -> the ValueError fallback returns root.
+        assert _symlink_ancestor(tmp_path, "/etc/hosts") == tmp_path.absolute()
 
     def test_remove_stale_files_returns_early_when_index_empty(self, tmp_path, monkeypatch):
         from confluence_export import git as G

@@ -8,7 +8,13 @@ import pytest
 import requests
 
 from confluence_export.client import AuthenticationError, ConfluenceClient
-from confluence_export.config import Config
+from confluence_export.config import (
+    ApiDialect,
+    AuthConfig,
+    AuthMode,
+    Config,
+    ConnectionProfile,
+)
 
 
 def _make_client(**kwargs) -> ConfluenceClient:
@@ -405,3 +411,242 @@ class TestVerboseLogging:
         client.verbose = False
         client._log("test message")
         assert capsys.readouterr().err == ""
+
+
+def _make_profile_client(auth_mode, *, dialect=ApiDialect.CLOUD_V2, **auth_kwargs) -> ConfluenceClient:
+    """Build a client from an explicit ConnectionProfile (the non-legacy path)."""
+    profile = ConnectionProfile(
+        site_url="https://x.atlassian.net",
+        api_base_url="https://x.atlassian.net",
+        cloud_id=None,
+        auth_mode=auth_mode,
+        api_dialect=dialect,
+        config_source="test",
+        interactive=False,
+        auth=AuthConfig(type=auth_mode, **auth_kwargs),
+    )
+    return ConfluenceClient(profile)
+
+
+class TestConstructorWithProfile:
+    def test_profile_passed_through_directly(self):
+        # Line 40: a ConnectionProfile is used as-is, not wrapped from a Config.
+        client = _make_profile_client(AuthMode.BASIC_API_TOKEN, email="a@b.com", token="tok")
+        assert client.base_url == "https://x.atlassian.net"
+        assert client.api_dialect is ApiDialect.CLOUD_V2
+        assert client.session.auth is not None
+
+    def test_cookie_auth_mode_sets_cookie_header(self, capsys):
+        # Lines 69-70: COOKIE auth_mode with a cookie_header installs the cookies.
+        client = _make_profile_client(
+            AuthMode.COOKIE,
+            dialect=ApiDialect.COOKIE_V1,
+            cookie_header="session=abc; other=def",
+        )
+        client.verbose = True
+        # Cookies were installed on the session, no Authorization header.
+        assert client.session.cookies.get("session") == "abc"
+        assert client.session.cookies.get("other") == "def"
+        assert "Authorization" not in client.session.headers
+        assert client.session.auth is None
+
+    def test_bearer_pat_sets_authorization_header(self):
+        client = _make_profile_client(AuthMode.BEARER_PAT, token="pat-xyz")
+        assert client.session.headers["Authorization"] == "Bearer pat-xyz"
+
+    def test_no_credentials_leaves_session_unauthenticated(self):
+        client = _make_profile_client(AuthMode.BASIC_API_TOKEN)
+        assert client.session.auth is None
+        assert "Authorization" not in client.session.headers
+
+
+class TestProbeListings:
+    def test_probe_page_listing_v2_returns_first_id(self):
+        # Lines 143-148: v2 path returns the first result's id.
+        client = _make_client()
+        from confluence_export.types import Space
+
+        space = Space(id="100", key="ENG", name="Engineering")
+        with patch.object(client, "_get") as mock:
+            mock.return_value = {"results": [{"id": "55"}, {"id": "56"}]}
+            page_id = client.probe_page_listing(space)
+        assert page_id == "55"
+        mock.assert_called_once_with(
+            "/wiki/api/v2/spaces/100/pages", {"limit": "1"}
+        )
+
+    def test_probe_page_listing_v2_empty_returns_none(self):
+        # Lines 146-147: empty results -> None.
+        client = _make_client()
+        from confluence_export.types import Space
+
+        space = Space(id="100", key="ENG", name="Engineering")
+        with patch.object(client, "_get", return_value={"results": []}):
+            assert client.probe_page_listing(space) is None
+
+    def test_probe_page_listing_v1_uses_content_endpoint(self):
+        # Lines 132-142: cookie_v1 path queries /content with spaceKey.
+        client = _make_client()
+        client.set_cookies("session=abc")
+        client._space_key_by_id["100"] = "ENG"
+        from confluence_export.types import Space
+
+        space = Space(id="100", key="", name="Engineering")
+        with patch.object(client, "_get") as mock:
+            mock.return_value = {"results": [{"id": "9"}]}
+            page_id = client.probe_page_listing(space)
+        assert page_id == "9"
+        path, params = mock.call_args.args
+        assert path == "/wiki/rest/api/content"
+        assert params["spaceKey"] == "ENG"
+        assert params["type"] == "page"
+
+    def test_probe_attachment_listing_v2(self):
+        # Line 158: v2 attachment probe.
+        client = _make_client()
+        with patch.object(client, "_get", return_value={"results": []}) as mock:
+            client.probe_attachment_listing("42")
+        mock.assert_called_once_with(
+            "/wiki/api/v2/pages/42/attachments", {"limit": "1"}
+        )
+
+    def test_probe_attachment_listing_v1(self):
+        # Lines 152-156: cookie_v1 attachment probe.
+        client = _make_client()
+        client.set_cookies("session=abc")
+        with patch.object(client, "_get", return_value={"results": []}) as mock:
+            client.probe_attachment_listing("42")
+        mock.assert_called_once_with(
+            "/wiki/rest/api/content/42/child/attachment", {"limit": "1"}
+        )
+
+
+class TestPaginateOffset:
+    def test_single_page(self):
+        # Lines 224-234: single page, no next link.
+        client = _make_client()
+        with patch.object(client, "_get") as mock:
+            mock.return_value = {"results": [{"id": "1"}, {"id": "2"}], "_links": {}}
+            results = client._paginate_offset("/wiki/rest/api/space")
+        assert [r["id"] for r in results] == ["1", "2"]
+
+    def test_multi_page_follows_next_link(self):
+        # Lines 232-240: a next link drives a second fetch with parsed params.
+        client = _make_client()
+        with patch.object(client, "_get") as mock:
+            mock.side_effect = [
+                {"results": [{"id": "1"}], "_links": {"next": "/wiki/rest/api/space?start=25&limit=25"}},
+                {"results": [{"id": "2"}], "_links": {}},
+            ]
+            results = client._paginate_offset("/wiki/rest/api/space", {"limit": "25"})
+        assert [r["id"] for r in results] == ["1", "2"]
+        # Second call uses the path + params parsed out of the next link.
+        second_path, second_params = mock.call_args_list[1].args
+        assert second_path == "/wiki/rest/api/space"
+        assert second_params == {"start": "25", "limit": "25"}
+
+
+class TestSpaceKeyForV1:
+    def test_resolves_via_get_spaces_when_not_cached(self):
+        # Lines 275-277: not cached -> scan get_spaces() for a matching id.
+        client = _make_client()
+        from confluence_export.types import Space
+
+        matching = Space(id="100", key="ENG", name="Engineering")
+        other = Space(id="200", key="OPS", name="Operations")
+        with patch.object(client, "get_spaces", return_value=[other, matching]):
+            assert client._space_key_for_v1("100") == "ENG"
+
+    def test_last_resort_returns_input_when_unknown(self):
+        # Line 280: no cache hit, no get_spaces match -> echo the input.
+        client = _make_client()
+        with patch.object(client, "get_spaces", return_value=[]):
+            assert client._space_key_for_v1("UNKNOWN") == "UNKNOWN"
+
+
+class TestFolderFromV1:
+    def test_maps_v1_folder_fields(self):
+        # Lines 325-329 (and the returned dict): v1 folder mapping.
+        client = _make_client()
+        data = {
+            "id": 77,
+            "title": "Docs",
+            "space": {"id": "100"},
+            "ancestors": [{"id": "1"}, {"id": "5", "type": "page"}],
+            "extensions": {"position": 3},
+        }
+        result = client._folder_from_v1(data)
+        assert result == {
+            "id": "77",
+            "title": "Docs",
+            "spaceId": "100",
+            "parentId": "5",
+            "parentType": "page",
+            "position": 3,
+            "status": "folder",
+        }
+
+    def test_no_ancestors_yields_empty_parent(self):
+        client = _make_client()
+        result = client._folder_from_v1({"id": "9", "title": "Top"})
+        assert result["parentId"] == ""
+        assert result["parentType"] == ""
+        assert result["position"] == 0
+
+
+class TestGetSpaceByKeyV1:
+    def test_404_returns_none(self):
+        # Lines 408-410: a 404 from the v1 space endpoint maps to None.
+        client = _make_client()
+        client.set_cookies("session=abc")
+        err_resp = MagicMock()
+        err_resp.status_code = 404
+        http_err = requests.exceptions.HTTPError(response=err_resp)
+        with patch.object(client, "_get", side_effect=http_err):
+            assert client.get_space_by_key("MISSING") is None
+
+    def test_other_http_error_reraises(self):
+        # Line 411: a non-404 HTTP error propagates.
+        client = _make_client()
+        client.set_cookies("session=abc")
+        err_resp = MagicMock()
+        err_resp.status_code = 500
+        http_err = requests.exceptions.HTTPError(response=err_resp)
+        with patch.object(client, "_get", side_effect=http_err):
+            with pytest.raises(requests.exceptions.HTTPError):
+                client.get_space_by_key("ENG")
+
+    def test_success_maps_v1_space(self):
+        client = _make_client()
+        client.set_cookies("session=abc")
+        with patch.object(client, "_get") as mock:
+            mock.return_value = {"id": "100", "key": "ENG", "name": "Engineering"}
+            space = client.get_space_by_key("ENG")
+        assert space is not None
+        assert space.id == "100"
+        assert space.key == "ENG"
+
+
+class TestGetFolderByIdV1:
+    def test_cookie_v1_uses_content_endpoint(self):
+        # Lines 434-439: cookie_v1 folder fetch goes through /content + v1 mapper.
+        client = _make_client()
+        client.set_cookies("session=abc")
+        with patch.object(client, "_get") as mock:
+            mock.return_value = {
+                "id": "77",
+                "title": "Docs",
+                "space": {"id": "100"},
+            }
+            result = client.get_folder_by_id("77")
+        assert result["id"] == "77"
+        assert result["status"] == "folder"
+        path, params = mock.call_args.args
+        assert path == "/wiki/rest/api/content/77"
+        assert params["expand"] == "ancestors,space,extensions"
+
+    def test_cookie_v1_failure_returns_none(self):
+        client = _make_client()
+        client.set_cookies("session=abc")
+        with patch.object(client, "_get", side_effect=Exception("boom")):
+            assert client.get_folder_by_id("77") is None

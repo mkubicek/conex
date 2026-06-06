@@ -155,3 +155,11 @@ class TestStability:
         assert plan_forward["10"].name == "Report"
         assert plan_forward["2"].name == "report-2"
         assert plan_forward["30"].name == "REPORT-3"
+
+
+def test_truncate_with_suffix_all_dash_base_falls_back_to_untitled():
+    # Defensive branch: a base that truncates to empty (all dashes) must not yield a
+    # leading-dash segment like "-2"; it falls back to "untitled" + suffix.
+    from confluence_export.layout import _truncate_with_suffix
+
+    assert _truncate_with_suffix("---", "-2") == "untitled-2"

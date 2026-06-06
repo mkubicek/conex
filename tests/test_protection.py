@@ -14,9 +14,12 @@ from confluence_export.protection import (
     ProtectedDir,
     ProtectionSet,
     SubtreeProtection,
+    _media_owner_dir,
     build_protected,
     media_file_is_preserved,
+    media_owner_dirs_from_written_files,
     move_window_dirs,
+    page_dirs_from_written_files,
     prune_media_owner_set,
 )
 
@@ -226,3 +229,73 @@ class TestMoveWindowDirs:
     def test_empty_pre_reconcile_is_just_page_dir(self, tmp_path):
         page_dir = tmp_path / "P"
         assert move_window_dirs(page_dir, "id1", {}) == [page_dir]
+
+
+class TestMediaOwnerDir:
+    def test_returns_owner_dir_for_media_path(self, tmp_path):
+        # A tracked .media file folds to the RESOLVED owner page dir (the path
+        # segments before the .media component).
+        rel = f"Space/Page/{MEDIA_DIR_NAME}/a.png"
+        assert _media_owner_dir(tmp_path, rel) == (
+            tmp_path / "Space" / "Page"
+        ).resolve()
+
+    def test_returns_none_when_not_under_media(self, tmp_path):
+        # Line 247: a path with no .media component is not media-owned -> None.
+        assert _media_owner_dir(tmp_path, "Space/Page/Page.md") is None
+
+
+class TestPageDirsFromWrittenFiles:
+    def test_media_file_folds_to_owner_dir(self, tmp_path):
+        out = tmp_path / "out"
+        media_file = out / "Space" / "Page" / MEDIA_DIR_NAME / "a.png"
+        dirs = page_dirs_from_written_files(out, [media_file])
+        assert dirs == frozenset({(out / "Space" / "Page").resolve()})
+
+    def test_md_and_html_use_parent_dir(self, tmp_path):
+        out = tmp_path / "out"
+        md = out / "Space" / "Page" / "Page.md"
+        html = out / "Space" / "Other" / "Other.html"
+        dirs = page_dirs_from_written_files(out, [md, html])
+        assert dirs == frozenset(
+            {(out / "Space" / "Page").resolve(), (out / "Space" / "Other").resolve()}
+        )
+
+    def test_other_suffix_contributes_nothing(self, tmp_path):
+        # A non-.md/.html, non-media file under output_dir is ignored entirely.
+        out = tmp_path / "out"
+        assert page_dirs_from_written_files(out, [out / "Page" / "note.txt"]) == (
+            frozenset()
+        )
+
+    def test_file_outside_output_dir_is_skipped(self, tmp_path):
+        # Lines 262-263: a written file that resolves OUTSIDE output_dir raises
+        # ValueError on relative_to and is skipped, contributing nothing.
+        out = tmp_path / "out"
+        outside = tmp_path / "elsewhere" / "Page" / "Page.md"
+        inside = out / "Page" / "Page.md"
+        dirs = page_dirs_from_written_files(out, [outside, inside])
+        assert dirs == frozenset({(out / "Page").resolve()})
+
+
+class TestMediaOwnerDirsFromWrittenFiles:
+    def test_media_file_folds_to_owner_dir(self, tmp_path):
+        out = tmp_path / "out"
+        media_file = out / "Space" / "Page" / MEDIA_DIR_NAME / "a.png"
+        owners = media_owner_dirs_from_written_files(out, [media_file])
+        assert owners == frozenset({(out / "Space" / "Page").resolve()})
+
+    def test_non_media_file_contributes_nothing(self, tmp_path):
+        # Only .media files count here; a plain page file under output_dir is ignored.
+        out = tmp_path / "out"
+        owners = media_owner_dirs_from_written_files(out, [out / "Page" / "Page.md"])
+        assert owners == frozenset()
+
+    def test_file_outside_output_dir_is_skipped(self, tmp_path):
+        # Lines 283-284: a media file that resolves OUTSIDE output_dir raises
+        # ValueError on relative_to and is skipped, contributing nothing.
+        out = tmp_path / "out"
+        outside = tmp_path / "elsewhere" / "Page" / MEDIA_DIR_NAME / "a.png"
+        inside = out / "Page" / MEDIA_DIR_NAME / "b.png"
+        owners = media_owner_dirs_from_written_files(out, [outside, inside])
+        assert owners == frozenset({(out / "Page").resolve()})

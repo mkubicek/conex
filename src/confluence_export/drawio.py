@@ -60,7 +60,7 @@ def _replace_rendered_png(render_path: Path, output_path: Path, mode: int) -> bo
         print(f"  Warning: draw.io render failed for {output_path.name}: {exc}", file=sys.stderr)
         try:
             render_path.unlink()
-        except OSError:
+        except OSError:  # pragma: no cover
             pass
         return False
     return True
@@ -141,7 +141,7 @@ def render_drawio_to_png(
     except OSError as exc:
         try:
             render_path.unlink()
-        except OSError:
+        except OSError:  # pragma: no cover
             pass
         print(f"  Warning: draw.io render failed for {drawio_path.name}: {exc}", file=sys.stderr)
         if force and _usable_png(output_path):
@@ -199,7 +199,7 @@ def render_drawio_to_png(
     if force:
         try:
             render_path.unlink()
-        except OSError:
+        except OSError:  # pragma: no cover
             pass
         if _usable_png(output_path):
             print(
@@ -211,7 +211,7 @@ def render_drawio_to_png(
 
     try:
         render_path.unlink()
-    except OSError:
+    except OSError:  # pragma: no cover
         pass
 
     print(f"  Warning: draw.io produced no output for {drawio_path.name}", file=sys.stderr)

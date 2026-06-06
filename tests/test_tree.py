@@ -222,3 +222,11 @@ def test_page_path_unknown_id(sample_pages):
 def test_find_node_by_path_not_found(sample_pages):
     roots = build_tree(sample_pages)
     assert find_node_by_path(roots, "/Root/Nonexistent") is None
+
+
+def test_find_node_by_path_descends_past_leaf(sample_pages):
+    # Path goes one level deeper than the tree: every existing segment matches
+    # ("Grandchild A1" is a leaf), then recursion hits an empty node list with a
+    # remaining part, so resolution fails rather than returning the leaf.
+    roots = build_tree(sample_pages)
+    assert find_node_by_path(roots, "/Root/Child A/Grandchild A1/TooDeep") is None

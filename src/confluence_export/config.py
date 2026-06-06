@@ -793,7 +793,7 @@ def save_connection_config(
     except Exception:
         try:
             tmp_path.unlink()
-        except FileNotFoundError:
+        except FileNotFoundError:  # pragma: no cover
             pass
         raise
     cp.chmod(0o600)

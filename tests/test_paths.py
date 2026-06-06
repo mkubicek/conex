@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from confluence_export.paths import (
+    _with_suffix_token,
+    drawio_render_name,
     is_safe_component,
     plan_attachment_names,
     resolve_within,
@@ -168,3 +170,76 @@ class TestResolveWithin:
 
         with pytest.raises(ValueError, match="symlink"):
             resolve_within(tmp_path, "img.png")
+
+
+class TestWithSuffixToken:
+    def test_drops_extension_when_suffix_alone_exceeds_max_len(self):
+        # A pathological name whose combined suffixes are longer than max_len:
+        # there is no room to keep any extension, so the suffix is dropped and
+        # the collision marker is still appended to a non-empty stem.
+        name = "a" + ".x" * 60  # 120-char suffix, far over max_len
+        out = _with_suffix_token(name, "tok")
+
+        assert len(out) <= 100
+        assert not out.endswith(".x")
+        assert "-tok" in out
+        assert is_safe_component(out)
+
+    def test_keeps_extension_when_it_fits(self):
+        out = _with_suffix_token("photo.png", "tok")
+
+        assert out.endswith(".png")
+        assert "-tok" in out
+
+
+class TestDrawioRenderName:
+    def test_uses_default_name_when_unreserved(self):
+        assert drawio_render_name("diagram.drawio", "tok", set()) == "diagram.drawio.png"
+
+    def test_appends_token_on_collision(self):
+        out = drawio_render_name("diagram.drawio", "tok", {"diagram.drawio.png"})
+
+        assert out != "diagram.drawio.png"
+        assert is_safe_component(out)
+        assert "tok" in out
+
+
+class TestPlanAttachmentNamesEdges:
+    def test_duplicate_attachment_id_is_deduplicated(self):
+        # Two attachments share one id: the second is skipped entirely, so the
+        # id maps to exactly one (the first-seen) filename.
+        first = SimpleNamespace(id="dup", title="first.png")
+        second = SimpleNamespace(id="dup", title="second.png")
+
+        plan = plan_attachment_names([first, second])
+
+        assert list(plan.by_id) == ["dup"]
+        assert plan.by_id["dup"] == "first.png"
+        assert plan.for_attachment(second) == "first.png"
+
+
+class TestAttachmentNamePlanLookups:
+    def test_for_attachment_falls_back_to_title_for_unplanned_object(self):
+        planned = SimpleNamespace(id="att1", title="doc.png")
+        plan = plan_attachment_names([planned])
+
+        # A different, unplanned object (no id, distinct object identity) that
+        # nonetheless shares the title resolves via the by_title fallback.
+        other_same_title = SimpleNamespace(id="", title="doc.png")
+        assert plan.for_attachment(other_same_title) == "doc.png"
+
+    def test_for_attachment_sanitizes_unknown_title(self):
+        plan = plan_attachment_names([SimpleNamespace(id="att1", title="doc.png")])
+
+        unknown = SimpleNamespace(id="", title="../evil.png")
+        out = plan.for_attachment(unknown)
+
+        assert out not in plan.by_title.values()
+        assert is_safe_component(out)
+
+    def test_for_reference_prefers_attachment_id(self):
+        a = SimpleNamespace(id="att1", title="a/b.png")
+        plan = plan_attachment_names([a])
+
+        # The id resolves regardless of the (mismatched) title passed in.
+        assert plan.for_reference("does-not-matter", attachment_id="att1") == plan.by_id["att1"]

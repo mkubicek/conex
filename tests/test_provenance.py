@@ -176,3 +176,67 @@ class TestRecursiveArchivedDirs:
             output_dir=tmp_path,
         )
         assert recursive_archived_dirs(p) == []
+
+    def test_entry_outside_output_dir_is_ignored_by_per_root_rescue(self, tmp_path):
+        # An on-disk entry whose file_path is NOT under output_dir (e.g. a scan
+        # carrying a stray absolute path) must be skipped by the per-entry rescue
+        # loop, never crashing relative_to. A genuinely-archived entry that IS under
+        # the live-claimed root is still rescued, proving the skip targeted only the
+        # foreign entry.
+        out = tmp_path / "out"
+        (out / "_archived" / "Old").mkdir(parents=True)
+        foreign = ExportedPage(
+            page_id="foreign",
+            version=1,
+            title="Foreign",
+            path="/_archived/Foreign",
+            file_path=tmp_path / "elsewhere" / "_archived" / "Foreign" / "Foreign.md",
+            status="archived",
+        )
+        good = _entry(out, "_archived/Old", status="archived", path="/_archived/Old")
+        p = _prov(
+            plan={"live": PurePosixPath("_archived")},
+            on_disk_entries=(foreign, good),
+            output_dir=out,
+        )
+        dirs = {d.resolve() for d in recursive_archived_dirs(p)}
+        assert (out / "_archived" / "Old").resolve() in dirs
+        assert (tmp_path / "elsewhere" / "_archived" / "Foreign").resolve() not in dirs
+
+    def test_archived_entry_under_unowned_root_skipped_by_per_root_rescue(self, tmp_path):
+        # An archived-status entry under an "_archived" root that NO live page claims
+        # is skipped by the per-entry rescue loop (root_name not in
+        # live_root_segments): such roots are preserved WHOLE by the directory branch
+        # instead, so the per-root rescue dict must stay empty for them. We prove the
+        # whole root is preserved (not the entry's parent dir individually).
+        (tmp_path / "_archived" / "Old").mkdir(parents=True)
+        (tmp_path / "_archived" / "Old" / "Old.md").write_text("# Old")
+        entry = _entry(tmp_path, "_archived/Old", status="archived", path="/_archived/Old")
+        p = _prov(
+            plan={"live": PurePosixPath("Live")},  # no live page owns "_archived"
+            on_disk_entries=(entry,),
+            output_dir=tmp_path,
+        )
+        dirs = [d.resolve() for d in recursive_archived_dirs(p)]
+        # Whole root preserved by the directory-existence branch...
+        assert (tmp_path / "_archived").resolve() in dirs
+        # ...and the per-entry rescue did NOT additionally add the inner page dir.
+        assert (tmp_path / "_archived" / "Old").resolve() not in dirs
+
+    def test_entry_under_non_archived_root_skipped_by_per_root_rescue(self, tmp_path):
+        # An on-disk entry under a normal (non-archived) root is skipped by the
+        # per-entry rescue loop (its first segment is not an archived root segment),
+        # so it never gets preserved. A genuinely-archived entry under the
+        # live-claimed "_archived" root is still rescued, proving the skip was
+        # selective rather than blanket.
+        (tmp_path / "_archived" / "Old").mkdir(parents=True)
+        normal = _entry(tmp_path, "Docs/Page", status="archived", path="/Docs/Page")
+        good = _entry(tmp_path, "_archived/Old", status="archived", path="/_archived/Old")
+        p = _prov(
+            plan={"live": PurePosixPath("_archived")},
+            on_disk_entries=(normal, good),
+            output_dir=tmp_path,
+        )
+        dirs = {d.resolve() for d in recursive_archived_dirs(p)}
+        assert (tmp_path / "_archived" / "Old").resolve() in dirs
+        assert (tmp_path / "Docs" / "Page").resolve() not in dirs

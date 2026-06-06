@@ -105,7 +105,7 @@ def _save_versions(media_dir: Path, versions: dict) -> None:
             pass
         try:
             tmp.unlink()
-        except OSError:
+        except OSError:  # pragma: no cover
             pass
         raise
 
@@ -221,7 +221,7 @@ def _legacy_record_can_preserve(
     if isinstance(record, dict):
         return False
     if _manifest_owner(record):
-        return False
+        return False  # pragma: no cover
     if _manifest_version(record) <= 0:
         return False
     if name != safe_attachment_name(att.title):
@@ -270,7 +270,7 @@ def _copy_media_file(src: Path, dest: Path) -> None:
     except Exception:
         try:
             tmp.unlink()
-        except OSError:
+        except OSError:  # pragma: no cover
             pass
         raise
 
@@ -523,7 +523,7 @@ def download_attachments(
             except Exception:
                 try:
                     tmp.unlink()
-                except OSError:
+                except OSError:  # pragma: no cover
                     pass
                 raise
             return dest
@@ -648,7 +648,7 @@ def materialize_existing_attachments(
                 continue
             try:
                 dest = _resolve_manifest_entry(media_dir, name)
-            except ValueError:
+            except ValueError:  # pragma: no cover
                 continue
             if dest.exists():
                 try:

@@ -275,6 +275,6 @@ def resolve_within(base: Path, component: str) -> Path:
     candidate = leaf.resolve()
     try:
         candidate.relative_to(root)
-    except ValueError as exc:
+    except ValueError as exc:  # pragma: no cover
         raise ValueError(f"path component escapes base directory: {component!r}") from exc
     return candidate

@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from confluence_export.drawio import (
+    _usable_png,
     detect_drawio_macros,
     find_drawio_attachments,
     find_drawio_cli,
@@ -425,3 +426,92 @@ class TestRenderDrawioToPng:
              patch("confluence_export.drawio.time.sleep"):
             result = render_drawio_to_png(drawio)
             assert result == expected_png
+
+
+class TestUsablePng:
+    def test_stat_oserror_returns_false(self, tmp_path):
+        """An OS-level error while probing the path is treated as not-usable."""
+        png = tmp_path / "test.png"
+        png.write_bytes(b"data")
+        with patch.object(Path, "stat", side_effect=OSError("boom")):
+            assert _usable_png(png) is False
+
+    def test_missing_file_returns_false(self, tmp_path):
+        assert _usable_png(tmp_path / "nope.png") is False
+
+
+class TestRenderEdgeCases:
+    def test_output_path_is_directory_with_cli_present(self, tmp_path, capsys):
+        """When the CLI is available but the output path is a directory, abort."""
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        png = tmp_path / "test.drawio.png"
+        png.mkdir()
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
+             patch("subprocess.Popen") as mock_popen:
+            result = render_drawio_to_png(drawio)
+
+        assert result is None
+        assert "output path is a directory" in capsys.readouterr().err
+        mock_popen.assert_not_called()
+
+    def test_replace_oserror_returns_none_and_cleans_temp(self, tmp_path, capsys):
+        """If os.replace fails moving the temp PNG into place, render reports failure."""
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        png = tmp_path / "test.drawio.png"
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+
+        def fake_popen(*args, **kwargs):
+            output = Path(args[0][args[0].index("--output") + 1])
+            output.write_bytes(b"PNG data")
+            return mock_proc
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
+             patch("subprocess.Popen", side_effect=fake_popen), \
+             patch("confluence_export.drawio.os.replace", side_effect=OSError("cross-device")):
+            result = render_drawio_to_png(drawio)
+
+        assert result is None
+        assert not png.exists()
+        assert not list(tmp_path.glob(".drawio-*.png"))
+        assert "render failed" in capsys.readouterr().err
+
+    def test_file_usable_after_loop_with_zero_return_code(self, tmp_path):
+        """Process exits 0 with no file in-loop, then the PNG lands before the post-loop check."""
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        expected_png = drawio.with_suffix(".drawio.png")
+
+        mock_proc = MagicMock()
+        render_path = None
+        poll_seq = iter([0, 0, 0, 0])
+
+        def fake_popen(*args, **kwargs):
+            nonlocal render_path
+            render_path = Path(args[0][args[0].index("--output") + 1])
+            return mock_proc
+
+        # First poll (loop) returns 0 with no usable file -> loop breaks.
+        # Second poll (the finally-block check at line 185) writes the file,
+        # so the post-loop _usable_png + rc==0 branch fires.
+        poll_count = [0]
+
+        def fake_poll():
+            poll_count[0] += 1
+            if poll_count[0] == 2 and render_path is not None:
+                render_path.write_bytes(b"PNG data")
+            return next(poll_seq)
+
+        mock_proc.poll.side_effect = fake_poll
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
+             patch("subprocess.Popen", side_effect=fake_popen), \
+             patch("confluence_export.drawio.time.sleep"):
+            result = render_drawio_to_png(drawio)
+
+        assert result == expected_png
+        assert expected_png.read_bytes() == b"PNG data"

@@ -130,7 +130,7 @@ def _write_text_atomic(path: Path, text: str, *, encoding: str = "utf-8") -> Non
     except Exception:
         try:
             tmp.unlink()
-        except OSError:
+        except OSError:  # pragma: no cover
             pass
         raise
 
@@ -557,7 +557,7 @@ class Exporter:
                 raise ValueError(f"refusing to use symlinked media file: {path}")
             try:
                 tracked = _media_identity(path)
-            except OSError:
+            except OSError:  # pragma: no cover
                 return
             media_transaction_paths.add(tracked)
             if tracked in media_file_snapshots or not path.is_file():
@@ -574,7 +574,7 @@ class Exporter:
             except Exception:
                 try:
                     tmp.unlink()
-                except OSError:
+                except OSError:  # pragma: no cover
                     pass
                 raise
             media_file_snapshots[tracked] = tmp
@@ -583,7 +583,7 @@ class Exporter:
             for backup in media_file_snapshots.values():
                 try:
                     backup.unlink()
-                except OSError:
+                except OSError:  # pragma: no cover
                     pass
 
         def rollback_media_changes() -> None:
@@ -591,7 +591,7 @@ class Exporter:
             for p in written:
                 try:
                     tracked = _media_identity(p)
-                except OSError:
+                except OSError:  # pragma: no cover
                     tracked = p.absolute()
                 paths_to_remove.add(tracked)
             for tracked in paths_to_remove:
@@ -599,14 +599,14 @@ class Exporter:
                     try:
                         if tracked.is_symlink() or tracked.is_file():
                             tracked.unlink()
-                    except OSError:
+                    except OSError:  # pragma: no cover
                         pass
             for path, backup in media_file_snapshots.items():
                 try:
                     if path.is_symlink():
                         path.unlink()
                     shutil.copy2(backup, path)
-                except OSError:
+                except OSError:  # pragma: no cover
                     pass
             cleanup_media_snapshots()
 

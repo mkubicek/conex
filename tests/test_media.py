@@ -645,6 +645,42 @@ class TestDownloadAttachments:
         versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
         assert versions[new_name]["id"] == "att1"
 
+    def test_failed_redownload_keeps_owned_destination_when_previous_copy_exists(
+        self, tmp_path
+    ):
+        """When a download fails but the planned destination already exists and is
+        owned by this attachment, the existing destination is returned (protecting
+        it from prune) even though a separate last-good copy lives at the old name."""
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        moved = _att(title="new.png", att_id="att1", version=2, download_link="/wiki/x")
+        new_name = plan_attachment_names([moved]).for_attachment(moved)
+        old_name = "old.png"
+        (media_dir / old_name).write_bytes(b"last-good")
+        (media_dir / new_name).write_bytes(b"already-here")
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            old_name: {
+                "version": 1,
+                "id": "att1",
+                "title": "old.png",
+                "key": attachment_identity(moved),
+            },
+            new_name: {
+                "version": 1,
+                "id": "att1",
+                "title": "new.png",
+                "key": attachment_identity(moved),
+            },
+        }))
+        client = MagicMock()
+        client.download_attachment_to_file.side_effect = Exception("network error")
+
+        result = download_attachments(client, [moved], media_dir)
+
+        assert media_dir / new_name in _attachment_paths(result)
+        # The download failed, so the pre-existing owned destination is kept as-is.
+        assert (media_dir / new_name).read_bytes() == b"already-here"
+
     def test_failed_redownload_ignores_symlinked_old_manifest_entry(self, tmp_path):
         media_dir = tmp_path / ".media"
         media_dir.mkdir()
@@ -1037,6 +1073,41 @@ class TestDownloadAttachments:
         versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
         assert versions[new_name]["id"] == "att1"
 
+    def test_no_media_materialization_keeps_last_good_when_wrong_owner_dest_unremovable(
+        self, tmp_path
+    ):
+        """If a wrong-owner entry occupies the planned name as a non-empty directory
+        it cannot be unlinked; materialization must not destroy the last-good file
+        at the old name nor drop its manifest entry."""
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        moved = _att(title="new.png", att_id="att1", version=1)
+        new_name = plan_attachment_names([moved]).for_attachment(moved)
+        old_name = "old.png"
+        (media_dir / old_name).write_bytes(b"last-good")
+        blocker = media_dir / new_name
+        blocker.mkdir()
+        (blocker / "inner").write_bytes(b"x")  # non-empty -> unlink() raises OSError
+        (media_dir / _VERSIONS_FILE).write_text(json.dumps({
+            old_name: {
+                "version": 1,
+                "id": "att1",
+                "title": "old.png",
+                "key": attachment_identity(moved),
+            },
+            new_name: {"version": 1, "id": "other", "title": "new.png", "key": "other"},
+        }))
+
+        written = materialize_existing_attachments([moved], media_dir)
+
+        # The directory blocks materialization; nothing new is written there.
+        assert (media_dir / new_name).is_dir()
+        assert media_dir / new_name not in written
+        # Last-good file and its manifest entry survive untouched.
+        assert (media_dir / old_name).read_bytes() == b"last-good"
+        versions = json.loads((media_dir / _VERSIONS_FILE).read_text())
+        assert old_name in versions
+
     def test_no_media_materialization_preserves_unrelated_manifest_entries(self, tmp_path):
         media_dir = tmp_path / ".media"
         media_dir.mkdir()
@@ -1210,6 +1281,148 @@ def test_load_versions_returns_empty_on_non_object_json(tmp_path):
 
     (tmp_path / _VERSIONS_FILE).write_text("[]")
     assert _load_versions(tmp_path) == {}
+
+
+class TestResolveManifestEntry:
+    """_resolve_manifest_entry maps unsafe/legacy manifest names to a contained
+    path or refuses them, so a hostile manifest can never read/write outside."""
+
+    def test_rejects_name_with_separator(self, tmp_path):
+        from confluence_export.media import _resolve_manifest_entry
+
+        with pytest.raises(ValueError, match="unsafe manifest path component"):
+            _resolve_manifest_entry(tmp_path, "a/b.png")
+
+    def test_rejects_name_equal_to_manifest_file(self, tmp_path):
+        from confluence_export.media import _VERSIONS_FILE, _resolve_manifest_entry
+
+        with pytest.raises(ValueError, match="unsafe manifest path component"):
+            _resolve_manifest_entry(tmp_path, _VERSIONS_FILE)
+
+    def test_rejects_legacy_symlinked_name(self, tmp_path):
+        from confluence_export.media import _resolve_manifest_entry
+
+        outside = tmp_path / "secret.txt"
+        outside.write_text("secret")
+        # ".hidden.png" is not a safe component, so resolution takes the symlink
+        # branch; pointing at a real file proves the symlink guard, not escape.
+        (tmp_path / ".hidden.png").symlink_to(outside)
+
+        with pytest.raises(ValueError, match="escapes base directory|symlink"):
+            _resolve_manifest_entry(tmp_path, ".hidden.png")
+        assert outside.read_text() == "secret"
+
+    def test_legacy_name_resolve_oserror_becomes_value_error(self, tmp_path, monkeypatch):
+        from confluence_export.media import _resolve_manifest_entry
+
+        name = ".hidden.png"
+        leaf = tmp_path / name
+        leaf.write_bytes(b"x")  # real file (not a symlink), forces the resolve() path
+        real_resolve = Path.resolve
+
+        def resolve_with_race(self, *args, **kwargs):
+            if self == leaf:
+                raise OSError("resolve race")
+            return real_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", resolve_with_race)
+
+        with pytest.raises(ValueError, match="unusable manifest path component"):
+            _resolve_manifest_entry(tmp_path, name)
+
+
+class TestManifestPredicates:
+    """Branch behavior of the small manifest-classification helpers that decide
+    whether an on-disk byte stream may be trusted for the current attachment."""
+
+    def test_manifest_version_zero_for_non_int_dict_version(self):
+        from confluence_export.media import _manifest_version
+
+        assert _manifest_version({"version": "not-an-int"}) == 0
+
+    def test_version_matches_legacy_non_colliding_empty_id(self):
+        from confluence_export.media import _version_matches
+
+        att = _att(title="img.png", version=1, att_id="")
+        # Legacy integer record proves only title+version; with no id and no
+        # name collision it is allowed to vouch for the bytes.
+        assert _version_matches({"img.png": 1}, "img.png", att, set()) is True
+
+    def test_version_matches_legacy_rejected_when_colliding(self):
+        from confluence_export.media import _version_matches
+        from confluence_export.paths import nfc_casefold, safe_attachment_name
+
+        att = _att(title="img.png", version=1, att_id="")
+        collisions = {nfc_casefold(safe_attachment_name("img.png"))}
+        assert _version_matches({"img.png": 1}, "img.png", att, collisions) is False
+
+    def test_legacy_can_preserve_rejects_name_mismatch(self):
+        from confluence_export.media import _legacy_record_can_preserve
+
+        att = _att(title="img.png", version=1, att_id="")
+        # Disk filename differs from the attachment's safe name -> cannot vouch.
+        assert _legacy_record_can_preserve(2, "other.png", att, set()) is False
+
+    def test_legacy_can_migrate_rejects_zero_version(self):
+        from confluence_export.media import _legacy_record_can_migrate
+
+        att = _att(title="old.png", version=1, att_id="")
+        assert _legacy_record_can_migrate(0, "old.png", "old.png", att, set()) is False
+
+    def test_legacy_can_migrate_rejects_target_name_mismatch(self):
+        from confluence_export.media import _legacy_record_can_migrate
+
+        att = _att(title="old.png", version=1, att_id="")
+        # old_name matches the title, but the planned target name does not match
+        # the safe name -> not a clean migration.
+        assert (
+            _legacy_record_can_migrate(2, "old.png", "elsewhere.png", att, set())
+            is False
+        )
+
+    def test_unmanifested_can_preserve_rejects_name_mismatch(self):
+        from confluence_export.media import _unmanifested_file_can_preserve
+
+        att = _att(title="img.png", version=1)
+        assert _unmanifested_file_can_preserve(None, "other.png", att, set()) is False
+
+
+class TestCopyAndSameFileHelpers:
+    def test_copy_media_file_cleans_tmp_and_reraises_on_copy_failure(
+        self, tmp_path, monkeypatch
+    ):
+        from confluence_export.media import _copy_media_file
+
+        src = tmp_path / "src.bin"
+        src.write_bytes(b"data")
+        dest = tmp_path / "dest.bin"
+
+        def boom(_src, _dst):
+            raise RuntimeError("copy failed")
+
+        monkeypatch.setattr("confluence_export.media.shutil.copy2", boom)
+
+        with pytest.raises(RuntimeError, match="copy failed"):
+            _copy_media_file(src, dest)
+
+        assert not dest.exists()
+        # No half-written .copy-*.tmp scratch file is left behind.
+        assert [p.name for p in tmp_path.iterdir()] == ["src.bin"]
+
+    def test_same_existing_file_returns_false_on_oserror(self, tmp_path, monkeypatch):
+        from confluence_export.media import _same_existing_file
+
+        a = tmp_path / "a"
+        a.write_bytes(b"1")
+        b = tmp_path / "b"
+        b.write_bytes(b"2")
+
+        def raising_samefile(self, _other):
+            raise OSError("stat race")
+
+        monkeypatch.setattr(Path, "samefile", raising_samefile)
+
+        assert _same_existing_file(a, b) is False
 
 
 class TestPathTraversal:

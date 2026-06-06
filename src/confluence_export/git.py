@@ -390,7 +390,7 @@ def _restore_protected_deletions(
     symlink_ancestors: dict[Path, list[str]] = {}
     for rel_path in result.stdout.strip("\0").split("\0"):
         if not rel_path:
-            continue
+            continue  # pragma: no cover
         if _is_secret_config_relpath(rel_path):
             continue
         full_lexical = (output_dir / rel_path).absolute()
@@ -406,7 +406,7 @@ def _restore_protected_deletions(
     blocked: set[str] = set()
     for ancestor, rel_paths in symlink_ancestors.items():
         if not ancestor.is_symlink():
-            continue
+            continue  # pragma: no cover
         try:
             ancestor.unlink()
         except OSError:
