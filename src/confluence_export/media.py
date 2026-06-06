@@ -207,6 +207,13 @@ def _version_matches(
         return True
     if isinstance(record, dict):
         return False
+    # A legacy ``{title: int}`` manifest (written by older conex) records no
+    # attachment id, so it cannot prove the on-disk file is THIS attachment rather
+    # than a same-titled, same-version one. We DELIBERATELY re-download instead of
+    # trusting it (unlike older versions, which skipped on title+version alone).
+    # This is one-time: the skip/download path rewrites the manifest in the current
+    # id-bearing format, so the next export skips unchanged attachments normally.
+    # Not a bug — see test_legacy_manifest_with_id_redownloads_before_claiming_owner.
     if att.id:
         return False
     return nfc_casefold(safe_attachment_name(att.title)) not in collision_bases

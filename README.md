@@ -141,6 +141,12 @@ By default, `export` and `diff` **refresh from Confluence**. Pass `--cached` to 
 
 Archived pages are skipped by default. `--include-archived` (on both `export` and `diff`) exports them under an `_archived/` subtree. A normal export that omits archived pages **preserves** a prior `--include-archived` export's `_archived/` content rather than pruning it.
 
+### Attachments
+
+Attachment downloads are best-effort: a transient network failure (timeout, dropped connection) or a `404` for an upstream-deleted attachment prints a `Warning:` to stderr and leaves the previously committed copy in place — the export still exits `0`. Check stderr after bulk runs if you need attachment completeness.
+
+The **first** export of a pre-existing export re-downloads its attachments once, to upgrade the attachment manifest (`.media/.versions.json`) to the current format. Transient warnings during that one-time pass are expected; subsequent exports skip unchanged attachments. (conex re-downloads rather than trusting an older manifest that can't prove a file is still the current attachment.)
+
 ## Git Versioning
 
 Exports are automatically versioned with git. After each export, only Confluence-sourced files are committed. If you've made local edits to previously exported files, those are captured in a separate commit first. Locally created files are never auto-committed.
