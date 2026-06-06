@@ -67,7 +67,7 @@ One caveat for `--no-media`: a normal export re-downloads a moved page's `.media
 ## Install
 
 ```bash
-uv pip install -e .
+uv pip install -e .   # or: pip install -e .
 ```
 
 ## Setup
@@ -76,7 +76,7 @@ uv pip install -e .
 confluence-export configure
 ```
 
-Stores your site URL and credentials to `~/.config/confluence-export/config.json`. You can also use env vars (`CONFLUENCE_SITE_URL`, `CONFLUENCE_BASE_URL`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`, `CONFLUENCE_PAT`, `CONFLUENCE_COOKIE`) or CLI flags (`--site-url`, `--base-url`, `--email`, `--api-token`, `--cookie`).
+Stores your site URL and credentials to `~/.config/confluence-export/config.json`. You can also use env vars (`CONFLUENCE_SITE_URL`, `CONFLUENCE_BASE_URL`, `CONFLUENCE_API_BASE_URL`, `CONFLUENCE_CLOUD_ID`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`, `CONFLUENCE_PAT`, `CONFLUENCE_COOKIE`, `CONFLUENCE_AUTH_TYPE`) or CLI flags (`--site-url`, `--base-url`, `--api-base-url`, `--cloud-id`, `--email`, `--api-token`, `--cookie`, `--auth-type`, `-v`/`--verbose`).
 
 Use a local config when an export directory should override the global default:
 
@@ -119,17 +119,27 @@ In non-interactive runs, commands never prompt for credentials. Run `confluence-
 ## Commands
 
 ```bash
-confluence-export spaces                            # list accessible spaces
-confluence-export tree SPACEKEY                     # show page hierarchy
-confluence-export find SPACEKEY "query"             # search pages by title
-confluence-export export SPACEKEY -o ./output       # export full space
-confluence-export export SPACEKEY --path /Sub/Tree  # export a subtree
-confluence-export export SPACEKEY --no-media        # skip attachments
-confluence-export export SPACEKEY --no-git          # skip git versioning
-confluence-export export SPACEKEY --no-author-lookup # skip Confluence user lookup
-confluence-export diff SPACEKEY ./output            # compare export vs. live
-confluence-export refresh SPACEKEY                  # force-refresh cache
+confluence-export spaces                              # list accessible spaces
+confluence-export tree SPACEKEY                       # show page hierarchy
+confluence-export find SPACEKEY "query"               # search pages by title
+confluence-export export SPACEKEY -o ./output         # export full space (refreshes from Confluence)
+confluence-export export SPACEKEY --path /Sub/Tree    # export a subtree
+confluence-export export SPACEKEY --no-children       # export a single page only
+confluence-export export SPACEKEY --include-archived  # also export archived pages (under _archived/)
+confluence-export export SPACEKEY --cached            # reuse the last cache, skip the refresh
+confluence-export export SPACEKEY --include-html      # save raw HTML next to the markdown
+confluence-export export SPACEKEY --no-media          # skip attachments
+confluence-export export SPACEKEY --no-drawio-render  # skip draw.io -> PNG rendering
+confluence-export export SPACEKEY --no-git            # skip git versioning
+confluence-export export SPACEKEY --no-author-lookup  # skip Confluence user lookup
+confluence-export diff SPACEKEY ./output              # compare export vs. live (read-only)
+confluence-export diff SPACEKEY ./output --path /Sub  # diff a subtree
+confluence-export refresh SPACEKEY                    # force-refresh cache
 ```
+
+By default, `export` and `diff` **refresh from Confluence**. Pass `--cached` to `export` (or run `refresh` first) to reuse the last fetched cache without hitting the API.
+
+Archived pages are skipped by default. `--include-archived` (on both `export` and `diff`) exports them under an `_archived/` subtree. A normal export that omits archived pages **preserves** a prior `--include-archived` export's `_archived/` content rather than pruning it.
 
 ## Git Versioning
 
