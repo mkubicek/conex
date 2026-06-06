@@ -622,14 +622,6 @@ def _cmd_export(
     # commit only adds in that mode (is_full=False). Shared predicate with the
     # exporter (is_full_export) so the relocation gate and the prune gate agree.
     is_full = is_full_export(path_filter, no_children)
-    # Route protected paths to the matching protection scope in commit_export:
-    #   * page-EXACT for archived pages whose precise on-disk target is known
-    #     (M1-exact: a page moved out of an archived parent stays prunable);
-    #   * RECURSIVE for skipped pages (a transient failure — preserve the page
-    #     AND its descendants, whose true upstream state we cannot know this run)
-    #     and for a wholesale-omitted _archived subtree on a blind run.
-    protected_dirs = result.preserved_page_paths
-    protected_subtree_dirs = result.preserved_paths + result.skipped_paths
     # ──────────────────────────────────────────────────────────────────────────
     # DATA-SAFETY DECISION 1 (deliberate — do NOT "fix" this into pruning):
     # If the API / cache returns ZERO live pages, we KEEP the previously-committed
@@ -648,7 +640,9 @@ def _cmd_export(
     #      were SKIPPED this run and their tracked deletions must be restored
     #      (RF-B/M2). Archived-preservation sets are pure protection inputs; they
     #      never independently open the gate.
-    # See provenance.py for the archived-visibility model.
+    # Scope routing (page-exact vs recursive) is welded into the typed
+    # ProtectionSet that result.protection() produces — there is no untyped slot
+    # to mis-route here. See provenance.py / protection.py for the models.
     # ──────────────────────────────────────────────────────────────────────────
     if use_git and (
         result.written_files
@@ -661,9 +655,7 @@ def _cmd_export(
             result.written_files,
             space_key,
             is_full=is_full,
-            protected_dirs=protected_dirs,
-            protected_subtree_dirs=protected_subtree_dirs,
-            prune_media_dirs=result.prune_media_dirs,
+            protection=result.protection(out),
             preserve_media=no_media,
         )
 

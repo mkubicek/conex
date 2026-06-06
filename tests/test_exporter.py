@@ -11,6 +11,11 @@ import yaml
 
 from confluence_export.exporter import ExportResult, Exporter, _write_text_atomic
 from confluence_export.media import _VERSIONS_FILE
+from confluence_export.protection import (
+    PageExactProtection,
+    ProtectionSet,
+    SubtreeProtection,
+)
 from confluence_export.paths import attachment_identity, plan_attachment_names
 from confluence_export.types import (
     Attachment,
@@ -20,6 +25,15 @@ from confluence_export.types import (
     Space,
     Version,
 )
+
+
+def _prot(*, page_exact=(), subtrees=()) -> ProtectionSet:
+    """Typed ProtectionSet from plain dir lists, pinning exactly the protections a
+    commit_export test intends (page-exact vs recursive scope made explicit)."""
+    return ProtectionSet(
+        page_exact=tuple(PageExactProtection(p) for p in page_exact),
+        subtrees=tuple(SubtreeProtection(p) for p in subtrees),
+    )
 
 
 def _make_space():
@@ -1449,8 +1463,10 @@ class TestReconcileWriterHandshake:
         r2 = exporter.export_space(_make_space(), tmp_path, force_refresh=True)
         commit_export(
             tmp_path, r2.written_files, "TEST",
-            protected_dirs=r2.preserved_page_paths,
-            protected_subtree_dirs=r2.preserved_paths + r2.skipped_paths,
+            protection=_prot(
+                page_exact=r2.preserved_page_paths,
+                subtrees=r2.preserved_paths + r2.skipped_paths,
+            ),
         )
 
         ls = subprocess.run(
@@ -1553,8 +1569,10 @@ class TestReconcileWriterHandshake:
             result.written_files,
             "TEST",
             is_full=True,
-            protected_dirs=result.preserved_page_paths,
-            protected_subtree_dirs=result.preserved_paths,
+            protection=_prot(
+                page_exact=result.preserved_page_paths,
+                subtrees=result.preserved_paths,
+            ),
         )
 
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
@@ -1743,7 +1761,7 @@ class TestReconcileWriterHandshake:
             result.written_files,
             "TEST",
             is_full=True,
-            protected_subtree_dirs=result.preserved_paths,
+            protection=_prot(subtrees=result.preserved_paths),
         )
 
         ls = subprocess.run(
@@ -1783,8 +1801,10 @@ class TestReconcileWriterHandshake:
             result.written_files,
             "TEST",
             is_full=True,
-            protected_dirs=result.preserved_page_paths,
-            protected_subtree_dirs=result.preserved_paths + result.skipped_paths,
+            protection=_prot(
+                page_exact=result.preserved_page_paths,
+                subtrees=result.preserved_paths + result.skipped_paths,
+            ),
         )
 
         ls = subprocess.run(

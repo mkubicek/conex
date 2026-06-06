@@ -29,6 +29,7 @@ from confluence_export.provenance import (
     preservation_in_scope,
     recursive_archived_dirs,
 )
+from confluence_export.protection import ProtectionSet, move_window_dirs
 from confluence_export.media import (
     MEDIA_DIR_NAME,
     WORKSPACE_DIR_NAME,
@@ -76,6 +77,22 @@ class ExportResult:
     # though no current media file was written, so stale tracked media can be
     # pruned during --no-media exports.
     prune_media_dirs: list[Path] = field(default_factory=list)
+
+    def protection(self, output_dir: Path) -> ProtectionSet:
+        """Compile this run's protected-path accumulators into the typed bundle the
+        git prune/restore consumes. This is the SINGLE producer that routes scope —
+        archived-exact pages page-exactly, skipped pages + blind ``_archived``
+        recursively — replacing the hand-written ``+`` that used to live in cli.py
+        where a page-exact list could be dropped into the recursive slot by mistake
+        (the fix-② hazard). ``skipped_paths`` stays a distinct field because the
+        cli prune gate fires on it specifically (Decision 1)."""
+        return ProtectionSet.from_exporter(
+            preserved_page_paths=self.preserved_page_paths,
+            preserved_paths=self.preserved_paths,
+            skipped_paths=self.skipped_paths,
+            prune_media_dirs=self.prune_media_dirs,
+            output_dir=output_dir,
+        )
 
 
 def is_full_export(path_filter: str | None, no_children: bool) -> bool:
@@ -433,8 +450,9 @@ class Exporter:
         return result
 
     def _mark_skipped_subtree(self, node: PageNode, page_dir: Path) -> None:
-        self._skipped_paths.append(page_dir)
-        self._skipped_paths.extend(self._pre_reconcile_dirs.get(node.page.id, []))
+        self._skipped_paths.extend(
+            move_window_dirs(page_dir, node.page.id, self._pre_reconcile_dirs)
+        )
         for child in node.children:
             self._mark_skipped_subtree(
                 child,
@@ -507,10 +525,11 @@ class Exporter:
                     page.webui = full_page.webui
             except Exception as exc:
                 print(f"  Warning: could not fetch body for {page.title}: {exc}", file=sys.stderr)
-                self._skipped_paths.append(page_dir)
                 # M2: also protect the page's pre-reconcile (old) path so a moved
                 # page that fails to refetch keeps its last-good committed export.
-                self._skipped_paths.extend(self._pre_reconcile_dirs.get(page.id, []))
+                self._skipped_paths.extend(
+                    move_window_dirs(page_dir, page.id, self._pre_reconcile_dirs)
+                )
                 return []
 
         # Get attachments from cache
@@ -672,8 +691,9 @@ class Exporter:
                                 reserved_media_names.add(png_path.name)
         except Exception as exc:
             print(f"  Warning: {exc}", file=sys.stderr)
-            self._skipped_paths.append(page_dir)
-            self._skipped_paths.extend(self._pre_reconcile_dirs.get(page.id, []))
+            self._skipped_paths.extend(
+                move_window_dirs(page_dir, page.id, self._pre_reconcile_dirs)
+            )
             rollback_media_changes()
             return []
 
@@ -700,9 +720,10 @@ class Exporter:
             )
         except Exception as exc:
             print(f"  Warning: could not convert {page.title}: {exc}", file=sys.stderr)
-            self._skipped_paths.append(page_dir)
             # M2: also protect the page's pre-reconcile (old) path (see above).
-            self._skipped_paths.extend(self._pre_reconcile_dirs.get(page.id, []))
+            self._skipped_paths.extend(
+                move_window_dirs(page_dir, page.id, self._pre_reconcile_dirs)
+            )
             rollback_media_changes()
             return []
 
@@ -714,8 +735,9 @@ class Exporter:
             _write_text_atomic(md_path, markdown, encoding="utf-8")
         except Exception as exc:
             print(f"  Warning: could not write {page.title}: {exc}", file=sys.stderr)
-            self._skipped_paths.append(page_dir)
-            self._skipped_paths.extend(self._pre_reconcile_dirs.get(page.id, []))
+            self._skipped_paths.extend(
+                move_window_dirs(page_dir, page.id, self._pre_reconcile_dirs)
+            )
             rollback_media_changes()
             return []
         written.append(md_path)

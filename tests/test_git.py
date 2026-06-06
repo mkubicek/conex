@@ -14,6 +14,26 @@ from confluence_export.git import (
     ensure_repo,
     git_available,
 )
+from confluence_export.protection import (
+    PageExactProtection,
+    ProtectionSet,
+    SubtreeProtection,
+    prune_media_owner_set,
+)
+
+
+def _prot(*, page_exact=(), subtrees=(), prune_media=(), output_dir=None) -> ProtectionSet:
+    """Build a typed ProtectionSet from plain dir lists for commit_export tests.
+    Mirrors the production scope routing (page-exact vs recursive) explicitly so a
+    test pins exactly the protections it intends — there is no untyped slot."""
+    return ProtectionSet(
+        page_exact=tuple(PageExactProtection(p) for p in page_exact),
+        subtrees=tuple(SubtreeProtection(p) for p in subtrees),
+        prune_media_owners=(
+            prune_media_owner_set(list(prune_media), output_dir)
+            if prune_media else frozenset()
+        ),
+    )
 
 
 class TestChunkedPaths:
@@ -302,7 +322,7 @@ class TestCommitExport:
             "TEST",
             is_full=True,
             preserve_media=True,
-            prune_media_dirs=[media],
+            protection=_prot(prune_media=[media], output_dir=tmp_path),
         )
 
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
@@ -441,7 +461,7 @@ class TestCommitExport:
         # Moved + failed this run: reconcile deleted A/P/P.md from disk; the page
         # was skipped, so its old dir is protected from the prune.
         (old / "P.md").unlink()
-        commit_export(tmp_path, [], "TEST", is_full=True, protected_dirs=[old])
+        commit_export(tmp_path, [], "TEST", is_full=True, protection=_prot(page_exact=[old]))
 
         # The working tree must be clean (the deletion restored), so the next
         # run's pre-export safety commit does not stage it away.
@@ -452,11 +472,10 @@ class TestCommitExport:
         ).stdout
         assert "A/P/P.md" in ls, "protection defeated by next-run commit_local_changes"
 
-    def test_protected_dirs_survive_prune_while_real_deletions_pruned(self, tmp_path):
-        """A page SKIPPED this run (transient convert/body failure) must keep its
-        last-good committed files — passing its dir in protected_dirs excludes it
-        from the stale prune — while a genuinely upstream-deleted page is still
-        pruned. Regression for the #34 skip-then-prune silent deletion."""
+    def test_page_exact_protection_survives_prune_while_real_deletions_pruned(self, tmp_path):
+        """A page-EXACT protected dir (PageExactProtection) keeps its last-good
+        committed files while a genuinely upstream-deleted page is still pruned.
+        Regression for the #34 skip-then-prune silent deletion."""
         self._init_repo(tmp_path)
         (tmp_path / "A").mkdir()
         (tmp_path / "A" / "A.md").write_text("# A")
@@ -470,7 +489,7 @@ class TestCommitExport:
         # Full export: only A is written; P was skipped (protected), Gone is gone.
         commit_export(
             tmp_path, [tmp_path / "A" / "A.md"], "TEST",
-            is_full=True, protected_dirs=[tmp_path / "P"],
+            is_full=True, protection=_prot(page_exact=[tmp_path / "P"]),
         )
 
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
@@ -478,11 +497,11 @@ class TestCommitExport:
         assert (tmp_path / "P" / "P.md").exists()  # and still on disk
         assert "Gone/Gone.md" not in ls  # genuine upstream deletion still pruned
 
-    def test_protected_dirs_protect_page_exactly_not_child(self, tmp_path):
-        """protected_dirs is page-EXACT (e.g. an archived page whose precise target
-        is known, M1-exact): it preserves the page's own files but NOT a nested
-        child that is gone this run — the child is still reconciled by the stale
-        prune. (Skipped pages use the recursive protected_subtree_dirs instead.)"""
+    def test_page_exact_protection_not_child(self, tmp_path):
+        """PageExactProtection is page-EXACT (e.g. an archived page whose precise
+        target is known, M1-exact): it preserves the page's own files but NOT a
+        nested child that is gone this run — the child is still reconciled by the
+        stale prune. (Skipped pages use recursive SubtreeProtection instead.)"""
         self._init_repo(tmp_path)
         parent = tmp_path / "Parent"
         child = parent / "Child"
@@ -500,7 +519,7 @@ class TestCommitExport:
         # page-exactly (its own file kept, its absent child reconciled away).
         commit_export(
             tmp_path, [live / "Live.md"], "TEST",
-            is_full=True, protected_dirs=[parent],
+            is_full=True, protection=_prot(page_exact=[parent]),
         )
 
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
@@ -510,8 +529,8 @@ class TestCommitExport:
 
     def test_skipped_parent_protects_vanished_child_recursively(self, tmp_path):
         """Fix ②: a page SKIPPED this run is protected RECURSIVELY (it flows through
-        protected_subtree_dirs). A committed child that transiently vanishes under
-        it — not written this run, not a known deletion — is preserved, not pruned;
+        SubtreeProtection). A committed child that transiently vanishes under it —
+        not written this run, not a known deletion — is preserved, not pruned;
         page-exact protection would wrongly git-rm it (the regression vs main)."""
         self._init_repo(tmp_path)
         parent = tmp_path / "Parent"
@@ -529,7 +548,7 @@ class TestCommitExport:
         # is absent from this run's tree (neither written nor an upstream deletion).
         commit_export(
             tmp_path, [live / "Live.md"], "TEST",
-            is_full=True, protected_subtree_dirs=[parent],
+            is_full=True, protection=_prot(subtrees=[parent]),
         )
 
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
@@ -556,14 +575,14 @@ class TestCommitExport:
         # Zero live pages written; only the archived dir is protected (page-exact).
         commit_export(
             tmp_path, [], "TEST",
-            is_full=True, protected_dirs=[archived],
+            is_full=True, protection=_prot(page_exact=[archived]),
         )
 
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
         assert "OldLive/OldLive.md" in ls  # NOT pruned despite zero writes
         assert "_archived/Arch/Arch.md" in ls
 
-    def test_protected_subtree_dirs_survive_prune_recursively(self, tmp_path):
+    def test_subtree_protection_survives_prune_recursively(self, tmp_path):
         """Preserved export subtrees, such as _archived, are intentionally
         omitted wholesale and must be protected recursively."""
         self._init_repo(tmp_path)
@@ -582,7 +601,7 @@ class TestCommitExport:
             [live / "Live.md"],
             "TEST",
             is_full=True,
-            protected_subtree_dirs=[archived],
+            protection=_prot(subtrees=[archived]),
         )
 
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
@@ -609,7 +628,7 @@ class TestCommitExport:
             [live / "Live.md"],
             "TEST",
             is_full=True,
-            protected_subtree_dirs=[archived],
+            protection=_prot(subtrees=[archived]),
         )
         commit_local_changes(tmp_path)
 
@@ -635,7 +654,7 @@ class TestCommitExport:
             [],
             "TEST",
             is_full=True,
-            protected_subtree_dirs=[archived],
+            protection=_prot(subtrees=[archived]),
         )
 
         assert not secret.exists()
@@ -659,7 +678,7 @@ class TestCommitExport:
             [],
             "TEST",
             is_full=True,
-            protected_dirs=[page],
+            protection=_prot(page_exact=[page]),
         )
 
         assert not (outside / "Page.md").exists()
@@ -696,7 +715,7 @@ class TestCommitExport:
             [],
             "TEST",
             is_full=True,
-            protected_dirs=[page],
+            protection=_prot(page_exact=[page]),
         )
 
         assert not (outside / "Page.md").exists()
@@ -734,7 +753,7 @@ class TestCommitExport:
             [],
             "TEST",
             is_full=True,
-            protected_dirs=[page],
+            protection=_prot(page_exact=[page]),
         )
 
         assert not (outside / "img.png").exists()
@@ -780,7 +799,7 @@ class TestCommitExport:
             [new_live / "OldLive.md"],
             "TEST",
             is_full=True,
-            protected_subtree_dirs=[stay],
+            protection=_prot(subtrees=[stay]),
         )
 
         ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout

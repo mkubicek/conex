@@ -307,13 +307,17 @@ class TestExportCommand:
             main()
 
         commit_export.assert_called_once()
-        # Routing: archived pages page-EXACT (protected_dirs); skipped pages join
-        # the RECURSIVE group (protected_subtree_dirs) alongside blind subtrees.
-        assert commit_export.call_args.kwargs["protected_dirs"] == export_result.preserved_page_paths
-        assert commit_export.call_args.kwargs["protected_subtree_dirs"] == (
+        # Scope is welded into the single typed ProtectionSet the exporter produces;
+        # there is no untyped protected_dirs / protected_subtree_dirs slot to
+        # mis-route. The whole bundle matches what result.protection() builds.
+        protection = commit_export.call_args.kwargs["protection"]
+        assert protection == export_result.protection(Path(out).resolve())
+        # And scope routed correctly: archived pages page-EXACT, skipped pages into
+        # the RECURSIVE subtree group alongside the blind _archived subtree.
+        assert [p.path for p in protection.page_exact] == export_result.preserved_page_paths
+        assert [s.path for s in protection.subtrees] == (
             export_result.preserved_paths + export_result.skipped_paths
         )
-        assert commit_export.call_args.kwargs["prune_media_dirs"] == export_result.prune_media_dirs
 
     def test_git_skips_full_export_with_only_preserved_subtrees(self, tmp_path):
         """An empty current-only export must not prune all live files merely
