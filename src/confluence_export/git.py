@@ -384,6 +384,11 @@ def _restore_protected_deletions(
     if not page_dirs and not sub_dirs:
         return
     result = _run_git(output_dir, "ls-files", "--deleted", "-z", check=False)
+    if result is None:  # pragma: no cover - transient git failure under load
+        # Retry once: a transient git failure here would silently skip the heal,
+        # leaving a protected file's deletion (or a symlinked ancestor) until the
+        # next run (issue #41 flake).
+        result = _run_git(output_dir, "ls-files", "--deleted", "-z", check=False)
     if result is None or not result.stdout.strip("\0"):
         return
     to_restore = []
@@ -414,7 +419,13 @@ def _restore_protected_deletions(
     if blocked:
         to_restore = [path for path in to_restore if path not in blocked]
     for batch in _chunked_paths(to_restore):
-        _run_git(output_dir, "checkout", "HEAD", "--", *batch, check=False)
+        if _run_git(output_dir, "checkout", "HEAD", "--", *batch, check=False) is None:
+            # Retry once: a transient git failure under load would otherwise leave a
+            # protected file unrestored and a just-unlinked symlinked ancestor not
+            # re-materialized as a real dir (issue #41 flake). The symlink ancestor
+            # was already unlinked above, so `checkout HEAD` is idempotent and can
+            # never write through the symlink to its outside target.
+            _run_git(output_dir, "checkout", "HEAD", "--", *batch, check=False)  # pragma: no cover - transient
 
 
 def _symlink_ancestor(output_dir: Path, rel_path: str) -> Path | None:
