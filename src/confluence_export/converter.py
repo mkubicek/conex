@@ -350,6 +350,11 @@ def _preprocess_html(
                 soup, macro, rendered, attach_map, name_plan,
                 media_downloaded=media_downloaded, available_media=available_media,
             )
+        elif macro_name == "drawio-sketch":
+            _convert_drawio_sketch(
+                soup, macro, rendered, attach_map, name_plan,
+                media_downloaded=media_downloaded, available_media=available_media,
+            )
         elif macro_name == "profile":
             _convert_profile(soup, macro, user_resolver)
         elif macro_name == "profile-picture":
@@ -722,36 +727,52 @@ def _convert_drawio_placeholder(
     ``rendered``."""
     name_param = macro.find("ac:parameter", attrs={"ac:name": "diagramName"})
     diagram_name = name_param.get_text().strip() if name_param else "diagram"
-    bare = diagram_name.removesuffix(".drawio")
-
     # F6/F7: resolve the diagramName to the real on-disk attachment, tolerant of
     # the .drawio extension and case/whitespace, rather than reconstructing a name.
     matched = _match_drawio_attachment(diagram_name, attach_map)
-    source_name = matched.title if matched is not None else f"{bare}.drawio"
+    _emit_drawio(
+        soup, macro, diagram_name, matched, rendered, name_plan,
+        media_downloaded=media_downloaded, available_media=available_media,
+    )
+
+
+def _emit_drawio(
+    soup: BeautifulSoup,
+    macro: Tag,
+    source_name: str,
+    matched: Attachment | None,
+    rendered: dict[str, Path],
+    name_plan: AttachmentNamePlan,
+    *,
+    media_downloaded: bool,
+    available_media: set[str] | None,
+) -> None:
+    """Emit the rendered-PNG ``<img>`` (+ a source link when the .drawio is on disk)
+    for a drawio / drawio-sketch macro resolved to ``matched``, or a graceful
+    "not rendered" note when no PNG is available."""
+    bare = source_name.removesuffix(".drawio")
+    source_title = matched.title if matched is not None else f"{bare}.drawio"
     source_local_name = (
         name_plan.for_attachment(matched)
         if matched is not None
-        else safe_attachment_name(source_name)
+        else safe_attachment_name(source_title)
     )
 
     # Rendered-PNG lookup: the exporter keys rendered[att.title]; try the matched
     # title first, then the reconstructed names (F7).
     png_path = None
     for key in ([matched.title] if matched is not None else []) + [
-        diagram_name, f"{bare}.drawio", bare,
+        source_name, f"{bare}.drawio", bare,
     ]:
         if key in rendered:
             png_path = rendered[key]
             break
 
     # F5: a source link only when the source is actually on disk.
-    source_tracked = (
-        matched is not None
-        and (
-            source_local_name in available_media
-            if available_media is not None
-            else media_downloaded
-        )
+    source_tracked = matched is not None and (
+        source_local_name in available_media
+        if available_media is not None
+        else media_downloaded
     )
 
     p = soup.new_tag("p")
@@ -763,16 +784,50 @@ def _convert_drawio_placeholder(
         ))
     else:
         em = soup.new_tag("em")
-        em.string = f"[Draw.io diagram not rendered: {_markdown_label(source_name)}]"
+        em.string = f"[Draw.io diagram not rendered: {_markdown_label(source_title)}]"
         p.append(em)
     if source_tracked:
         p.append(soup.new_tag("br"))
         src_em = soup.new_tag("em")
         src_em.append("Draw.io source: ")
         link = soup.new_tag("a", href=_markdown_media_url(source_local_name))
-        link.string = _markdown_label(source_name)
+        link.string = _markdown_label(source_title)
         src_em.append(link)
         p.append(src_em)
+    macro.replace_with(p)
+
+
+def _convert_drawio_sketch(
+    soup: BeautifulSoup,
+    macro: Tag,
+    rendered: dict[str, Path],
+    attach_map: dict[str, Attachment],
+    name_plan: AttachmentNamePlan,
+    *,
+    media_downloaded: bool = True,
+    available_media: set[str] | None = None,
+) -> None:
+    """drawio-sketch macro (#6). Render it like a drawio diagram when it is
+    attachment-backed (carries an ``ri:attachment``); otherwise emit a graceful
+    ``[Draw.io sketch]`` note instead of the generic dynamic-content placeholder.
+
+    The inline-payload render path (writing an embedded sketch to a temp ``.drawio``
+    and rendering it) is intentionally deferred until a real drawio-sketch storage
+    sample confirms the shape — until then an inline sketch degrades to a clean note
+    rather than a confusing ``[Confluence dynamic content: drawio-sketch]``."""
+    ri = macro.find("ri:attachment")
+    filename = ri.get("ri:filename", "").strip() if ri is not None else ""
+    if filename:
+        matched = _match_drawio_attachment(filename, attach_map)
+        _emit_drawio(
+            soup, macro, filename, matched, rendered, name_plan,
+            media_downloaded=media_downloaded, available_media=available_media,
+        )
+        return
+    p = soup.new_tag("p")
+    em = soup.new_tag("em")
+    em.string = "[Draw.io sketch]"
+    p.append(em)
     macro.replace_with(p)
 
 
