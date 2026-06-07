@@ -404,7 +404,7 @@ def _cmd_tree(
 ) -> None:
     """Show page hierarchy."""
     space = _exit_on_auth_error(lambda: _resolve_space(client, space_key))
-    cs = cache.ensure_loaded(client, space)
+    cs = cache.ensure_loaded(client, space, need_attachments=False)
 
     roots = build_tree(cs.pages)
     tree_str = format_tree(roots)
@@ -421,7 +421,7 @@ def _cmd_find(
 ) -> None:
     """Search pages by title."""
     space = _exit_on_auth_error(lambda: _resolve_space(client, space_key))
-    cs = cache.ensure_loaded(client, space)
+    cs = cache.ensure_loaded(client, space, need_attachments=False)
 
     results = find_pages(cs.pages, query)
     if not results:
@@ -682,14 +682,18 @@ def _cmd_diff(
     exported = scan_export_dir(export_path, space_key)
     print(f"Scanned {len(exported)} page(s) from export directory.", file=sys.stderr)
 
-    # Always refresh — diff against stale cache is useless
+    # Always refresh — diff against stale cache is useless. Page-only: diff compares
+    # page ids/versions/paths (compute_diff takes pages, not attachments), so skip
+    # the per-page attachment listing (#39).
     cs = cache.load(space_key)
     if cs is not None:
         space = cs.space
     else:
         space = _exit_on_auth_error(lambda: _resolve_space(client, space_key))
     cs = _exit_on_auth_error(
-        lambda: cache.refresh(client, space, include_archived=include_archived)
+        lambda: cache.refresh(
+            client, space, include_archived=include_archived, fetch_attachments=False
+        )
     )
 
     # Filter API pages

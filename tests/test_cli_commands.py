@@ -987,3 +987,45 @@ class TestConfigureExistingDefaults:
         assert data["auth"]["type"] == "scoped_api_token"
         assert data["cloud_id"] == "cloud-999"
         assert data["api_base_url"] == "https://api.atlassian.com/ex/confluence/cloud-999"
+
+
+class TestPageOnlyWiring:
+    """#39: tree/find/diff refresh page-only (skip the per-page attachment listing)."""
+
+    def _patches(self, argv, cache, client):
+        return [
+            patch("sys.argv", argv),
+            patch("confluence_export.cli.load_connection_profile", return_value=_profile()),
+            patch("confluence_export.cli.ConfluenceClient", return_value=client),
+            patch("confluence_export.cli.CacheStore", return_value=cache),
+        ]
+
+    def _run(self, argv, cache, client):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(argv, cache, client):
+                stack.enter_context(p)
+            main()
+
+    def test_tree_uses_page_only(self):
+        cache = MagicMock()
+        cache.ensure_loaded.return_value = _cached_space()
+        self._run(["confluence-export", "tree", "TEST"], cache, _mock_client())
+        assert cache.ensure_loaded.call_args.kwargs.get("need_attachments") is False
+
+    def test_find_uses_page_only(self):
+        cache = MagicMock()
+        cache.ensure_loaded.return_value = _cached_space()
+        self._run(["confluence-export", "find", "TEST", "Child"], cache, _mock_client())
+        assert cache.ensure_loaded.call_args.kwargs.get("need_attachments") is False
+
+    def test_diff_uses_page_only(self, tmp_path):
+        cache = MagicMock()
+        cache.load.return_value = None
+        cache.refresh.return_value = _cached_space()
+        export_dir = tmp_path / "export"
+        export_dir.mkdir()
+        self._run(
+            ["confluence-export", "diff", "TEST", str(export_dir)], cache, _mock_client()
+        )
+        assert cache.refresh.call_args.kwargs.get("fetch_attachments") is False

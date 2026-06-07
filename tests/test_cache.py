@@ -258,3 +258,91 @@ def test_resolve_folders_skips_unresolvable_parent():
     result = CacheStore._resolve_folders(client, pages)
 
     assert [p.id for p in result] == ["c"]
+
+
+class TestPageOnlyRefresh:
+    """#39: page-only refresh skips the per-page attachment listing."""
+
+    def _client(self, pages, returns_archived=True):
+        client = MagicMock()
+        client.returns_archived_pages = returns_archived
+        client.verbose = False
+        client.get_pages_in_space.return_value = pages
+        client.get_attachments.return_value = []
+        return client
+
+    def _pages(self):
+        return [Page(id="p1", title="Page", space_id="1", version=Version(number=1))]
+
+    def test_page_only_refresh_skips_attachment_listing(self, tmp_path):
+        with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
+            store = CacheStore()
+            client = self._client(self._pages())
+            cs = store.refresh(client, _make_space(), fetch_attachments=False)
+            client.get_attachments.assert_not_called()
+            assert cs.attachments == {}
+            assert cs.attachments_complete is False
+
+    def test_full_refresh_fetches_attachments_and_marks_complete(self, tmp_path):
+        with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
+            store = CacheStore()
+            client = self._client(self._pages())
+            cs = store.refresh(client, _make_space())  # default: full
+            client.get_attachments.assert_called_once_with("p1")
+            assert cs.attachments_complete is True
+
+    def test_attachments_complete_roundtrips(self, tmp_path):
+        with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
+            store = CacheStore()
+            cs = _make_cached_space()
+            cs.attachments_complete = False
+            store.save(cs)
+            assert store.load("TEST").attachments_complete is False
+
+    def test_legacy_cache_without_flag_defaults_complete(self):
+        data = _make_cached_space().to_dict()
+        del data["attachments_complete"]
+        assert CachedSpace.from_dict(data).attachments_complete is True
+
+    def test_ensure_loaded_page_only_cache_satisfies_page_only_request(self, tmp_path):
+        with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
+            store = CacheStore()
+            cs = _make_cached_space()
+            cs.attachments_complete = False
+            store.save(cs)
+            client = MagicMock()
+            result = store.ensure_loaded(client, _make_space(), need_attachments=False)
+            client.get_pages_in_space.assert_not_called()  # served from cache, no refresh
+            assert result.attachments_complete is False
+
+    def test_ensure_loaded_page_only_cache_insufficient_for_export(self, tmp_path):
+        with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
+            store = CacheStore()
+            cs = _make_cached_space()
+            cs.attachments_complete = False
+            store.save(cs)
+            client = self._client(self._pages())
+            result = store.ensure_loaded(client, _make_space(), need_attachments=True)
+            client.get_pages_in_space.assert_called_once()  # refreshed (full)
+            client.get_attachments.assert_called_once()
+            assert result.attachments_complete is True
+
+    def test_ensure_loaded_full_cache_satisfies_page_only_request(self, tmp_path):
+        with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
+            store = CacheStore()
+            store.save(_make_cached_space())  # attachments_complete defaults True
+            client = MagicMock()
+            result = store.ensure_loaded(client, _make_space(), need_attachments=False)
+            client.get_pages_in_space.assert_not_called()  # full cache reused
+            assert result.attachments_complete is True
+
+    def test_verbose_refresh_prints_instrumentation(self, tmp_path, capsys):
+        with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
+            store = CacheStore()
+            client = self._client(self._pages())
+            client.verbose = True
+            client.stats = {"requests": 3, "retries": 1, "rate_limit_sleep_s": 2.0}
+            store.refresh(client, _make_space())
+            err = capsys.readouterr().err
+            assert "Refresh timing:" in err
+            assert "attachment-list call" in err
