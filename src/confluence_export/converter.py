@@ -359,11 +359,14 @@ def _preprocess_html(
             _convert_profile(soup, macro, user_resolver)
         elif macro_name == "profile-picture":
             # A profile-picture with a user was already resolved to an inline
-            # mention in the user-mention pre-pass. If it still holds that
-            # resolved content (e.g. a nested profile-picture whose inner mention
-            # we kept — F4), unwrap to preserve it; an empty one (no user) is
-            # dropped rather than emitting a dynamic-content placeholder.
-            if macro.get_text(strip=True):
+            # mention <span> in the user-mention pre-pass (converter.py:312-314) —
+            # including the nested case (F4), where the inner macro is replaced by a
+            # span that ends up inside this outer one. Unwrap ONLY when that resolved
+            # span is present; a macro whose only text is a raw ac:parameter value
+            # (a bare account-id with no nested ri:user) carries no span and is
+            # dropped, so the raw id is never leaked as body text. An empty one (no
+            # user) is likewise dropped rather than emitting a placeholder.
+            if macro.find("span"):
                 macro.unwrap()
             else:
                 macro.decompose()

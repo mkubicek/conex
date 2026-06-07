@@ -772,6 +772,20 @@ class TestGetRawRetryAndRateLimit:
             mock_get.side_effect = [self._http_error(500), ok]
             assert client._get_raw("/d") is ok
 
+    def test_get_raw_closes_failed_streamed_response_before_retry(self):
+        # raise_for_status leaves a stream=True body unread; the failed response must
+        # be closed so its pooled connection is released rather than leaked until GC.
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            failed = self._http_error(500)
+            ok = self._ok()
+            mock_get.side_effect = [failed, ok]
+            assert client._get_raw("/d") is ok
+            failed.close.assert_called_once()
+            # The successful response must NOT be closed (the caller streams it).
+            ok.close.assert_not_called()
+
     def test_get_raw_retries_on_connection_error(self):
         client = _make_client()
         with patch.object(client.session, "get") as mock_get, \

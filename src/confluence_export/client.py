@@ -259,6 +259,7 @@ class ConfluenceClient:
         url = self.base_url + path
         for attempt in range(max_retries):
             self._await_rate_limit()
+            resp = None
             try:
                 self._log(f"GET (raw) {url}")
                 with self._rate_lock:
@@ -271,6 +272,15 @@ class ConfluenceClient:
                 requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout,
             ) as exc:
+                # raise_for_status() leaves a streamed body unread, so a failed
+                # response holds its pooled connection until GC. Close it before we
+                # retry or raise so the connection is released, not leaked across the
+                # retry loop (#39) or a sustained outage.
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except Exception:  # pragma: no cover - best-effort cleanup
+                        pass
                 self._on_request_error(exc, attempt, max_retries, url)
         raise RuntimeError(f"Max retries exceeded for {url}")
 

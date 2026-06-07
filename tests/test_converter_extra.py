@@ -209,6 +209,20 @@ def test_profile_picture_empty_account_id_dropped():
     assert "Confluence dynamic content" not in result
 
 
+def test_profile_picture_with_plain_text_param_does_not_leak_raw_id():
+    # A profile-picture whose only content is a raw ac:parameter value (no nested
+    # ri:user to resolve) must be dropped, not unwrapped — otherwise the raw
+    # account-id leaks as visible body text.
+    html = (
+        '<p>Author: <ac:structured-macro ac:name="profile-picture">'
+        '<ac:parameter ac:name="user">5f1a-accountid</ac:parameter>'
+        "</ac:structured-macro></p>"
+    )
+    result = _preprocess_html(html, [])
+    assert "5f1a-accountid" not in result
+    assert "Confluence dynamic content" not in result
+
+
 def test_profile_picture_inside_panel_keeps_mention():
     # Regression guard (#5 follow-up): a profile-picture nested in a panel must
     # keep its mention. _convert_panel re-parses the panel body into a fresh soup,
