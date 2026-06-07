@@ -5,7 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from confluence_export.diagnostics import WarningCollector
 from confluence_export.drawio import (
+    _is_empty_drawio,
     _usable_png,
     detect_drawio_macros,
     find_drawio_attachments,
@@ -13,6 +15,15 @@ from confluence_export.drawio import (
     render_drawio_to_png,
 )
 from confluence_export.types import Attachment
+
+# A non-empty diagram source (has mxGeometry) so render-failure tests exercise the
+# "produced no output" branch rather than the "empty diagram skipped" wording.
+REAL_DRAWIO = (
+    '<mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/>'
+    '<mxCell id="2" vertex="1" parent="1">'
+    '<mxGeometry x="40" y="40" width="80" height="40" as="geometry"/>'
+    "</mxCell></root></mxGraphModel>"
+)
 
 
 class TestFindDrawioAttachments:
@@ -229,7 +240,7 @@ class TestRenderDrawioToPng:
 
     def test_failed_initial_render_removes_partial_png(self, tmp_path, capsys):
         drawio = tmp_path / "test.drawio"
-        drawio.write_text("<xml/>")
+        drawio.write_text(REAL_DRAWIO)
         png = tmp_path / "test.drawio.png"
         mock_proc = MagicMock()
         mock_proc.poll.return_value = 1
@@ -301,7 +312,7 @@ class TestRenderDrawioToPng:
 
     def test_render_failure(self, tmp_path, capsys):
         drawio = tmp_path / "test.drawio"
-        drawio.write_text("<xml/>")
+        drawio.write_text(REAL_DRAWIO)
 
         mock_proc = MagicMock()
         mock_proc.poll.return_value = 1  # process exited with error, no file
@@ -375,7 +386,7 @@ class TestRenderDrawioToPng:
     def test_render_timeout_kills_process(self, tmp_path, capsys):
         """drawio truly hangs without producing output — deadline triggers cleanup."""
         drawio = tmp_path / "test.drawio"
-        drawio.write_text("<xml/>")
+        drawio.write_text(REAL_DRAWIO)
 
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None  # never exits
@@ -515,3 +526,59 @@ class TestRenderEdgeCases:
 
         assert result == expected_png
         assert expected_png.read_bytes() == b"PNG data"
+
+
+class TestIsEmptyDrawio:
+    def test_empty_source_is_empty(self, tmp_path):
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        assert _is_empty_drawio(drawio) is True
+
+    def test_diagram_with_geometry_is_not_empty(self, tmp_path):
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text(REAL_DRAWIO)
+        assert _is_empty_drawio(drawio) is False
+
+    def test_large_source_is_not_empty(self, tmp_path):
+        # A real (even compressed) diagram is larger than the size gate, so the
+        # cheap size check short-circuits before reading the body.
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<diagram>" + "x" * 700 + "</diagram>")
+        assert _is_empty_drawio(drawio) is False
+
+    def test_unreadable_source_is_not_empty(self, tmp_path):
+        # stat() raising (e.g. file vanished) must not crash the warning wording.
+        assert _is_empty_drawio(tmp_path / "does-not-exist.drawio") is False
+
+
+class TestRenderWarningCollection:
+    def _no_output_proc(self):
+        proc = MagicMock()
+        proc.poll.return_value = 1  # exited, wrote nothing
+        return proc
+
+    def test_empty_diagram_records_low_severity_category(self, tmp_path, capsys):
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        warnings = WarningCollector()
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
+             patch("subprocess.Popen", return_value=self._no_output_proc()):
+            result = render_drawio_to_png(drawio, warnings=warnings)
+
+        assert result is None
+        assert "empty draw.io diagram skipped" in capsys.readouterr().err
+        assert warnings.counts() == {"empty draw.io diagram skipped": 1}
+
+    def test_nonempty_no_output_records_render_warning(self, tmp_path, capsys):
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text(REAL_DRAWIO)
+        warnings = WarningCollector()
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
+             patch("subprocess.Popen", return_value=self._no_output_proc()):
+            result = render_drawio_to_png(drawio, warnings=warnings)
+
+        assert result is None
+        assert "produced no output" in capsys.readouterr().err
+        assert warnings.counts() == {"draw.io produced no output": 1}

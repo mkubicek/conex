@@ -10,7 +10,10 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import requests
+
 from confluence_export.client import ConfluenceClient
+from confluence_export.diagnostics import WarningCollector
 from confluence_export.filemode import default_file_mode, replacement_mode
 from confluence_export.paths import (
     attachment_identity,
@@ -386,11 +389,36 @@ def available_attachment_names(attachments: list[Attachment], media_dir: Path) -
     return available
 
 
+def _record_download_warning(
+    att: Attachment, exc: Exception, warnings: WarningCollector | None
+) -> None:
+    """Print a clear best-effort download warning and tally it by category. A 404 on
+    the binary (the metadata listed the file, but its bytes are gone) is *unavailable
+    content*, not an exporter endpoint bug — word it so the user doesn't misread it."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(exc, requests.exceptions.HTTPError) and status == 404:
+        category = "attachment unavailable (HTTP 404)"
+        print(
+            f"  Warning: attachment '{att.title}': metadata exists but its binary is "
+            "unavailable (HTTP 404)",
+            file=sys.stderr,
+        )
+    elif isinstance(exc, requests.exceptions.Timeout):
+        category = "attachment download timeout"
+        print(f"  Warning: timed out downloading {att.title}: {exc}", file=sys.stderr)
+    else:
+        category = "attachment download failed"
+        print(f"  Warning: failed to download {att.title}: {exc}", file=sys.stderr)
+    if warnings is not None:
+        warnings.record(category)
+
+
 def download_attachments(
     client: ConfluenceClient,
     attachments: list[Attachment],
     media_dir: Path,
     skip_existing: bool = True,
+    warnings: WarningCollector | None = None,
 ) -> list[Path]:
     """Download attachments to media_dir. Returns list of downloaded file paths.
 
@@ -545,7 +573,7 @@ def download_attachments(
                     versions[name] = _manifest_entry(att)
                 except Exception as exc:
                     keep_existing(name, att, dest, allow_legacy=True)
-                    print(f"  Warning: failed to download {att.title}: {exc}", file=sys.stderr)
+                    _record_download_warning(att, exc, warnings)
 
         _save_versions(media_dir, versions)
         downloaded.append(media_dir / _VERSIONS_FILE)

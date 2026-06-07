@@ -11,6 +11,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from confluence_export.diagnostics import WarningCollector
 from confluence_export.filemode import default_file_mode, replacement_mode
 from confluence_export.types import Attachment
 
@@ -73,11 +74,26 @@ def _usable_png(path: Path) -> bool:
         return False
 
 
+def _is_empty_drawio(drawio_path: Path) -> bool:
+    """Whether a .drawio source has no renderable diagram content (so draw.io legitimately
+    produces no PNG). An empty mxGraphModel is tiny and has no shape geometry; a real
+    diagram (even compressed) is larger and has ``mxGeometry``/encoded ``<diagram>`` body.
+    Heuristic, used only to word the warning — never changes behavior."""
+    try:
+        if drawio_path.stat().st_size > 600:
+            return False
+        text = drawio_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return "mxGeometry" not in text and text.count("<mxCell") <= 2
+
+
 def render_drawio_to_png(
     drawio_path: Path,
     output_path: Path | None = None,
     *,
     force: bool = False,
+    warnings: "WarningCollector | None" = None,
 ) -> Path | None:
     """Render a .drawio file to PNG using the draw.io CLI.
 
@@ -214,5 +230,14 @@ def render_drawio_to_png(
     except OSError:  # pragma: no cover
         pass
 
-    print(f"  Warning: draw.io produced no output for {drawio_path.name}", file=sys.stderr)
+    if _is_empty_drawio(drawio_path):
+        # Low-severity content warning: the source has no renderable diagram, so
+        # draw.io legitimately wrote no PNG — not a render failure.
+        print(f"  Warning: empty draw.io diagram skipped: {drawio_path.name}", file=sys.stderr)
+        if warnings is not None:
+            warnings.record("empty draw.io diagram skipped")
+    else:
+        print(f"  Warning: draw.io produced no output for {drawio_path.name}", file=sys.stderr)
+        if warnings is not None:
+            warnings.record("draw.io produced no output")
     return None

@@ -171,7 +171,7 @@ class TestConvertFailureIsolated:
             attachments={"bad": [Attachment(id="x", title="img.png", media_type="image/png", file_size=3)]},
         )
 
-        def fake_download(client, attachments, media_dir):
+        def fake_download(client, attachments, media_dir, **_kwargs):
             p = media_dir / "img.png"
             p.write_bytes(b"png")
             return [p]
@@ -195,7 +195,7 @@ class TestConvertFailureIsolated:
         image.write_bytes(b"old-good")
         manifest.write_text('{"img.png": {"version": 1, "id": "x", "title": "img.png"}}')
 
-        def fake_download(client, attachments, media_dir):
+        def fake_download(client, attachments, media_dir, **_kwargs):
             p = media_dir / "img.png"
             p.write_bytes(b"new-partial")
             m = media_dir / _VERSIONS_FILE
@@ -292,7 +292,7 @@ class TestConvertFailureIsolated:
         outside.write_bytes(b"outside")
         (media_dir / "arch.drawio.png").symlink_to(outside)
 
-        def fake_download(_client, _attachments, _media_dir):
+        def fake_download(_client, _attachments, _media_dir, **_kwargs):
             source.write_text("new-source")
             manifest.write_text(json.dumps({
                 "arch.drawio": {"version": 2, "id": "a1", "title": "arch.drawio"}
@@ -329,7 +329,7 @@ class TestConvertFailureIsolated:
             "img.png": {"version": 1, "id": "a1", "title": "img.png"}
         }))
 
-        def fake_download(_client, _attachments, _media_dir):
+        def fake_download(_client, _attachments, _media_dir, **_kwargs):
             image.write_bytes(b"new-image")
             manifest.write_text(json.dumps({
                 "img.png": {"version": 2, "id": "a1", "title": "img.png"}
@@ -367,7 +367,7 @@ class TestConvertFailureIsolated:
         outside = tmp_path / "outside.png"
         outside.write_bytes(b"outside")
 
-        def fake_download(_client, _attachments, media_dir):
+        def fake_download(_client, _attachments, media_dir, **_kwargs):
             image = media_dir / "img.png"
             image.write_bytes(b"new-image")
             image.unlink()
@@ -402,7 +402,7 @@ class TestConvertFailureIsolated:
         outside = tmp_path / "outside.png"
         outside.write_bytes(b"outside")
 
-        def fake_download(_client, _attachments, _media_dir):
+        def fake_download(_client, _attachments, _media_dir, **_kwargs):
             image.unlink()
             image.symlink_to(outside)
             return [image]
@@ -438,7 +438,7 @@ class TestConvertFailureIsolated:
             "img.png": {"version": 1, "id": "a1", "title": "img.png"}
         }))
 
-        def mutate_then_raise(_client, _attachments, _media_dir):
+        def mutate_then_raise(_client, _attachments, _media_dir, **_kwargs):
             image.write_bytes(b"new-image")
             manifest.write_text(json.dumps({
                 "img.png": {"version": 2, "id": "a1", "title": "img.png"}

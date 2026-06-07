@@ -12,6 +12,7 @@ import requests
 
 from confluence_export.cache import CacheStore
 from confluence_export.client import AuthenticationError, ConfluenceClient
+from confluence_export.diagnostics import format_warning_summary
 from confluence_export.config import (
     ApiDialect,
     AuthConfig,
@@ -669,6 +670,9 @@ def _cmd_export(
         )
 
     print(f"\nExported {result.count} page(s) to {out.resolve()}")
+    summary = format_warning_summary(result.warnings)
+    if summary:
+        print(summary, file=sys.stderr)
 
 
 def _cmd_diff(

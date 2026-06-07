@@ -191,6 +191,42 @@ class TestExportCommand:
         md_files = list(Path(out).rglob("*.md"))
         assert len(md_files) == 2
 
+    def test_prints_warning_summary_to_stderr_when_degraded(self, tmp_path, capsys):
+        client = _mock_client()
+        export_result = ExportResult(
+            count=3,
+            written_files=[tmp_path / "out" / "P" / "P.md"],
+            warnings={"attachment unavailable (HTTP 404)": 2, "draw.io produced no output": 1},
+        )
+        exporter = MagicMock()
+        exporter.export_space.return_value = export_result
+        out = str(tmp_path / "out")
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-git"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.Exporter", return_value=exporter):
+            main()
+
+        captured = capsys.readouterr()
+        assert "Exported 3 page(s)" in captured.out
+        # The grouped one-liner goes to stderr so it does not pollute piped stdout.
+        assert "3 warning(s):" in captured.err
+        assert "attachment unavailable (HTTP 404) ×2" in captured.err
+
+    def test_no_warning_summary_when_clean(self, tmp_path, capsys):
+        client = _mock_client()
+        export_result = ExportResult(count=1, written_files=[], warnings={})
+        exporter = MagicMock()
+        exporter.export_space.return_value = export_result
+        out = str(tmp_path / "out")
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-git"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.Exporter", return_value=exporter):
+            main()
+
+        assert "warning(s):" not in capsys.readouterr().err
+
 
     def test_export_migrates_legacy_media_dirs(self, tmp_path, capsys):
         client = _mock_client()
