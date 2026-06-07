@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -63,6 +64,17 @@ class ConfluenceClient:
         self.session.timeout = 30
         self.api_dialect = profile.api_dialect
         self._space_key_by_id: dict[str, str] = {}
+
+        # Shared rate-limit coordination (#39): a 429 on any thread sets a window
+        # all threads honor before their next request, so one rate-limit response
+        # backs off the whole worker pool instead of every worker re-hammering.
+        self._rate_lock = threading.Lock()
+        self._rate_limit_until = 0.0  # monotonic time; requests wait until it passes
+        self.stats: dict[str, float] = {
+            "requests": 0,
+            "retries": 0,
+            "rate_limit_sleep_s": 0.0,
+        }
 
         auth = profile.auth
         if profile.auth_mode is AuthMode.COOKIE and auth.cookie_header:
@@ -157,46 +169,93 @@ class ConfluenceClient:
         else:
             self._get(f"/wiki/api/v2/pages/{quote(page_id, safe='')}/attachments", {"limit": "1"})
 
+    def _await_rate_limit(self) -> None:
+        """Block until a rate-limit window set by a 429 (possibly on another worker
+        thread) has passed. Never holds the lock while sleeping."""
+        with self._rate_lock:
+            wait = self._rate_limit_until - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+            with self._rate_lock:
+                self.stats["rate_limit_sleep_s"] += wait
+
+    def _note_rate_limit(self, retry_after: float) -> None:
+        """Record a 429: extend the shared backoff window and count the retry."""
+        with self._rate_lock:
+            self._rate_limit_until = max(
+                self._rate_limit_until, time.monotonic() + retry_after
+            )
+            self.stats["retries"] += 1
+
+    def _backoff(self, attempt: int) -> None:
+        """Exponential backoff for a transient 5xx / connection error."""
+        wait = 2 ** attempt
+        self._log(f"Transient error, retrying in {wait}s")
+        time.sleep(wait)
+        with self._rate_lock:
+            self.stats["retries"] += 1
+
+    def _on_request_error(self, exc, attempt: int, max_retries: int, url: str) -> None:
+        """Shared retry decision for _get and _get_raw: coordinate/back off and
+        return so the caller retries, or (re-)raise if not retryable / exhausted."""
+        if isinstance(exc, requests.exceptions.HTTPError):
+            status = exc.response.status_code
+            if status in (401, 403):
+                raise AuthenticationError(status, url) from exc
+            if status == 429:
+                retry_after = int(exc.response.headers.get("Retry-After", 60))
+                self._log(f"Rate limited, waiting {retry_after}s")
+                self._note_rate_limit(retry_after)
+                return
+            if status >= 500 and attempt < max_retries - 1:
+                self._backoff(attempt)
+                return
+            raise exc
+        # ConnectionError
+        if attempt < max_retries - 1:
+            self._backoff(attempt)
+            return
+        raise exc
+
     def _get(self, path: str, params: dict | None = None, max_retries: int = 3) -> dict:
-        """GET with retry + rate-limit handling."""
+        """GET with retry + shared rate-limit handling."""
         url = self.base_url + path
         for attempt in range(max_retries):
+            self._await_rate_limit()
             try:
                 self._log(f"GET {url} params={params}")
+                with self._rate_lock:
+                    self.stats["requests"] += 1
                 resp = self.session.get(url, params=params, timeout=30)
                 resp.raise_for_status()
                 return resp.json()
-            except requests.exceptions.HTTPError as exc:
-                status = exc.response.status_code
-                if status in (401, 403):
-                    raise AuthenticationError(status, url) from exc
-                if status == 429:
-                    retry_after = int(exc.response.headers.get("Retry-After", 60))
-                    self._log(f"Rate limited, waiting {retry_after}s")
-                    time.sleep(retry_after)
-                    continue
-                if status >= 500 and attempt < max_retries - 1:
-                    wait = 2 ** attempt
-                    self._log(f"Server error {status}, retrying in {wait}s")
-                    time.sleep(wait)
-                    continue
-                raise
-            except requests.exceptions.ConnectionError:
-                if attempt < max_retries - 1:
-                    wait = 2 ** attempt
-                    self._log(f"Connection error, retrying in {wait}s")
-                    time.sleep(wait)
-                    continue
-                raise
+            except (
+                requests.exceptions.HTTPError,
+                requests.exceptions.ConnectionError,
+            ) as exc:
+                self._on_request_error(exc, attempt, max_retries, url)
         raise RuntimeError(f"Max retries exceeded for {url}")
 
-    def _get_raw(self, path: str) -> requests.Response:
-        """GET returning raw response (for file downloads)."""
+    def _get_raw(self, path: str, max_retries: int = 3) -> requests.Response:
+        """GET returning a raw streaming response (file downloads), with the SAME
+        retry + shared rate-limit coordination as _get so attachment downloads honor
+        429/5xx/transient errors and the shared backoff window (#39)."""
         url = self.base_url + path
-        self._log(f"GET (raw) {url}")
-        resp = self.session.get(url, stream=True, timeout=60)
-        resp.raise_for_status()
-        return resp
+        for attempt in range(max_retries):
+            self._await_rate_limit()
+            try:
+                self._log(f"GET (raw) {url}")
+                with self._rate_lock:
+                    self.stats["requests"] += 1
+                resp = self.session.get(url, stream=True, timeout=60)
+                resp.raise_for_status()
+                return resp
+            except (
+                requests.exceptions.HTTPError,
+                requests.exceptions.ConnectionError,
+            ) as exc:
+                self._on_request_error(exc, attempt, max_retries, url)
+        raise RuntimeError(f"Max retries exceeded for {url}")
 
     def _paginate(self, path: str, params: dict | None = None) -> list[dict]:
         """Fetch all pages of results using cursor-based pagination."""

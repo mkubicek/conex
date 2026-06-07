@@ -650,3 +650,99 @@ class TestGetFolderByIdV1:
         client.set_cookies("session=abc")
         with patch.object(client, "_get", side_effect=Exception("boom")):
             assert client.get_folder_by_id("77") is None
+
+
+class TestGetRawRetryAndRateLimit:
+    """#39: attachment downloads (_get_raw) share _get's retry/rate-limit path, and a
+    429 sets a shared backoff window all requests honor."""
+
+    def _http_error(self, status, retry_after=None):
+        resp = MagicMock()
+        resp.status_code = status
+        resp.headers = {"Retry-After": str(retry_after)} if retry_after is not None else {}
+        resp.raise_for_status.side_effect = requests.exceptions.HTTPError(response=resp)
+        return resp
+
+    def _ok(self):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        return resp
+
+    def test_get_raw_retries_on_429_then_succeeds(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            ok = self._ok()
+            mock_get.side_effect = [self._http_error(429, retry_after=0), ok]
+            assert client._get_raw("/d") is ok
+            assert client.stats["retries"] >= 1
+            assert client.stats["requests"] >= 2
+
+    def test_get_raw_retries_on_500_then_succeeds(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            ok = self._ok()
+            mock_get.side_effect = [self._http_error(500), ok]
+            assert client._get_raw("/d") is ok
+
+    def test_get_raw_retries_on_connection_error(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            ok = self._ok()
+            mock_get.side_effect = [requests.exceptions.ConnectionError(), ok]
+            assert client._get_raw("/d") is ok
+
+    def test_get_raw_auth_error_not_retried(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get:
+            mock_get.return_value = self._http_error(403)
+            with pytest.raises(AuthenticationError):
+                client._get_raw("/d")
+
+    def test_get_raw_500_exhausted_raises_httperror(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            mock_get.return_value = self._http_error(500)
+            with pytest.raises(requests.exceptions.HTTPError):
+                client._get_raw("/d", max_retries=2)
+
+    def test_get_raw_429_exhausted_raises_runtime(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            mock_get.return_value = self._http_error(429, retry_after=0)
+            with pytest.raises(RuntimeError, match="Max retries"):
+                client._get_raw("/d", max_retries=2)
+
+    def test_get_raw_connection_error_exhausted_raises(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            mock_get.side_effect = requests.exceptions.ConnectionError()
+            with pytest.raises(requests.exceptions.ConnectionError):
+                client._get_raw("/d", max_retries=2)
+
+    def test_shared_window_makes_next_request_wait(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep") as sleep:
+            ok = self._ok()
+            ok.json.return_value = {}
+            mock_get.return_value = ok
+            client._note_rate_limit(5)  # a 429 elsewhere set a 5s window
+            client._get("/x")  # must wait the window before its request
+            assert sleep.called
+            assert client.stats["rate_limit_sleep_s"] > 0
+
+    def test_stats_count_successful_requests(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get:
+            ok = self._ok()
+            ok.json.return_value = {"ok": True}
+            mock_get.return_value = ok
+            client._get("/x")
+            assert client.stats["requests"] == 1
+            assert client.stats["retries"] == 0
