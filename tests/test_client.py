@@ -746,3 +746,17 @@ class TestGetRawRetryAndRateLimit:
             client._get("/x")
             assert client.stats["requests"] == 1
             assert client.stats["retries"] == 0
+
+    def test_non_numeric_retry_after_falls_back(self):
+        # A date-form or junk Retry-After must not crash the retryable 429.
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            bad = MagicMock()
+            bad.status_code = 429
+            bad.headers = {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+            bad.raise_for_status.side_effect = requests.exceptions.HTTPError(response=bad)
+            ok = self._ok()
+            ok.json.return_value = {"ok": True}
+            mock_get.side_effect = [bad, ok]
+            assert client._get("/x") == {"ok": True}  # retried, did not crash

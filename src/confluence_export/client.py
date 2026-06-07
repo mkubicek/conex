@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import sys
 import threading
 import time
@@ -171,10 +172,15 @@ class ConfluenceClient:
 
     def _await_rate_limit(self) -> None:
         """Block until a rate-limit window set by a 429 (possibly on another worker
-        thread) has passed. Never holds the lock while sleeping."""
+        thread) has passed, so one 429 backs off the whole pool. Adds small jitter so
+        the pooled workers don't all wake on the same instant and re-trip the limiter
+        (Atlassian's rate-limit guidance). Best-effort single-shot: a window extended
+        by a peer mid-sleep is honored on this thread's next request, not mid-sleep.
+        Never holds the lock while sleeping."""
         with self._rate_lock:
             wait = self._rate_limit_until - time.monotonic()
         if wait > 0:
+            wait += random.uniform(0, 0.5)
             time.sleep(wait)
             with self._rate_lock:
                 self.stats["rate_limit_sleep_s"] += wait
@@ -203,7 +209,14 @@ class ConfluenceClient:
             if status in (401, 403):
                 raise AuthenticationError(status, url) from exc
             if status == 429:
-                retry_after = int(exc.response.headers.get("Retry-After", 60))
+                # Retry-After is normally delta-seconds, but a proxy/gateway can send
+                # an HTTP-date (or junk). Don't let int() raise a ValueError that would
+                # escape the (HTTPError, ConnectionError)-only except and crash a
+                # retryable 429; fall back to 60s.
+                try:
+                    retry_after = float(exc.response.headers.get("Retry-After", 60))
+                except (TypeError, ValueError):
+                    retry_after = 60.0
                 self._log(f"Rate limited, waiting {retry_after}s")
                 self._note_rate_limit(retry_after)
                 return
