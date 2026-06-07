@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
+from confluence_export.client import AuthenticationError
 from confluence_export.diagnostics import WarningCollector
 from confluence_export.media import (
     _VERSIONS_FILE,
@@ -1530,6 +1531,24 @@ class TestRecordDownloadWarning:
 
         assert "timed out downloading slow.png" in capsys.readouterr().err
         assert wc.counts() == {"attachment download timeout": 1}
+
+    def test_401_points_at_token_type_not_generic_failure(self, capsys):
+        # A 401/403 lists fine but the binary is rejected — usually a scoped/granular
+        # token. It must NOT fall into the opaque generic bucket.
+        wc = WarningCollector()
+        _record_download_warning(_att(title="secret.png"), AuthenticationError(401, "/d"), wc)
+
+        err = capsys.readouterr().err
+        assert "HTTP 401 downloading 'secret.png'" in err
+        assert "classic (unscoped) API token" in err
+        assert wc.counts() == {"attachment download forbidden (HTTP 401/403)": 1}
+
+    def test_403_uses_the_same_forbidden_category(self, capsys):
+        wc = WarningCollector()
+        _record_download_warning(_att(title="x.png"), AuthenticationError(403, "/d"), wc)
+
+        assert "HTTP 403 downloading 'x.png'" in capsys.readouterr().err
+        assert wc.counts() == {"attachment download forbidden (HTTP 401/403)": 1}
 
     def test_collector_is_optional(self, capsys):
         # The helper still prints when no collector is supplied.

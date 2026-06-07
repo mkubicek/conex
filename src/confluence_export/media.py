@@ -12,7 +12,7 @@ from pathlib import Path
 
 import requests
 
-from confluence_export.client import ConfluenceClient
+from confluence_export.client import AuthenticationError, ConfluenceClient
 from confluence_export.diagnostics import WarningCollector
 from confluence_export.filemode import default_file_mode, replacement_mode
 from confluence_export.paths import (
@@ -394,13 +394,26 @@ def _record_download_warning(
 ) -> None:
     """Print a clear best-effort download warning and tally it by category. A 404 on
     the binary (the metadata listed the file, but its bytes are gone) is *unavailable
-    content*, not an exporter endpoint bug — word it so the user doesn't misread it."""
+    content*, not an exporter endpoint bug — word it so the user doesn't misread it.
+    A 401/403 is distinct: the metadata listed fine but the binary fetch was rejected,
+    which is most often a token-type problem (granular/scoped API tokens are widely
+    reported to fail attachment downloads even with the attachment scope granted), so
+    point the user at the one fix rather than burying it as a generic failure."""
     status = getattr(getattr(exc, "response", None), "status_code", None)
     if isinstance(exc, requests.exceptions.HTTPError) and status == 404:
         category = "attachment unavailable (HTTP 404)"
         print(
             f"  Warning: attachment '{att.title}': metadata exists but its binary is "
             "unavailable (HTTP 404)",
+            file=sys.stderr,
+        )
+    elif isinstance(exc, AuthenticationError):
+        category = "attachment download forbidden (HTTP 401/403)"
+        print(
+            f"  Warning: HTTP {exc.status_code} downloading '{att.title}': its metadata "
+            "is listed but the binary fetch was rejected. Granular/scoped API tokens are "
+            "known to fail attachment downloads even with the attachment scope; if these "
+            "persist across runs, use a classic (unscoped) API token.",
             file=sys.stderr,
         )
     elif isinstance(exc, requests.exceptions.Timeout):

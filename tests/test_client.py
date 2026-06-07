@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
@@ -112,6 +113,70 @@ class TestGet:
             mock_get.side_effect = requests.exceptions.ReadTimeout()
             with pytest.raises(requests.exceptions.ReadTimeout):
                 client._get("/test", max_retries=2)
+
+
+class TestCrossHostRedirectAuth:
+    """A Confluence attachment download 302-redirects to the media CDN, whose signed
+    URL self-authenticates. `requests` must DROP our Atlassian Authorization header on
+    the host change — re-attaching it to the media host is the exact bug that turns
+    working downloads into 403s in other Confluence clients. This pins that behavior
+    for conex's session so a future auth/redirect change can't silently regress it."""
+
+    @staticmethod
+    def _resp(status, request, headers=None):
+        resp = requests.models.Response()
+        resp.status_code = status
+        resp.headers = requests.structures.CaseInsensitiveDict(headers or {})
+        resp.url = request.url
+        resp.request = request
+        resp.raw = io.BytesIO(b"")
+        resp._content = b""
+        resp._content_consumed = True
+        return resp
+
+    def _drive_redirect(self, client, first_url, media_url):
+        """Send a real request through the client's session, with the transport
+        adapter mocked to 302 cross-host then 200, capturing each hop's auth header."""
+        sent: list[tuple[str, str | None]] = []
+
+        def fake_send(_adapter, request, **_kwargs):
+            sent.append((request.url, request.headers.get("Authorization")))
+            if len(sent) == 1:
+                return self._resp(302, request, {"Location": media_url})
+            return self._resp(200, request)
+
+        with patch("requests.adapters.HTTPAdapter.send", new=fake_send):
+            resp = client.session.get(first_url, allow_redirects=True, stream=True)
+        return resp, sent
+
+    def test_basic_auth_header_stripped_on_media_redirect(self):
+        client = _make_client()  # email+token -> HTTPBasicAuth on the session
+        first_url = "https://x.atlassian.net/wiki/rest/api/content/1/child/attachment/2/download"
+        media_url = "https://api.media.atlassian.com/file/abc/binary?token=signed"
+
+        resp, sent = self._drive_redirect(client, first_url, media_url)
+
+        assert resp.status_code == 200
+        assert len(sent) == 2
+        (first_hop_url, first_auth), (media_hop_url, media_auth) = sent
+        # First hop to Atlassian carries our credentials...
+        assert "x.atlassian.net" in first_hop_url and first_auth is not None
+        # ...the cross-host hop to the media CDN must NOT.
+        assert "api.media.atlassian.com" in media_hop_url
+        assert media_auth is None
+
+    def test_bearer_pat_header_stripped_on_media_redirect(self):
+        client = _make_client()
+        # Simulate Bearer-PAT auth (header on the session rather than session.auth).
+        client.session.auth = None
+        client.session.headers["Authorization"] = "Bearer pat-secret"
+        first_url = "https://x.atlassian.net/wiki/rest/api/content/1/child/attachment/2/download"
+        media_url = "https://api.media.atlassian.com/file/abc/binary?token=signed"
+
+        _resp, sent = self._drive_redirect(client, first_url, media_url)
+
+        assert sent[0][1] == "Bearer pat-secret"
+        assert sent[1][1] is None  # stripped on the media host
 
 
 class TestPaginate:
