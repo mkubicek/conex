@@ -188,41 +188,50 @@ def main() -> None:
 
     client = ConfluenceClient(profile, verbose=args.verbose)
 
-    match args.command:
-        case "spaces":
-            _exit_on_auth_error(lambda: _cmd_spaces(client))
-        case "tree":
-            _cmd_tree(client, CacheStore(), profile, args.space_key)
-        case "find":
-            _cmd_find(client, CacheStore(), profile, args.space_key, args.query)
-        case "export":
-            _cmd_export(
-                client,
-                profile,
-                space_key=args.space_key,
-                path_filter=args.path,
-                output_dir=args.output,
-                no_children=args.no_children,
-                no_media=args.no_media,
-                no_drawio_render=args.no_drawio_render,
-                force_refresh=not args.cached,
-                debug=args.include_html,
-                include_archived=args.include_archived,
-                no_git=args.no_git,
-                no_author_lookup=args.no_author_lookup,
-            )
-        case "diff":
-            _cmd_diff(
-                client,
-                CacheStore(),
-                profile,
-                space_key=args.space_key,
-                export_dir=args.export_dir,
-                path_filter=args.path,
-                include_archived=args.include_archived,
-            )
-        case "refresh":
-            _cmd_refresh(client, CacheStore(), profile, args.space_key)
+    try:
+        match args.command:
+            case "spaces":
+                _exit_on_auth_error(lambda: _cmd_spaces(client))
+            case "tree":
+                _cmd_tree(client, CacheStore(), profile, args.space_key)
+            case "find":
+                _cmd_find(client, CacheStore(), profile, args.space_key, args.query)
+            case "export":
+                _cmd_export(
+                    client,
+                    profile,
+                    space_key=args.space_key,
+                    path_filter=args.path,
+                    output_dir=args.output,
+                    no_children=args.no_children,
+                    no_media=args.no_media,
+                    no_drawio_render=args.no_drawio_render,
+                    force_refresh=not args.cached,
+                    debug=args.include_html,
+                    include_archived=args.include_archived,
+                    no_git=args.no_git,
+                    no_author_lookup=args.no_author_lookup,
+                )
+            case "diff":
+                _cmd_diff(
+                    client,
+                    CacheStore(),
+                    profile,
+                    space_key=args.space_key,
+                    export_dir=args.export_dir,
+                    path_filter=args.path,
+                    include_archived=args.include_archived,
+                )
+            case "refresh":
+                _cmd_refresh(client, CacheStore(), profile, args.space_key)
+    except requests.exceptions.RequestException as exc:
+        # A network request that exhausted the client's retries (e.g. a persistent
+        # read timeout or connection drop) should fail with a clear message, not an
+        # uncaught traceback (issue #39 follow-up). Transient blips are retried in
+        # the client; this is the genuine-outage path.
+        print(f"Error: a network request to Confluence failed: {exc}", file=sys.stderr)
+        print("Likely transient (read timeout / connection drop) — re-run to retry.", file=sys.stderr)
+        sys.exit(1)
 
 
 # -- command implementations -------------------------------------------------

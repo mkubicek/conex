@@ -92,6 +92,27 @@ class TestGet:
             with pytest.raises(requests.exceptions.ConnectionError):
                 client._get("/test", max_retries=2)
 
+    def test_read_timeout_retries_then_succeeds(self):
+        # #39 follow-up: a per-page attachment-list ReadTimeout (a Timeout, NOT a
+        # ConnectionError) must be retried, not escape uncaught and abort the export.
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            ok = MagicMock()
+            ok.status_code = 200
+            ok.raise_for_status.return_value = None
+            ok.json.return_value = {"ok": True}
+            mock_get.side_effect = [requests.exceptions.ReadTimeout(), ok]
+            assert client._get("/test") == {"ok": True}
+
+    def test_read_timeout_exhausted_raises(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            mock_get.side_effect = requests.exceptions.ReadTimeout()
+            with pytest.raises(requests.exceptions.ReadTimeout):
+                client._get("/test", max_retries=2)
+
 
 class TestPaginate:
     def test_single_page(self):

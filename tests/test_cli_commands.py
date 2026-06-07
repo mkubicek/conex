@@ -1029,3 +1029,23 @@ class TestPageOnlyWiring:
             ["confluence-export", "diff", "TEST", str(export_dir)], cache, _mock_client()
         )
         assert cache.refresh.call_args.kwargs.get("fetch_attachments") is False
+
+
+class TestNetworkErrorHandling:
+    """#39 follow-up: a network failure that exhausts retries exits cleanly, not as
+    an uncaught traceback (a read timeout during refresh aborted a bulk export)."""
+
+    def test_persistent_read_timeout_exits_cleanly(self, capsys):
+        client = _mock_client()
+        cache = MagicMock()
+        cache.refresh.side_effect = requests.exceptions.ReadTimeout("read timed out")
+        with patch("sys.argv", ["confluence-export", "refresh", "TEST"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
+            with pytest.raises(SystemExit) as exc:
+                main()
+            assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "network request to Confluence failed" in err
+        assert "re-run to retry" in err.lower()

@@ -224,7 +224,9 @@ class ConfluenceClient:
                 self._backoff(attempt)
                 return
             raise exc
-        # ConnectionError
+        # ConnectionError / Timeout (ReadTimeout, ConnectTimeout): transient, retry.
+        # A read timeout on a single per-page attachment-list call must not abort the
+        # whole space refresh/export with an uncaught traceback (issue #39 follow-up).
         if attempt < max_retries - 1:
             self._backoff(attempt)
             return
@@ -245,6 +247,7 @@ class ConfluenceClient:
             except (
                 requests.exceptions.HTTPError,
                 requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
             ) as exc:
                 self._on_request_error(exc, attempt, max_retries, url)
         raise RuntimeError(f"Max retries exceeded for {url}")
@@ -266,6 +269,7 @@ class ConfluenceClient:
             except (
                 requests.exceptions.HTTPError,
                 requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
             ) as exc:
                 self._on_request_error(exc, attempt, max_retries, url)
         raise RuntimeError(f"Max retries exceeded for {url}")
