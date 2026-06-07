@@ -8,7 +8,7 @@ import re
 import sys
 import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
@@ -138,6 +138,15 @@ def gateway_url(cloud_id: str) -> str:
 
 def normalize_url(url: str) -> str:
     return (url or "").strip().rstrip("/")
+
+
+def is_https_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        _normalized_port(parsed)
+    except ValueError:
+        return False
+    return parsed.scheme == "https" and bool(parsed.hostname)
 
 
 def _config_dir() -> Path:
@@ -300,33 +309,132 @@ def _parse_file_config(path: Path) -> _ResolvedConfig:
     )
 
 
+def _origin_changed(
+    base_url: str,
+    override_url: str,
+    *,
+    override_is_local: bool = False,
+) -> bool:
+    """True when an override points credentials at a different origin."""
+    if not override_url:
+        return False
+    try:
+        base = urlparse(base_url)
+        override = urlparse(override_url)
+        if not override.hostname:
+            return False
+        if not base.hostname:
+            return override_is_local
+        return _credential_scope(override_url) != _credential_scope(base_url)
+    except ValueError:
+        return True
+
+
+def _credential_scope(url: str) -> tuple[str, str, int | None, str]:
+    parsed = urlparse(url)
+    route = ""
+    if is_gateway_url(url):
+        route = gateway_cloud_id(url) or ""
+    return (parsed.scheme, (parsed.hostname or "").lower(), _normalized_port(parsed), route)
+
+
+def _normalized_port(parsed) -> int | None:
+    port = parsed.port
+    if port is not None:
+        return port
+    if parsed.scheme == "https":
+        return 443
+    if parsed.scheme == "http":
+        return 80
+    return None
+
+
+def _is_local_config_source(path: Path | None) -> bool:
+    return bool(path and path.name == CONFIG_FILE and path.parent.name == LOCAL_CONFIG_DIR_NAME)
+
+
 def _overlay(base: _ResolvedConfig, override: _ResolvedConfig) -> _ResolvedConfig:
-    override_auth_has_credentials = False
-    if base.auth and override.auth:
-        override_auth_has_cookie = bool(override.auth.cookie_header)
-        override_auth_has_tokenish = bool(override.auth.email or override.auth.token)
-        override_auth_has_credentials = override_auth_has_cookie or override_auth_has_tokenish
-        if override.auth.type is not None:
-            auth_type = override.auth.type
-        elif override_auth_has_credentials:
-            auth_type = None
-        else:
-            auth_type = base.auth.type
-        auth = AuthConfig(
-            type=auth_type,
-            email=override.auth.email or ("" if override_auth_has_cookie else base.auth.email),
-            token=override.auth.token or ("" if override_auth_has_cookie else base.auth.token),
-            cookie_header=override.auth.cookie_header or (
-                "" if override_auth_has_tokenish else base.auth.cookie_header
-            ),
-        )
-    else:
-        auth = override.auth or base.auth
-        override_auth_has_credentials = bool(
-            override.auth and (
-                override.auth.email or override.auth.token or override.auth.cookie_header
+    override_auth_has_cookie = bool(override.auth and override.auth.cookie_header)
+    override_auth_has_tokenish = bool(
+        override.auth and (override.auth.email or override.auth.token)
+    )
+    override_auth_has_credentials = override_auth_has_cookie or override_auth_has_tokenish
+    base_auth_has_credentials = bool(
+        base.auth and (base.auth.email or base.auth.token or base.auth.cookie_header)
+    )
+    base_is_local = _is_local_config_source(base.source)
+    override_is_local = _is_local_config_source(override.source)
+    route_origin_changed = (
+        base_auth_has_credentials
+        and (
+            _origin_changed(
+                base.site_url,
+                override.site_url,
+                override_is_local=override_is_local,
+            )
+            or _origin_changed(
+                base.api_base_url or base.site_url,
+                override.api_base_url,
+                override_is_local=override_is_local,
+            )
+            or (
+                override.cloud_id is not None
+                and override.cloud_id != base.cloud_id
+                and (
+                    base.cloud_id is not None
+                    or base_is_local
+                    or override_is_local
+                )
             )
         )
+    )
+    route_change_drops_auth = route_origin_changed and (
+        override_auth_has_credentials
+        or override_is_local
+        or bool(override.site_url or override.api_base_url)
+    )
+    credential_only_override = (
+        override_auth_has_credentials
+        and not override.site_url
+        and not override.api_base_url
+    )
+    if credential_only_override and _is_local_config_source(base.source):
+        raise ConnectionProfileError(
+            "credential-only environment/CLI overrides cannot be applied to a "
+            "local .conex site_url; set CONFLUENCE_SITE_URL or --site-url with "
+            "the credentials"
+        )
+
+    if base.auth and override.auth:
+        if route_change_drops_auth:
+            auth = AuthConfig(
+                type=override.auth.type,
+                email=override.auth.email,
+                token=override.auth.token,
+                cookie_header=override.auth.cookie_header,
+            )
+        elif override.auth.type is not None:
+            auth_type = override.auth.type
+            auth = AuthConfig(
+                type=auth_type,
+                email=override.auth.email or ("" if override_auth_has_cookie else base.auth.email),
+                token=override.auth.token or ("" if override_auth_has_cookie else base.auth.token),
+                cookie_header=override.auth.cookie_header or (
+                    "" if override_auth_has_tokenish else base.auth.cookie_header
+                ),
+            )
+        else:
+            auth_type = None if override_auth_has_credentials else base.auth.type
+            auth = AuthConfig(
+                type=auth_type,
+                email=override.auth.email or ("" if override_auth_has_cookie else base.auth.email),
+                token=override.auth.token or ("" if override_auth_has_cookie else base.auth.token),
+                cookie_header=override.auth.cookie_header or (
+                    "" if override_auth_has_tokenish else base.auth.cookie_header
+                ),
+            )
+    else:
+        auth = override.auth or (None if route_change_drops_auth else base.auth)
 
     site_url_overridden = bool(override.site_url)
     merged_auth_has_credentials = bool(
@@ -344,9 +452,16 @@ def _overlay(base: _ResolvedConfig, override: _ResolvedConfig) -> _ResolvedConfi
         and merged_auth_has_credentials
     )
     clear_derived_route = (
-        (site_url_overridden or override_auth_has_credentials or override_auth_forces_site_route)
+        (
+            site_url_overridden
+            or override_auth_has_credentials
+            or override_auth_forces_site_route
+            or override.cloud_id is not None
+        )
         and not override.api_base_url
     )
+    origin_route_overridden = site_url_overridden or bool(override.api_base_url)
+    merged_source = override.source or (None if origin_route_overridden else base.source)
 
     return _ResolvedConfig(
         site_url=override.site_url or base.site_url,
@@ -359,9 +474,30 @@ def _overlay(base: _ResolvedConfig, override: _ResolvedConfig) -> _ResolvedConfi
             ) else base.cloud_id
         ),
         auth=auth,
-        source=override.source or base.source,
-        source_label=override.source_label if override.source else base.source_label,
+        source=merged_source,
+        source_label=override.source_label if merged_source is None else (
+            override.source_label if override.source else base.source_label
+        ),
     )
+
+
+def _has_credentials(config: _ResolvedConfig) -> bool:
+    return bool(
+        config.auth
+        and (config.auth.email or config.auth.token or config.auth.cookie_header)
+    )
+
+
+def _has_route(config: _ResolvedConfig) -> bool:
+    return bool(config.site_url or config.api_base_url)
+
+
+def _has_origin_route(config: _ResolvedConfig) -> bool:
+    return bool(config.site_url or config.api_base_url)
+
+
+def _is_credential_only(config: _ResolvedConfig) -> bool:
+    return _has_credentials(config) and not _has_route(config)
 
 
 def _env_config() -> _ResolvedConfig:
@@ -479,25 +615,38 @@ def load_connection_profile(
     if local_path is not None:
         merged = _overlay(merged, _parse_file_config(local_path))
 
-    merged = _overlay(merged, _env_config())
-    merged = _overlay(
-        merged,
-        _cli_config(
-            site_url=site_url,
-            base_url=base_url,
-            api_base_url=api_base_url,
-            cloud_id=cloud_id,
-            auth_type=auth_type,
-            email=email,
-            api_token=api_token,
-            cookie=cookie,
-        ),
+    env_config = _env_config()
+    cli_config = _cli_config(
+        site_url=site_url,
+        base_url=base_url,
+        api_base_url=api_base_url,
+        cloud_id=cloud_id,
+        auth_type=auth_type,
+        email=email,
+        api_token=api_token,
+        cookie=cookie,
     )
+    env_route_scoped_by_cli = _is_credential_only(env_config) and _has_origin_route(cli_config)
+    if env_route_scoped_by_cli:
+        env_config = replace(
+            env_config,
+            site_url=cli_config.site_url,
+            api_base_url=cli_config.api_base_url,
+            cloud_id=cli_config.cloud_id if cli_config.cloud_id is not None else env_config.cloud_id,
+        )
+        cli_config = replace(cli_config, site_url="", api_base_url="", cloud_id=None)
+
+    merged = _overlay(merged, env_config)
+    merged = _overlay(merged, cli_config)
 
     if merged.auth is None:
         raise ConnectionProfileError("authentication credentials are required")
     if not merged.site_url:
         raise ConnectionProfileError("site_url is required")
+    if not is_https_url(merged.site_url):
+        raise ConnectionProfileError("site_url must be an HTTPS URL")
+    if merged.api_base_url and not is_https_url(merged.api_base_url):
+        raise ConnectionProfileError("api_base_url must be an HTTPS URL")
     if is_gateway_url(merged.site_url):
         raise ConnectionProfileError(
             "site_url must be the Confluence site URL, not the OAuth gateway URL"
@@ -644,7 +793,7 @@ def save_connection_config(
     except Exception:
         try:
             tmp_path.unlink()
-        except FileNotFoundError:
+        except FileNotFoundError:  # pragma: no cover
             pass
         raise
     cp.chmod(0o600)

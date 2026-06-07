@@ -216,6 +216,20 @@ class TestEmptyResponse:
             assert result.pages == []
             assert store.load("TEST").pages == []  # corrupt file overwritten with valid JSON
 
+    def test_zero_pages_over_invalid_cache_shape_proceeds(self, tmp_path):
+        with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
+            store = CacheStore()
+            store._space_file("TEST").write_text("[]")
+            client = MagicMock()
+            client.returns_archived_pages = False
+            client.get_pages_in_space.return_value = []
+            client.get_attachments.return_value = []
+
+            result = store.refresh(client, _make_space())
+
+            assert result.pages == []
+            assert store.load("TEST").pages == []
+
     def test_zero_pages_with_no_prior_cache_proceeds(self, tmp_path):
         with patch("confluence_export.cache.cache_dir", return_value=tmp_path):
             store = CacheStore()

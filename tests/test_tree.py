@@ -143,6 +143,78 @@ def test_build_tree_archived_orphan():
     assert any(r.page.title == "_archived" for r in roots)
 
 
+def test_build_tree_archived_child_grouped_under_archived_root():
+    pages = [
+        Page(id="1", title="Live", parent_type="space", position=0),
+        Page(
+            id="2", title="Old Child", parent_id="1", parent_type="page",
+            position=0, status="archived",
+        ),
+    ]
+
+    roots = build_tree(pages)
+
+    live = next(r for r in roots if r.page.id == "1")
+    assert live.children == []
+    archived = next(r for r in roots if r.page.id == "__archived__")
+    assert [child.page.id for child in archived.children] == ["2"]
+
+
+def test_build_tree_live_child_of_archived_parent_surfaces_to_root():
+    # PR3: a CURRENT page whose parent is archived must stay visible as a root, not
+    # be buried under _archived where a default export (which omits __archived__)
+    # would silently drop it. The archived parent still groups under _archived.
+    pages = [
+        Page(id="1", title="Archived Parent", parent_type="space", position=0, status="archived"),
+        Page(id="2", title="Live Child", parent_id="1", parent_type="page", position=0),
+    ]
+
+    roots = build_tree(pages)
+
+    assert any(r.page.id == "2" for r in roots)  # live child surfaced to a root
+    archived = next(r for r in roots if r.page.id == "__archived__")
+    archived_ids = {n.page.id for n in collect_subtree(archived)}
+    assert "2" not in archived_ids  # live child NOT buried under _archived
+    assert "1" in archived_ids  # archived parent still grouped there
+
+
+def test_build_tree_live_grandchild_follows_surfaced_live_parent():
+    # A live chain under an archived ancestor: the live parent surfaces to a root
+    # and its own live child stays nested under it (only the archived ancestor is
+    # grouped under _archived).
+    pages = [
+        Page(id="A", title="Archived", parent_type="space", position=0, status="archived"),
+        Page(id="B", title="Live Mid", parent_id="A", parent_type="page", position=0),
+        Page(id="C", title="Live Leaf", parent_id="B", parent_type="page", position=0),
+    ]
+
+    roots = build_tree(pages)
+
+    b = next(r for r in roots if r.page.id == "B")  # surfaced to root
+    assert [child.page.id for child in b.children] == ["C"]  # leaf stays under it
+    archived = next(r for r in roots if r.page.id == "__archived__")
+    assert [child.page.id for child in archived.children] == ["A"]
+
+
+def test_build_tree_live_leaf_under_two_archived_ancestors_surfaces():
+    # A live leaf whose parent AND grandparent are both archived (G_arch -> P_arch
+    # -> C_live): the live leaf surfaces to a root; both archived ancestors stay
+    # grouped under _archived (the archived chain nests; the live leaf does not).
+    pages = [
+        Page(id="G", title="G arch", parent_type="space", position=0, status="archived"),
+        Page(id="P", title="P arch", parent_id="G", parent_type="page", position=0, status="archived"),
+        Page(id="C", title="C live", parent_id="P", parent_type="page", position=0),
+    ]
+
+    roots = build_tree(pages)
+
+    assert any(r.page.id == "C" for r in roots)  # live leaf surfaced
+    archived = next(r for r in roots if r.page.id == "__archived__")
+    archived_ids = {n.page.id for n in collect_subtree(archived)}
+    assert "C" not in archived_ids
+    assert {"G", "P"} <= archived_ids  # both archived ancestors grouped under _archived
+
+
 def test_page_path_unknown_id(sample_pages):
     assert page_path(sample_pages, "999") == "/"
 
@@ -150,3 +222,11 @@ def test_page_path_unknown_id(sample_pages):
 def test_find_node_by_path_not_found(sample_pages):
     roots = build_tree(sample_pages)
     assert find_node_by_path(roots, "/Root/Nonexistent") is None
+
+
+def test_find_node_by_path_descends_past_leaf(sample_pages):
+    # Path goes one level deeper than the tree: every existing segment matches
+    # ("Grandchild A1" is a leaf), then recursion hits an empty node list with a
+    # remaining part, so resolution fails rather than returning the leaf.
+    roots = build_tree(sample_pages)
+    assert find_node_by_path(roots, "/Root/Child A/Grandchild A1/TooDeep") is None

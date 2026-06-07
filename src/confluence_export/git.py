@@ -7,12 +7,21 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import unicodedata
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
-from confluence_export.media import WORKSPACE_DIR_NAME
+from confluence_export.media import MEDIA_DIR_NAME, WORKSPACE_DIR_NAME
+from confluence_export.paths import nfc, nfc_casefold
+from confluence_export.protection import (
+    ProtectedDir,
+    ProtectionSet,
+    _media_owner_dir,
+    build_protected,
+    media_file_is_preserved,
+    media_owner_dirs_from_written_files,
+    page_dirs_from_written_files,
+)
 
 # Conservative per-call argv budget for git add / git rm path lists. macOS
 # ARG_MAX is 1 MiB (and includes the environment block), so 100 KiB leaves
@@ -128,25 +137,30 @@ def commit_export(
     space_key: str,
     *,
     is_full: bool = True,
-    protected_dirs: list[Path] | None = None,
+    protection: ProtectionSet = ProtectionSet(),
+    preserve_media: bool = False,
 ) -> bool:
     """Stage exporter-written files and remove stale tracked files.
 
-    Stages written_files, then (only on a full export) removes any tracked files
-    under output_dir that are not in written_files (handles upstream deletions,
-    renames, and moves). Returns True if a commit was made.
+    Stages written_files, then (only on a full export that actually wrote pages)
+    removes any tracked files under output_dir that are not in written_files
+    (handles upstream deletions, renames, and moves). A full export that wrote
+    nothing prunes nothing — see the Decision-1 note at the prune below. Returns
+    True if a commit was made.
 
     ``is_full`` must be False for filtered / single-subtree / no-children
     exports: those write only part of the tree, so written_files covers only
     that subset. Pruning then would ``git rm`` the entire rest of the repo. A
     partial export is therefore strictly add-only.
 
-    ``protected_dirs`` are page directories SKIPPED this run because of a
-    transient failure (body fetch / conversion raised) rather than a genuine
-    upstream deletion. Their tracked files are absent from written_files but must
-    NOT be pruned — that would silently delete a stable page's last-good
-    committed export just because it failed to regenerate this run. They are
-    excluded from the stale prune and heal on the next successful export.
+    ``protection`` (protection.ProtectionSet) carries the typed, already-scoped
+    protections: ``page_exact`` dirs are spared page-EXACTLY (the page's own files
+    + ``.media``, NOT a child page — M1-exact); ``subtrees`` are spared RECURSIVELY
+    (skipped pages whose descendants we cannot vouch for, and a wholesale-omitted
+    ``_archived`` tree); ``prune_media_owners`` is the ``--no-media`` override that
+    FORCES pruning of otherwise-preserved media. Scope is welded into the value
+    type, so there is no untyped slot to mis-route (the page-exact vs recursive bug
+    that fix ② had to repair by hand).
 
     A moved page is handled as a plain delete + add: the reconciler drops the old
     path's markdown/.media and the write walk regenerates them at the new path,
@@ -154,6 +168,12 @@ def commit_export(
     makes history follow — no sidecar relocation or index patching needed (issue
     #17, Option B). The user's ``.workspace`` is never moved; it is preserved by
     the prune skip below and stays where the user put it.
+
+    ``preserve_media`` must be True on a ``--no-media`` run (M1): that run writes
+    no attachments, so written_files carries no ``.media`` paths and the prune
+    would otherwise ``git rm`` every committed attachment even though they are
+    still valid on disk. The committed media is left untouched; a later full
+    export with media reconciles genuine attachment deletions.
     """
     # Stage only the files the exporter wrote. Chunk to avoid hitting the
     # OS argv limit on big spaces (thousands of paths joined into one exec
@@ -167,7 +187,31 @@ def commit_export(
     # Remove stale tracked files (deletions/renames/moves upstream). Only on a
     # full export — a partial export's written_files is not the whole tree.
     if is_full:
-        _remove_stale_files(output_dir, written_files, protected_dirs or [])
+        # Compile the typed protections ONCE into dual-form matchers shared by the
+        # prune and the restore so they cannot drift (protection.build_protected).
+        page_dirs, sub_dirs = build_protected(output_dir, protection)
+        # DATA-SAFETY DECISION 1: prune ONLY when this run actually wrote live
+        # pages. A full export that wrote nothing has no authority to reconcile
+        # deletions — a transient/auth-failed empty response, or a v2 space that
+        # returned its archived set but zero current pages, must NEVER git-rm a
+        # whole committed export down to (near-)empty. We keep the prior export
+        # and heal on the next successful run; archived-preservation sets alone
+        # can never trigger a prune of live pages. (See the cli.py prune gate.)
+        if written_files:
+            _remove_stale_files(
+                output_dir, written_files,
+                page_dirs=page_dirs, sub_dirs=sub_dirs,
+                prune_media_owners=protection.prune_media_owners,
+                preserve_media=preserve_media,
+            )
+        # Restore any tracked file reconcile deleted from disk under a protected
+        # dir, so the worktree matches the copy we kept in HEAD and the next run's
+        # commit_local_changes can't stage the deletion (RF-B/M2). Always safe —
+        # it only re-adds protected files, never deletes — so it runs even on a
+        # write-less run (e.g. all pages skipped this run).
+        _restore_protected_deletions(
+            output_dir, page_dirs=page_dirs, sub_dirs=sub_dirs,
+        )
 
     # Check if anything was staged
     result = _run_git(output_dir, "diff", "--cached", "--quiet", check=False)
@@ -210,21 +254,34 @@ def _fs_is_case_insensitive(output_dir: Path) -> bool:
 def _remove_stale_files(
     output_dir: Path,
     written_files: list[Path],
-    protected_dirs: list[Path] | None = None,
+    *,
+    page_dirs: list[ProtectedDir] | None = None,
+    sub_dirs: list[ProtectedDir] | None = None,
+    prune_media_owners: frozenset[Path] = frozenset(),
+    preserve_media: bool = False,
 ) -> None:
-    """Remove tracked files that are no longer part of the export."""
+    """Remove tracked files that are no longer part of the export.
+
+    ``page_dirs`` / ``sub_dirs`` are the compiled page-EXACT / RECURSIVE
+    ``ProtectedDir`` matchers (protection.build_protected); a tracked file matched
+    by either is spared. Each matcher carries both the symlink-resolved and lexical
+    path form with output_dir self-excluded, so the dual-form OR lives in ONE place
+    (protection.ProtectedDir) shared with the restore — the two can never drift.
+    ``prune_media_owners`` is the ``--no-media`` override that FORCES pruning of
+    otherwise-preserved media (RF-C)."""
     if not _has_commits(output_dir):
         return
 
-    # Page dirs skipped this run due to a transient failure: their tracked files
-    # are absent from written_files but must be preserved, not pruned (a stable
-    # page that merely failed to regenerate this run must keep its last-good
-    # committed export). Never treat output_dir itself as protected.
-    out_resolved = output_dir.resolve()
-    protected = {
-        p.resolve() for p in (protected_dirs or [])
-        if p.resolve() != out_resolved
-    }
+    page_dirs = page_dirs or []
+    sub_dirs = sub_dirs or []
+    written_page_dirs = (
+        page_dirs_from_written_files(output_dir, written_files)
+        if preserve_media else frozenset()
+    )
+    written_media_dirs = (
+        media_owner_dirs_from_written_files(output_dir, written_files)
+        if preserve_media else frozenset()
+    )
 
     result = _run_git(output_dir, "ls-files", "-z", ".", check=False)
     if result is None or not result.stdout.strip("\0"):
@@ -241,12 +298,8 @@ def _remove_stale_files(
     #     differ only in case (a re-cased title, or legacy content from another
     #     machine); git folds those to one path, so we must too, or the same file
     #     is both git-added (new case) and flagged stale (old case).
-    _nfc = lambda s: unicodedata.normalize("NFC", s)  # noqa: E731
-    fold = (
-        (lambda s: _nfc(s).casefold())
-        if _fs_is_case_insensitive(output_dir)
-        else _nfc
-    )
+    # One shared fold definition with layout's collision keys (Q6).
+    fold = nfc_casefold if _fs_is_case_insensitive(output_dir) else nfc
     written_keys = {fold(str(f.resolve())) for f in written_files}
 
     stale = []
@@ -257,15 +310,40 @@ def _remove_stale_files(
         parts = Path(rel_path).parts
         if WORKSPACE_DIR_NAME in parts:
             continue
+        # M1: a --no-media run wrote no attachments; never prune committed
+        # media just because it is absent from this run's written_files — BUT
+        # only media that is still ON DISK. Media reconcile already deleted (a
+        # moved page's old .media) must still be pruned, or it is left tracked
+        # but missing and the export finishes dirty (RF-C).
+        if preserve_media and MEDIA_DIR_NAME in parts and (output_dir / rel_path).is_file():
+            owner = _media_owner_dir(output_dir, rel_path)
+            if owner is not None and media_file_is_preserved(
+                owner,
+                written_page_dirs=written_page_dirs,
+                written_media_dirs=written_media_dirs,
+                prune_media_owners=prune_media_owners,
+                page_exact=page_dirs,
+                subtrees=sub_dirs,
+            ):
+                continue
         if _is_secret_config_relpath(rel_path):
             continue
-        full = (output_dir / rel_path).resolve()
-        if protected and any(full.is_relative_to(d) for d in protected):
+        full_lexical = (output_dir / rel_path).absolute()
+        full = full_lexical.resolve()
+        # Dual-form (resolved OR lexical) match, one matcher object, shared with
+        # the restore — see protection.ProtectedDir (pair-argument is load-bearing).
+        if any(d.owns_exactly(full, full_lexical) for d in page_dirs):
+            continue
+        if any(d.contains_subtree(full, full_lexical) for d in sub_dirs):
             continue
         if fold(str(full)) not in written_keys:
             stale.append(rel_path)
 
     if stale:
+        for rel_path in stale:
+            path = output_dir / rel_path
+            if MEDIA_DIR_NAME in Path(rel_path).parts and path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
         # Same chunking rationale as commit_export: a large stale list can
         # exceed argv limits when passed to a single git rm call. If a batch
         # fails (e.g. one path has a staged rename from reconcile), fall back to
@@ -282,6 +360,76 @@ def _remove_stale_files(
                             file=sys.stderr,
                         )
 
+
+def _restore_protected_deletions(
+    output_dir: Path,
+    *,
+    page_dirs: list[ProtectedDir],
+    sub_dirs: list[ProtectedDir],
+) -> None:
+    """Restore tracked-but-deleted files under a protected dir from HEAD.
+
+    When a moved page is skipped (transient body/convert failure), reconcile has
+    already removed its old path from disk and the stale-prune keeps it tracked
+    (protected) so the last-good committed copy stays in HEAD. That leaves the
+    working tree with a tracked deletion, which the NEXT run's commit_local_changes
+    (``git add -u``) would stage — quietly dropping the copy M2 protected. Restore
+    those files so the worktree matches HEAD. Only restores genuinely-deleted
+    files (``ls-files --deleted``), so a present (possibly user-edited) file is
+    never reverted.
+
+    ``page_dirs`` / ``sub_dirs`` are the SAME compiled ``ProtectedDir`` matchers
+    the stale-prune used (protection.build_protected), so restore and prune cannot
+    drift — the original RF-B failure class."""
+    if not page_dirs and not sub_dirs:
+        return
+    result = _run_git(output_dir, "ls-files", "--deleted", "-z", check=False)
+    if result is None or not result.stdout.strip("\0"):
+        return
+    to_restore = []
+    symlink_ancestors: dict[Path, list[str]] = {}
+    for rel_path in result.stdout.strip("\0").split("\0"):
+        if not rel_path:
+            continue  # pragma: no cover
+        if _is_secret_config_relpath(rel_path):
+            continue
+        full_lexical = (output_dir / rel_path).absolute()
+        full = full_lexical.resolve()
+        if (
+            any(d.owns_exactly(full, full_lexical) for d in page_dirs)
+            or any(d.contains_subtree(full, full_lexical) for d in sub_dirs)
+        ):
+            ancestor = _symlink_ancestor(output_dir, rel_path)
+            if ancestor is not None:
+                symlink_ancestors.setdefault(ancestor, []).append(rel_path)
+            to_restore.append(rel_path)
+    blocked: set[str] = set()
+    for ancestor, rel_paths in symlink_ancestors.items():
+        if not ancestor.is_symlink():
+            continue  # pragma: no cover
+        try:
+            ancestor.unlink()
+        except OSError:
+            blocked.update(rel_paths)
+    if blocked:
+        to_restore = [path for path in to_restore if path not in blocked]
+    for batch in _chunked_paths(to_restore):
+        _run_git(output_dir, "checkout", "HEAD", "--", *batch, check=False)
+
+
+def _symlink_ancestor(output_dir: Path, rel_path: str) -> Path | None:
+    root = output_dir.absolute()
+    path = (output_dir / rel_path).absolute()
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return root
+    current = root
+    for part in rel.parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            return current
+    return None
 
 def _unstage_secret_configs(output_dir: Path) -> None:
     """Undo any accidental staging of local .conex files."""

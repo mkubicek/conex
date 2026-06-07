@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from confluence_export.drawio import (
+    _usable_png,
     detect_drawio_macros,
     find_drawio_attachments,
     find_drawio_cli,
@@ -82,6 +83,203 @@ class TestRenderDrawioToPng:
             result = render_drawio_to_png(drawio)
             assert result == png
 
+    def test_existing_png_reused_when_cli_missing(self, tmp_path):
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        png = tmp_path / "test.drawio.png"
+        png.write_bytes(b"PNG data")
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value=None):
+            result = render_drawio_to_png(drawio)
+
+        assert result == png
+
+    def test_existing_png_directory_not_reused_when_cli_missing(self, tmp_path, capsys):
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        png = tmp_path / "test.drawio.png"
+        png.mkdir()
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value=None):
+            result = render_drawio_to_png(drawio)
+
+        assert result is None
+        assert "CLI not found" in capsys.readouterr().err
+
+    def test_existing_png_symlink_not_reused_when_cli_missing(self, tmp_path, capsys):
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(b"PNG data")
+        png = tmp_path / "test.drawio.png"
+        png.symlink_to(outside)
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value=None):
+            result = render_drawio_to_png(drawio)
+
+        assert result is None
+        assert "CLI not found" in capsys.readouterr().err
+
+    def test_render_replaces_symlink_output_without_touching_target(self, tmp_path):
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(b"outside")
+        png = tmp_path / "test.drawio.png"
+        png.symlink_to(outside)
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+
+        def fake_popen(*args, **kwargs):
+            output = Path(args[0][args[0].index("--output") + 1])
+            assert output != png
+            output.write_bytes(b"fresh")
+            return mock_proc
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
+             patch("subprocess.Popen", side_effect=fake_popen):
+            result = render_drawio_to_png(drawio)
+
+        assert result == png
+        assert outside.read_bytes() == b"outside"
+        assert png.read_bytes() == b"fresh"
+        assert not png.is_symlink()
+
+    def test_force_render_cli_missing_keeps_existing_png(self, tmp_path):
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        png = tmp_path / "test.drawio.png"
+        png.write_bytes(b"stale")
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value=None):
+            result = render_drawio_to_png(drawio, force=True)
+
+        assert result == png
+        assert png.read_bytes() == b"stale"
+
+    def test_force_render_does_not_return_stale_existing_png(self, tmp_path):
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        png = tmp_path / "test.drawio.png"
+        png.write_bytes(b"stale")
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+
+        def fake_popen(*args, **kwargs):
+            output = Path(args[0][args[0].index("--output") + 1])
+            assert output != png
+            assert png.read_bytes() == b"stale"
+            output.write_bytes(b"fresh")
+            return mock_proc
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
+             patch("subprocess.Popen", side_effect=fake_popen):
+            result = render_drawio_to_png(drawio, force=True)
+
+        assert result == png
+        assert png.read_bytes() == b"fresh"
+
+    def test_force_render_waits_for_stable_output_before_replacing_existing_png(self, tmp_path):
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        png = tmp_path / "test.drawio.png"
+        png.write_bytes(b"stale")
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        render_path = None
+        sleeps = 0
+
+        def fake_popen(*args, **kwargs):
+            nonlocal render_path
+            render_path = Path(args[0][args[0].index("--output") + 1])
+            render_path.write_bytes(b"partial")
+            return mock_proc
+
+        def fake_sleep(_):
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps == 1:
+                assert png.read_bytes() == b"stale"
+                render_path.write_bytes(b"complete")
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
+             patch("subprocess.Popen", side_effect=fake_popen), \
+             patch("confluence_export.drawio.time.sleep", side_effect=fake_sleep):
+            result = render_drawio_to_png(drawio, force=True)
+
+        assert result == png
+        assert sleeps >= 1
+        assert png.read_bytes() == b"complete"
+
+    def test_force_render_failure_keeps_existing_png(self, tmp_path, capsys):
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        png = tmp_path / "test.drawio.png"
+        png.write_bytes(b"stale")
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
+             patch("subprocess.Popen", return_value=mock_proc):
+            result = render_drawio_to_png(drawio, force=True)
+
+        assert result == png
+        assert png.read_bytes() == b"stale"
+        assert "keeping previous PNG" in capsys.readouterr().err
+
+    def test_failed_initial_render_removes_partial_png(self, tmp_path, capsys):
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        png = tmp_path / "test.drawio.png"
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1
+
+        def fake_popen(*args, **kwargs):
+            output = Path(args[0][args[0].index("--output") + 1])
+            output.write_bytes(b"partial")
+            return mock_proc
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
+             patch("subprocess.Popen", side_effect=fake_popen):
+            result = render_drawio_to_png(drawio)
+
+        assert result is None
+        assert not png.exists()
+        assert "no output" in capsys.readouterr().err
+
+    def test_force_render_exec_failure_keeps_existing_png(self, tmp_path, capsys):
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        png = tmp_path / "test.drawio.png"
+        png.write_bytes(b"stale")
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
+             patch("subprocess.Popen", side_effect=FileNotFoundError("vanished")):
+            result = render_drawio_to_png(drawio, force=True)
+
+        assert result == png
+        assert png.read_bytes() == b"stale"
+        err = capsys.readouterr().err
+        assert "render failed" in err
+        assert "keeping previous PNG" in err
+
+    def test_force_render_oserror_keeps_existing_png_and_removes_temp(self, tmp_path, capsys):
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        png = tmp_path / "test.drawio.png"
+        png.write_bytes(b"stale")
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
+             patch("subprocess.Popen", side_effect=PermissionError("not executable")):
+            result = render_drawio_to_png(drawio, force=True)
+
+        assert result == png
+        assert png.read_bytes() == b"stale"
+        assert not list(tmp_path.glob(".drawio-*.png"))
+        err = capsys.readouterr().err
+        assert "render failed" in err
+        assert "keeping previous PNG" in err
+
     def test_successful_render(self, tmp_path):
         drawio = tmp_path / "test.drawio"
         drawio.write_text("<xml/>")
@@ -91,7 +289,8 @@ class TestRenderDrawioToPng:
         mock_proc.poll.return_value = None
 
         def fake_popen(*args, **kwargs):
-            expected_png.write_bytes(b"PNG data")
+            output = Path(args[0][args[0].index("--output") + 1])
+            output.write_bytes(b"PNG data")
             return mock_proc
 
         with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
@@ -122,7 +321,8 @@ class TestRenderDrawioToPng:
         mock_proc.poll.return_value = None
 
         def fake_popen(*args, **kwargs):
-            custom.write_bytes(b"PNG data")
+            output = Path(args[0][args[0].index("--output") + 1])
+            output.write_bytes(b"PNG data")
             return mock_proc
 
         with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
@@ -149,6 +349,12 @@ class TestRenderDrawioToPng:
 
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None  # never exits on its own
+        render_path = None
+
+        def fake_popen(*args, **kwargs):
+            nonlocal render_path
+            render_path = Path(args[0][args[0].index("--output") + 1])
+            return mock_proc
 
         # File is created on the second sleep call, simulating drawio writing
         # the PNG mid-poll. By the next loop iteration the existence check fires.
@@ -156,10 +362,10 @@ class TestRenderDrawioToPng:
         def fake_sleep(_):
             sleep_count[0] += 1
             if sleep_count[0] == 2:
-                expected_png.write_bytes(b"PNG data")
+                render_path.write_bytes(b"PNG data")
 
         with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
-             patch("subprocess.Popen", return_value=mock_proc), \
+             patch("subprocess.Popen", side_effect=fake_popen), \
              patch("confluence_export.drawio.time.sleep", side_effect=fake_sleep):
             result = render_drawio_to_png(drawio)
             assert result == expected_png
@@ -193,20 +399,119 @@ class TestRenderDrawioToPng:
         expected_png = drawio.with_suffix(".drawio.png")
 
         mock_proc = MagicMock()
+        render_path = None
+
+        def fake_popen(*args, **kwargs):
+            nonlocal render_path
+            render_path = Path(args[0][args[0].index("--output") + 1])
+            return mock_proc
 
         # First poll inside loop returns None (still running, no file yet);
         # second poll returns 0 (exited) AND simulates the late file write.
         poll_seq = iter([None, 0, 0, 0])
         def fake_poll():
             ret = next(poll_seq)
-            if ret == 0 and not expected_png.exists():
-                expected_png.write_bytes(b"PNG data")
+            if ret == 0 and render_path is not None:
+                try:
+                    if render_path.stat().st_size == 0:
+                        render_path.write_bytes(b"PNG data")
+                except FileNotFoundError:
+                    pass
             return ret
 
         mock_proc.poll.side_effect = fake_poll
 
         with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
-             patch("subprocess.Popen", return_value=mock_proc), \
+             patch("subprocess.Popen", side_effect=fake_popen), \
              patch("confluence_export.drawio.time.sleep"):
             result = render_drawio_to_png(drawio)
             assert result == expected_png
+
+
+class TestUsablePng:
+    def test_stat_oserror_returns_false(self, tmp_path):
+        """An OS-level error while probing the path is treated as not-usable."""
+        png = tmp_path / "test.png"
+        png.write_bytes(b"data")
+        with patch.object(Path, "stat", side_effect=OSError("boom")):
+            assert _usable_png(png) is False
+
+    def test_missing_file_returns_false(self, tmp_path):
+        assert _usable_png(tmp_path / "nope.png") is False
+
+
+class TestRenderEdgeCases:
+    def test_output_path_is_directory_with_cli_present(self, tmp_path, capsys):
+        """When the CLI is available but the output path is a directory, abort."""
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        png = tmp_path / "test.drawio.png"
+        png.mkdir()
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
+             patch("subprocess.Popen") as mock_popen:
+            result = render_drawio_to_png(drawio)
+
+        assert result is None
+        assert "output path is a directory" in capsys.readouterr().err
+        mock_popen.assert_not_called()
+
+    def test_replace_oserror_returns_none_and_cleans_temp(self, tmp_path, capsys):
+        """If os.replace fails moving the temp PNG into place, render reports failure."""
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        png = tmp_path / "test.drawio.png"
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+
+        def fake_popen(*args, **kwargs):
+            output = Path(args[0][args[0].index("--output") + 1])
+            output.write_bytes(b"PNG data")
+            return mock_proc
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
+             patch("subprocess.Popen", side_effect=fake_popen), \
+             patch("confluence_export.drawio.os.replace", side_effect=OSError("cross-device")):
+            result = render_drawio_to_png(drawio)
+
+        assert result is None
+        assert not png.exists()
+        assert not list(tmp_path.glob(".drawio-*.png"))
+        assert "render failed" in capsys.readouterr().err
+
+    def test_file_usable_after_loop_with_zero_return_code(self, tmp_path):
+        """Process exits 0 with no file in-loop, then the PNG lands before the post-loop check."""
+        drawio = tmp_path / "test.drawio"
+        drawio.write_text("<xml/>")
+        expected_png = drawio.with_suffix(".drawio.png")
+
+        mock_proc = MagicMock()
+        render_path = None
+        poll_seq = iter([0, 0, 0, 0])
+
+        def fake_popen(*args, **kwargs):
+            nonlocal render_path
+            render_path = Path(args[0][args[0].index("--output") + 1])
+            return mock_proc
+
+        # First poll (loop) returns 0 with no usable file -> loop breaks.
+        # Second poll (the finally-block check at line 185) writes the file,
+        # so the post-loop _usable_png + rc==0 branch fires.
+        poll_count = [0]
+
+        def fake_poll():
+            poll_count[0] += 1
+            if poll_count[0] == 2 and render_path is not None:
+                render_path.write_bytes(b"PNG data")
+            return next(poll_seq)
+
+        mock_proc.poll.side_effect = fake_poll
+
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="/usr/bin/drawio"), \
+             patch("subprocess.Popen", side_effect=fake_popen), \
+             patch("confluence_export.drawio.time.sleep"):
+            result = render_drawio_to_png(drawio)
+
+        assert result == expected_png
+        assert expected_png.read_bytes() == b"PNG data"

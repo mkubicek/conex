@@ -1,8 +1,13 @@
 """Tests for draw.io diagram detection and processing."""
 
+import os
+from pathlib import Path
+from unittest.mock import patch
+
 from confluence_export.drawio import (
     detect_drawio_macros,
     find_drawio_attachments,
+    render_drawio_to_png,
 )
 from confluence_export.types import Attachment
 
@@ -43,3 +48,53 @@ def test_detect_drawio_macros():
 def test_detect_drawio_macros_none():
     html = "<p>No drawio here</p>"
     assert detect_drawio_macros(html) == []
+
+
+class _DoneProcess:
+    def poll(self):
+        return 0
+
+    def kill(self):
+        pass
+
+    def wait(self):
+        return 0
+
+
+def _popen_writes_png(args, **_kwargs):
+    output = Path(args[args.index("--output") + 1])
+    output.write_bytes(b"PNG")
+    return _DoneProcess()
+
+
+def test_forced_render_preserves_existing_png_mode(tmp_path):
+    source = tmp_path / "diagram.drawio"
+    source.write_text("<xml/>")
+    output = tmp_path / "diagram.drawio.png"
+    output.write_bytes(b"old")
+    output.chmod(0o640)
+
+    with patch("confluence_export.drawio.find_drawio_cli", return_value="drawio"), \
+         patch("confluence_export.drawio.subprocess.Popen", side_effect=_popen_writes_png):
+        result = render_drawio_to_png(source, output, force=True)
+
+    assert result == output
+    assert output.read_bytes() == b"PNG"
+    assert output.stat().st_mode & 0o777 == 0o640
+
+
+def test_forced_render_uses_umask_mode_for_new_png(tmp_path):
+    source = tmp_path / "diagram.drawio"
+    source.write_text("<xml/>")
+    output = tmp_path / "diagram.drawio.png"
+    old_umask = os.umask(0o027)
+    try:
+        with patch("confluence_export.drawio.find_drawio_cli", return_value="drawio"), \
+             patch("confluence_export.drawio.subprocess.Popen", side_effect=_popen_writes_png):
+            result = render_drawio_to_png(source, output, force=True)
+    finally:
+        os.umask(old_umask)
+
+    assert result == output
+    assert output.read_bytes() == b"PNG"
+    assert output.stat().st_mode & 0o777 == 0o640

@@ -21,6 +21,7 @@ from confluence_export.config import (
     config_path,
     gateway_url,
     is_gateway_url,
+    is_https_url,
     is_scoped_token,
     load_connection_profile,
     local_config_path,
@@ -241,7 +242,7 @@ def _auth_label(mode: AuthMode) -> str:
             return "Bearer token (PAT)"
         case AuthMode.COOKIE:
             return "cookie session"
-        case _:
+        case _:  # pragma: no cover
             raise AssertionError(f"Unhandled auth mode: {mode}")
 
 
@@ -253,7 +254,7 @@ def _api_mode_label(dialect: ApiDialect) -> str:
             return "OAuth gateway"
         case ApiDialect.COOKIE_V1:
             return "Confluence REST v1 compatibility"
-        case _:
+        case _:  # pragma: no cover
             raise AssertionError(f"Unhandled API dialect: {dialect}")
 
 
@@ -331,6 +332,9 @@ def _cmd_configure(local_dir: str | None = None) -> None:
 
     if not site_url:
         print("Error: site_url is required.", file=sys.stderr)
+        sys.exit(1)
+    if not is_https_url(site_url):
+        print("Error: site_url must be an HTTPS URL.", file=sys.stderr)
         sys.exit(1)
     if is_gateway_url(site_url):
         print(
@@ -618,7 +622,32 @@ def _cmd_export(
     # commit only adds in that mode (is_full=False). Shared predicate with the
     # exporter (is_full_export) so the relocation gate and the prune gate agree.
     is_full = is_full_export(path_filter, no_children)
-    if use_git and result.written_files:
+    # ──────────────────────────────────────────────────────────────────────────
+    # DATA-SAFETY DECISION 1 (deliberate — do NOT "fix" this into pruning):
+    # If the API / cache returns ZERO live pages, we KEEP the previously-committed
+    # export. We never prune a full export down to empty — not even when the cache
+    # AUTHORITATIVELY sees only archived pages. A zero-live response is ambiguous:
+    # a genuinely-emptied space, OR an auth / network / transient failure, OR a v2
+    # pagination that returned the archived set but no current pages. Deleting a
+    # whole committed export on a bad response is unrecoverable; keeping stale
+    # pages one extra run is not. We choose the safe direction.
+    #
+    # Enforced in TWO places, belt-and-suspenders:
+    #   1. The prune (commit_export -> _remove_stale_files) only runs when
+    #      written_files is non-empty (see git.py). Archived preservation alone
+    #      can never trigger a prune of live pages.
+    #   2. This gate fires commit_export only when we wrote pages, or when pages
+    #      were SKIPPED this run and their tracked deletions must be restored
+    #      (RF-B/M2). Archived-preservation sets are pure protection inputs; they
+    #      never independently open the gate.
+    # Scope routing (page-exact vs recursive) is welded into the typed
+    # ProtectionSet that result.protection() produces — there is no untyped slot
+    # to mis-route here. See provenance.py / protection.py for the models.
+    # ──────────────────────────────────────────────────────────────────────────
+    if use_git and (
+        result.written_files
+        or (is_full and result.skipped_paths)
+    ):
         from confluence_export.git import commit_export
 
         commit_export(
@@ -626,7 +655,8 @@ def _cmd_export(
             result.written_files,
             space_key,
             is_full=is_full,
-            protected_dirs=result.skipped_paths,
+            protection=result.protection(out),
+            preserve_media=no_media,
         )
 
     print(f"\nExported {result.count} page(s) to {out.resolve()}")

@@ -113,6 +113,29 @@ def test_scan_grouped_excludes_workspace_and_media(tmp_path: Path):
     assert set(grouped) == {"real"}
 
 
+def test_scan_grouped_excludes_conex_and_git(tmp_path: Path):
+    # T1: a stray .md inside local secrets (.conex) or git internals (.git) is
+    # never a page and must be excluded from the scan, so it is never treated as
+    # a movable/prunable page.
+    _write_page(tmp_path, ".conex/leak.md", "conex", 1)
+    _write_page(tmp_path, ".git/hooks/note.md", "git", 1)
+    _write_page(tmp_path, "P/P.md", "real", 1)
+
+    grouped = scan_export_dir_grouped(tmp_path, "TST")
+    assert set(grouped) == {"real"}
+
+
+def test_scan_grouped_excludes_dotfile_markdown_temps(tmp_path: Path):
+    # A crash-stranded atomic-write temp must not compete with the canonical page
+    # markdown or reconcile can choose the dotfile and delete the real page copy.
+    _write_page(tmp_path, "P/P.md", "real", 1)
+    _write_page(tmp_path, "P/.P.md.stranded.md", "real", 1)
+
+    grouped = scan_export_dir_grouped(tmp_path, "TST")
+
+    assert [entry.file_path.name for entry in grouped["real"]] == ["P.md"]
+
+
 def test_scan_grouped_skips_other_space_with_warning(tmp_path: Path, capsys):
     _write_page(tmp_path, "A/A.md", "1", 1, space_key="TST")
     _write_page(tmp_path, "B/B.md", "9", 1, space_key="OTHER")

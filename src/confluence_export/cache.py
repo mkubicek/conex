@@ -61,7 +61,14 @@ class CacheStore:
             # exists precisely to overwrite it. Treat it as "no populated cache".
             try:
                 prior = self.load(space.key)
-            except (json.JSONDecodeError, OSError):
+            except (
+                json.JSONDecodeError,
+                OSError,
+                TypeError,
+                AttributeError,
+                KeyError,
+                ValueError,
+            ):
                 prior = None
             if prior is not None and any(p.status != "folder" for p in prior.pages):
                 print(

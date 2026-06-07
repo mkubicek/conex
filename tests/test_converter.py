@@ -1,6 +1,7 @@
 """Tests for HTML to markdown conversion."""
 
 from confluence_export.converter import convert_page, sanitize_filename, _preprocess_html
+from confluence_export.paths import safe_attachment_name
 from confluence_export.types import Attachment, Page, Version
 
 
@@ -56,6 +57,20 @@ def test_preprocess_ac_image():
     assert "ac:image" not in result
 
 
+def test_preprocess_ac_image_uses_sanitized_attachment_name():
+    html = '<ac:image><ri:attachment ri:filename="a/b.png"/></ac:image>'
+    result = _preprocess_html(html, [Attachment(id="a1", title="a/b.png")])
+    assert ".media/a-b.png" in result
+    assert ".media/a/b.png" not in result
+
+
+def test_preprocess_ac_image_uses_planned_name_for_casefold_reference():
+    html = '<ac:image><ri:attachment ri:filename="report.pdf"/></ac:image>'
+    result = _preprocess_html(html, [Attachment(id="a1", title="Report.pdf")])
+    assert ".media/Report.pdf" in result
+    assert ".media/report.pdf" not in result
+
+
 def test_preprocess_ac_link():
     html = (
         '<ac:link><ri:attachment ri:filename="doc.pdf"/>'
@@ -65,6 +80,41 @@ def test_preprocess_ac_link():
     result = _preprocess_html(html, [])
     assert ".media/doc.pdf" in result
     assert "My Document" in result
+
+
+def test_preprocess_ac_link_uses_sanitized_attachment_name():
+    raw = "../../../x.png"
+    html = (
+        f'<ac:link><ri:attachment ri:filename="{raw}"/>'
+        "<ac:plain-text-link-body>Unsafe</ac:plain-text-link-body>"
+        "</ac:link>"
+    )
+    result = _preprocess_html(html, [Attachment(id="a1", title=raw)])
+    assert f".media/{safe_attachment_name(raw)}" in result
+    assert "../" not in result
+
+
+def test_attachment_link_markdown_escapes_url_and_label_injection():
+    title = "file name](x).pdf"
+    page = Page(
+        id="p1",
+        title="P",
+        body_storage=(
+            f'<ac:link><ri:attachment ri:filename="{title}"/>'
+            "<ac:plain-text-link-body>x](javascript:alert(1))</ac:plain-text-link-body>"
+            "</ac:link>"
+        ),
+    )
+    md = convert_page(
+        page,
+        base_url="https://example.atlassian.net/wiki",
+        space_key="TEST",
+        path="P",
+        attachments=[Attachment(id="a1", title=title)],
+    )
+
+    assert ".media/file%20name%5D%28x%29.pdf" in md
+    assert "](javascript:" not in md
 
 
 def test_preprocess_panel():

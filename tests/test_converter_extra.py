@@ -279,6 +279,57 @@ def test_two_profile_pictures_in_one_ac_link_keep_both_mentions():
     assert "@N-u2" in result
 
 
+def test_macro_inside_ac_link_is_preserved():
+    # F1: an ac:link wrapping a structured-macro must not be decomposed before the
+    # macro-dispatch pass runs — the macro is preserved (link unwrapped) and
+    # converted in place.
+    html = (
+        '<p><ac:link><ac:structured-macro ac:name="status">'
+        '<ac:parameter ac:name="title">DONE</ac:parameter>'
+        "</ac:structured-macro></ac:link></p>"
+    )
+    result = _preprocess_html(html, [])
+    assert "DONE" in result
+
+
+def test_two_bare_ri_users_in_one_link_both_resolved():
+    # F2: two bare ri:user sharing one ac:link must each resolve. Replacing the
+    # whole link on the first dropped the second.
+    html = (
+        '<p><ac:link><ri:user ri:account-id="a1"/>'
+        '<ri:user ri:account-id="a2"/></ac:link></p>'
+    )
+    result = _preprocess_html(html, [], user_resolver=lambda aid: {"displayName": f"N-{aid}"})
+    assert "@N-a1" in result
+    assert "@N-a2" in result
+
+
+def test_profile_macro_resolves_user_name():
+    # F3: the profile macro must resolve the user's display name, not be starved
+    # of its ri:user by the mention pre-pass (which left it showing "Unknown user").
+    html = (
+        '<ac:structured-macro ac:name="profile">'
+        '<ac:parameter ac:name="User"><ri:user ri:account-id="a1"/></ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [], user_resolver=lambda aid: {"displayName": "Alice"})
+    assert "Alice" in result
+    assert "Unknown user" not in result
+
+
+def test_nested_profile_picture_keeps_inner_mention():
+    # F4: a profile-picture nested inside a profile-picture must keep the inner
+    # resolved mention — the outer must not decompose the already-resolved span.
+    html = (
+        '<ac:structured-macro ac:name="profile-picture">'
+        '<ac:structured-macro ac:name="profile-picture">'
+        '<ri:user ri:account-id="a1"/>'
+        "</ac:structured-macro></ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [], user_resolver=lambda aid: {"displayName": "Alice"})
+    assert "@Alice" in result
+
+
 def test_drawio_nested_in_panel_still_renders():
     # A drawio diagram inside an info/panel body must still emit its real <img>.
     # _convert_panel re-parsed the body into a fresh soup, detaching the inner
@@ -294,6 +345,130 @@ def test_drawio_nested_in_panel_still_renders():
     result = _preprocess_html(html, atts, rendered={"arch.drawio": Path(".media/arch.drawio.png")})
     assert 'src=".media/arch.drawio.png"' in result
     assert "[drawio:" not in result
+
+
+def test_drawio_rendered_lookup_is_case_and_space_insensitive():
+    # F7: the exporter keys rendered[att.title]; a diagramName differing only in
+    # case/whitespace from the attachment title must still find the PNG, not fall
+    # through to a "not rendered" note.
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">my  diagram</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    atts = [Attachment(id="a", title="My Diagram.drawio", media_type="application/x-drawio")]
+    result = _preprocess_html(
+        html, atts, rendered={"My Diagram.drawio": Path(".media/My Diagram.drawio.png")}
+    )
+    assert "not rendered" not in result
+    assert "My%20Diagram.drawio.png" in result
+
+
+def test_drawio_no_media_omits_dead_source_link():
+    # F5: on a --no-media run the .drawio source is not on disk, so a source link
+    # to .media/<name>.drawio would be dead. It must be omitted.
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">arch</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    atts = [Attachment(id="a", title="arch.drawio", media_type="application/x-drawio")]
+    result = _preprocess_html(html, atts, rendered={}, media_downloaded=False)
+    assert "Draw.io source" not in result
+    assert "not rendered" in result
+
+
+def test_drawio_source_link_uses_actual_available_media():
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">arch</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    atts = [Attachment(id="a", title="arch.drawio", media_type="application/x-drawio")]
+
+    no_media_with_source = _preprocess_html(
+        html, atts, rendered={}, media_downloaded=False,
+        available_media={"arch.drawio"},
+    )
+    failed_download = _preprocess_html(
+        html, atts, rendered={}, media_downloaded=True,
+        available_media=set(),
+    )
+
+    assert "Draw.io source" in no_media_with_source
+    assert "Draw.io source" not in failed_download
+
+
+def test_drawio_matches_uppercase_drawio_extension():
+    # RF-D: a diagramName with an upper/mixed-case .drawio extension must still
+    # match an attachment titled with a lowercase .drawio (the suffix strip must
+    # be case-insensitive, not removesuffix-before-casefold).
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">Arch.DRAWIO</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    atts = [Attachment(id="a", title="Arch.drawio", media_type="application/x-drawio")]
+    result = _preprocess_html(
+        html, atts, rendered={"Arch.drawio": Path(".media/Arch.drawio.png")}
+    )
+    assert "not rendered" not in result
+    assert "Arch.drawio.png" in result
+
+
+def test_drawio_source_link_uses_real_attachment_title():
+    # F6: the source link must use the actual on-disk attachment title, not a
+    # reconstructed bare+'.drawio'. Here the drawio attachment (by media-type)
+    # has no .drawio extension, so reconstruction would point at a missing file.
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">arch</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    atts = [Attachment(id="a", title="arch", media_type="application/x-drawio")]
+    result = _preprocess_html(html, atts, rendered={})
+    assert '.media/arch"' in result          # links to the real title "arch"
+    assert ".media/arch.drawio" not in result  # not the reconstructed name
+
+
+def test_drawio_match_prefers_diagram_attachment_over_same_name_file():
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">arch</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    atts = [
+        Attachment(id="plain", title="arch", media_type="text/plain"),
+        Attachment(id="drawio", title="arch.drawio", media_type="application/x-drawio"),
+    ]
+
+    result = _preprocess_html(
+        html,
+        atts,
+        rendered={"arch.drawio": Path(".media/arch.drawio.png")},
+    )
+
+    assert 'src=".media/arch.drawio.png"' in result
+    assert 'href=".media/arch.drawio"' in result
+    assert 'href=".media/arch"' not in result
+
+
+def test_drawio_match_accepts_mixed_case_drawio_extension():
+    html = (
+        '<ac:structured-macro ac:name="drawio">'
+        '<ac:parameter ac:name="diagramName">Arch</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    atts = [Attachment(id="a", title="Arch.DRAWIO", media_type="application/octet-stream")]
+
+    result = _preprocess_html(
+        html,
+        atts,
+        rendered={"Arch.DRAWIO": Path(".media/Arch.DRAWIO.png")},
+    )
+
+    assert "not rendered" not in result
+    assert "Arch.DRAWIO.png" in result
 
 
 def test_view_file_nested_in_expand_still_renders():
@@ -449,3 +624,121 @@ def test_drawio_name_with_injection_chars_is_neutralized():
     assert "javascript%3A" in md_out                   # source href percent-encoded (neutralized)
     body = md_out.split("# P", 1)[1]                   # exclude the YAML frontmatter
     assert "](javascript:" not in body                 # no injected clickable link in the body
+
+
+# -- Missing-media fallbacks: available_media gates every attachment reference --
+# When available_media is a set that does NOT contain the attachment's local name
+# (e.g. a --no-media run, or a download that failed for that one file), the
+# reference must degrade to a visible "Missing attachment" note instead of a dead
+# link/image. Passing an empty set forces the missing branch for every reference.
+
+def test_ac_image_missing_media_emits_missing_attachment_note():
+    html = '<ac:image><ri:attachment ri:filename="shot.png"/></ac:image>'
+    result = _preprocess_html(html, [], available_media=set())
+    assert "Missing attachment: shot.png" in result
+    assert ".media/shot.png" not in result  # no dead image src
+    assert "ac:image" not in result
+
+
+def test_ac_link_attachment_missing_media_emits_missing_attachment_note():
+    # The note must use the link's label text, not the raw filename.
+    html = (
+        '<ac:link><ri:attachment ri:filename="doc.pdf"/>'
+        "<ac:plain-text-link-body>My Doc</ac:plain-text-link-body></ac:link>"
+    )
+    result = _preprocess_html(html, [], available_media=set())
+    assert "Missing attachment: My Doc" in result
+    assert ".media/doc.pdf" not in result  # no dead href
+
+
+def test_view_file_missing_media_emits_missing_attachment_note():
+    html = (
+        '<ac:structured-macro ac:name="view-file">'
+        '<ri:attachment ri:filename="report.pdf"/></ac:structured-macro>'
+    )
+    result = _preprocess_html(html, [], available_media=set())
+    assert "Missing attachment: report.pdf" in result
+    assert ".media/report.pdf" not in result
+
+
+# -- Stray ac:/ri: tag cleanup keeps inner text -------------------------------
+
+def test_stray_ri_tag_is_unwrapped_keeping_text():
+    # Any ac:/ri: tag not consumed by an earlier pass is unwrapped at the end so
+    # its text survives rather than leaking the namespaced tag into the markdown.
+    result = _preprocess_html("<ri:something>kept text</ri:something>", [])
+    assert "kept text" in result
+    assert "ri:something" not in result
+
+
+# -- ac:link straggler / empty-link handling ----------------------------------
+
+def test_ac_link_wrapping_profile_macro_unwraps_link_keeps_user():
+    # A ri:user the user pre-pass deliberately leaves alone (it belongs to a
+    # profile macro) survives into the ac:link pass as a straggler. The link is
+    # unwrapped (not dropped), so the profile macro still resolves to its mention.
+    html = (
+        "<ac:link><ac:structured-macro ac:name=\"profile\">"
+        '<ac:parameter ac:name="U"><ri:user ri:account-id="z"/></ac:parameter>'
+        "</ac:structured-macro></ac:link>"
+    )
+    result = _preprocess_html(html, [], user_resolver=lambda aid: {"displayName": "Zed"})
+    assert "Zed" in result
+    assert "Unknown user" not in result
+
+
+def test_empty_ac_link_is_dropped():
+    # A genuinely empty ac:link (no ri: child, no content) is removed entirely,
+    # leaving the surrounding text intact.
+    result = _preprocess_html("<p>a<ac:link></ac:link>b</p>", [])
+    assert "ab" in result
+    assert "ac:link" not in result
+
+
+# -- profile macro with email renders "Name (email)" --------------------------
+
+def test_profile_macro_with_email_renders_name_and_email():
+    html = (
+        '<ac:structured-macro ac:name="profile">'
+        '<ac:parameter ac:name="U"><ri:user ri:account-id="x"/></ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    result = _preprocess_html(
+        html, [], user_resolver=lambda aid: {"displayName": "Bob", "email": "b@x.io"}
+    )
+    assert "Bob (b@x.io)" in result
+
+
+# -- nested empty profile-pictures degrade cleanly (detached-macro guard) ------
+
+def test_nested_empty_profile_pictures_drop_without_crashing():
+    # Both macros lack a ri:user, so the user pre-pass leaves them for the
+    # structured-macro pass. The OUTER empty profile-picture is decomposed first,
+    # detaching the INNER (still in the find_all snapshot). The detached-node guard
+    # skips the inner instead of calling methods on a decomposed node (which would
+    # raise and abort the export). Result: both dropped cleanly, no markup leaks.
+    html = (
+        '<ac:structured-macro ac:name="profile-picture">'
+        '<ac:structured-macro ac:name="profile-picture"></ac:structured-macro>'
+        "</ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [])
+    assert "structured-macro" not in result
+    assert "Confluence dynamic content" not in result
+    assert result.strip() == ""
+
+
+# -- attachment-id disambiguation through ri:content-id -----------------------
+
+def test_ac_image_resolves_id_specific_local_name_via_content_id():
+    # Two attachments share the filename "shot.png"; the name plan disambiguates
+    # them by attachment id. An ac:image referencing one via ri:content-id must
+    # resolve to that id's distinct local name, not the bare filename.
+    atts = [
+        Attachment(id="id1", title="shot.png", media_type="image/png"),
+        Attachment(id="id2", title="shot.png", media_type="image/png"),
+    ]
+    html = '<ac:image><ri:attachment ri:filename="shot.png" ri:content-id="id2"/></ac:image>'
+    result = _preprocess_html(html, atts)
+    assert ".media/shot-id2.png" in result
+    assert 'src=".media/shot.png"' not in result

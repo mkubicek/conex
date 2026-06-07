@@ -19,6 +19,7 @@ from confluence_export.config import (
     ConnectionProfileError,
     resolve_cloud_id,
 )
+from confluence_export.exporter import ExportResult
 from confluence_export.types import CachedSpace, Page, Space, Version
 
 def _space(key="TEST", name="Test Space"):
@@ -279,6 +280,122 @@ class TestExportCommand:
 
         assert not (Path(out) / ".git").exists()
 
+    def test_git_runs_for_full_export_with_only_protected_paths(self, tmp_path):
+        """A moved page can fail before writing any file, but still needs the
+        post-export git path to restore tracked deletions under skipped paths."""
+        client = _mock_client()
+        export_result = ExportResult(
+            count=0,
+            written_files=[],
+            skipped_paths=[tmp_path / "out" / "Old" / "Page"],
+            preserved_page_paths=[tmp_path / "out" / "_archived" / "Known"],
+            preserved_paths=[tmp_path / "out" / "_archived"],
+            prune_media_dirs=[tmp_path / "out" / "Page" / ".media"],
+        )
+        exporter = MagicMock()
+        exporter.export_space.return_value = export_result
+        out = str(tmp_path / "out")
+
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.Exporter", return_value=exporter), \
+             patch("confluence_export.git.git_available", return_value=True), \
+             patch("confluence_export.git.ensure_repo", return_value=True), \
+             patch("confluence_export.git.commit_local_changes"), \
+             patch("confluence_export.git.commit_export") as commit_export:
+            main()
+
+        commit_export.assert_called_once()
+        # Scope is welded into the single typed ProtectionSet the exporter produces;
+        # there is no untyped protected_dirs / protected_subtree_dirs slot to
+        # mis-route. The whole bundle matches what result.protection() builds.
+        protection = commit_export.call_args.kwargs["protection"]
+        assert protection == export_result.protection(Path(out).resolve())
+        # And scope routed correctly: archived pages page-EXACT, skipped pages into
+        # the RECURSIVE subtree group alongside the blind _archived subtree.
+        assert [p.path for p in protection.page_exact] == export_result.preserved_page_paths
+        assert [s.path for s in protection.subtrees] == (
+            export_result.preserved_paths + export_result.skipped_paths
+        )
+
+    def test_git_skips_full_export_with_only_preserved_subtrees(self, tmp_path):
+        """An empty current-only export must not prune all live files merely
+        because an existing archived subtree is being preserved."""
+        client = _mock_client()
+        export_result = ExportResult(
+            count=0,
+            written_files=[],
+            preserved_paths=[tmp_path / "out" / "_archived"],
+        )
+        exporter = MagicMock()
+        exporter.export_space.return_value = export_result
+        out = str(tmp_path / "out")
+
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.Exporter", return_value=exporter), \
+             patch("confluence_export.git.git_available", return_value=True), \
+             patch("confluence_export.git.ensure_repo", return_value=True), \
+             patch("confluence_export.git.commit_local_changes"), \
+             patch("confluence_export.git.commit_export") as commit_export:
+            main()
+
+        commit_export.assert_not_called()
+
+    def test_git_skips_authoritative_archived_only_to_preserve_live_pages(self, tmp_path):
+        """DATA-SAFETY DECISION 1 (fix ①): even when the cache AUTHORITATIVELY sees
+        only archived pages (a v2 run that returned the archived set but ZERO
+        current pages), a zero-live-write run must NOT prune. The empty live set is
+        ambiguous (genuinely emptied OR a transient/pagination artifact), and
+        pruning would git-rm the committed live pages. Archived-preservation sets
+        are pure protection inputs — they never independently open the prune gate."""
+        client = _mock_client()
+        export_result = ExportResult(
+            count=0,
+            written_files=[],
+            preserved_page_paths=[tmp_path / "out" / "_archived" / "Known"],
+        )
+        exporter = MagicMock()
+        exporter.export_space.return_value = export_result
+        out = str(tmp_path / "out")
+
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.Exporter", return_value=exporter), \
+             patch("confluence_export.git.git_available", return_value=True), \
+             patch("confluence_export.git.ensure_repo", return_value=True), \
+             patch("confluence_export.git.commit_local_changes"), \
+             patch("confluence_export.git.commit_export") as commit_export:
+            main()
+
+        commit_export.assert_not_called()
+
+    def test_git_skips_emptied_full_export_to_preserve_committed_pages(self, tmp_path):
+        """DATA-SAFETY DECISION: a full export that returns ZERO pages with nothing
+        to protect must NOT prune the previously-committed export. A zero-page
+        result (genuinely emptied space OR a transient/auth failure) keeps the
+        prior export rather than risk deleting it on a bad response."""
+        client = _mock_client()
+        export_result = ExportResult(count=0, written_files=[])  # nothing at all
+        exporter = MagicMock()
+        exporter.export_space.return_value = export_result
+        out = str(tmp_path / "out")
+
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.Exporter", return_value=exporter), \
+             patch("confluence_export.git.git_available", return_value=True), \
+             patch("confluence_export.git.ensure_repo", return_value=True), \
+             patch("confluence_export.git.commit_local_changes"), \
+             patch("confluence_export.git.commit_export") as commit_export:
+            main()
+
+        commit_export.assert_not_called()
+
     def test_no_author_lookup_flag_propagates_to_exporter(self, tmp_path):
         client = _mock_client()
         cache = MagicMock()
@@ -367,6 +484,18 @@ class TestConfigureCommand:
 
         assert not config_file.exists()
         assert "OAuth gateway" in capsys.readouterr().err
+
+    def test_http_site_url_exits(self, capsys, tmp_path):
+        inputs = iter(["http://x.atlassian.net", "a@b.com", "tok"])
+        config_file = tmp_path / "config.json"
+        with patch("sys.argv", ["confluence-export", "configure"]), \
+             patch("builtins.input", side_effect=inputs), \
+             patch("confluence_export.cli.config_path", return_value=config_file):
+            with pytest.raises(SystemExit):
+                main()
+
+        assert not config_file.exists()
+        assert "HTTPS" in capsys.readouterr().err
 
     def test_bearer_mode_when_no_email(self, capsys, tmp_path):
         config_file = tmp_path / "config.json"
@@ -537,3 +666,324 @@ class TestConfigError:
         err = capsys.readouterr().err
         assert "site_url" in err
         assert "configure" in err  # suggests running configure
+
+
+# -- diff command ------------------------------------------------------------
+
+
+class TestDiffCommand:
+    def _diff_cache(self):
+        cache = MagicMock()
+        cs = _cached_space()
+        cache.load.return_value = cs
+        cache.refresh.return_value = cs
+        return cache
+
+    def test_diff_reports_new_pages_against_empty_export(self, tmp_path, capsys):
+        """End-to-end: scan an (empty) export dir, refresh from cache, and print a
+        real diff. Both cached pages must show up as New since the export is empty."""
+        client = _mock_client()
+        cache = self._diff_cache()
+        export_dir = tmp_path / "export"
+        export_dir.mkdir()
+        with patch("sys.argv", ["confluence-export", "diff", "TEST", str(export_dir)]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
+            main()
+
+        captured = capsys.readouterr()
+        # Refresh was forced (diffing against stale cache is useless).
+        cache.refresh.assert_called_once()
+        assert "Scanned 0 page(s)" in captured.err
+        assert "New (2)" in captured.out
+        assert "/Root" in captured.out
+        assert "/Root/Child" in captured.out
+
+    def test_diff_nonexistent_dir_exits(self, tmp_path, capsys):
+        client = _mock_client()
+        missing = tmp_path / "nope"
+        with patch("sys.argv", ["confluence-export", "diff", "TEST", str(missing)]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=MagicMock()):
+            with pytest.raises(SystemExit) as exc:
+                main()
+        assert exc.value.code == 1
+        assert "is not a directory" in capsys.readouterr().err
+
+    def test_diff_unknown_path_filter_exits(self, tmp_path, capsys):
+        client = _mock_client()
+        cache = self._diff_cache()
+        export_dir = tmp_path / "export"
+        export_dir.mkdir()
+        with patch("sys.argv", ["confluence-export", "diff", "TEST", str(export_dir), "--path", "/Does/Not/Exist"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
+            with pytest.raises(SystemExit) as exc:
+                main()
+        assert exc.value.code == 1
+        assert "not found in space" in capsys.readouterr().err
+
+    def test_diff_path_filter_scopes_to_subtree(self, tmp_path, capsys):
+        """A valid --path filter restricts the diff to that subtree only."""
+        client = _mock_client()
+        cache = self._diff_cache()
+        export_dir = tmp_path / "export"
+        export_dir.mkdir()
+        with patch("sys.argv", ["confluence-export", "diff", "TEST", str(export_dir), "--path", "/Root/Child"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
+            main()
+
+        out = capsys.readouterr().out
+        # Only the Child subtree is in scope; Root alone is not a separate "New".
+        assert "New (1)" in out
+        assert "/Root/Child" in out
+
+    def test_diff_resolves_space_when_cache_empty(self, tmp_path, capsys):
+        """When the cache has no prior snapshot, the space is resolved via the
+        client before refreshing."""
+        client = _mock_client()
+        cache = MagicMock()
+        cache.load.return_value = None  # cache miss → resolve via client
+        cache.refresh.return_value = _cached_space()
+        export_dir = tmp_path / "export"
+        export_dir.mkdir()
+        with patch("sys.argv", ["confluence-export", "diff", "TEST", str(export_dir)]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
+            main()
+
+        # Space was resolved through the client since the cache was empty.
+        client.get_space_by_key.assert_called_with("TEST")
+        assert "New (2)" in capsys.readouterr().out
+
+
+# -- preflight helpers -------------------------------------------------------
+
+
+class TestPreflightHelpers:
+    def test_check_output_writable_rejects_file_at_output_path(self, tmp_path):
+        from confluence_export.cli import _check_output_writable
+
+        existing_file = tmp_path / "afile"
+        existing_file.write_text("x")
+        with pytest.raises(RuntimeError, match="exists and is not a directory"):
+            _check_output_writable(str(existing_file))
+
+    def test_check_output_writable_rejects_unwritable_parent(self, tmp_path):
+        from confluence_export.cli import _check_output_writable
+
+        target = tmp_path / "sub" / "out"
+        with patch("confluence_export.cli.os.access", return_value=False):
+            with pytest.raises(RuntimeError, match="is not writable"):
+                _check_output_writable(str(target))
+
+    def test_preflight_error_message_for_authentication_error(self):
+        from confluence_export.cli import _preflight_error_message
+        from confluence_export.client import AuthenticationError
+
+        exc = AuthenticationError(403, "https://x.atlassian.net/api")
+        assert _preflight_error_message(exc) == "HTTP 403 from https://x.atlassian.net/api"
+
+    def test_preflight_error_message_for_http_error(self):
+        from confluence_export.cli import _preflight_error_message
+
+        resp = MagicMock()
+        resp.status_code = 500
+        exc = requests.exceptions.HTTPError("boom")
+        exc.response = resp
+        assert _preflight_error_message(exc) == "HTTP 500"
+
+    def test_ensure_gateway_route_raises_when_no_cloud_id(self):
+        from confluence_export.cli import _ensure_gateway_route
+
+        profile = _profile(cloud_id=None)
+        with pytest.raises(RuntimeError, match="cloud ID or gateway URL is missing"):
+            _ensure_gateway_route(profile)
+
+    def test_require_space_raises_when_not_found(self):
+        from confluence_export.cli import _require_space
+
+        client = _mock_client(spaces=[_space()])
+        with pytest.raises(RuntimeError, match="space 'NOPE' not found"):
+            _require_space(client, "NOPE")
+
+
+class TestPreflightBranches:
+    """Drive the full preflight via the export command to cover its branches."""
+
+    def test_preflight_reports_cloud_id_and_gateway_route(self, tmp_path, capsys):
+        """A scoped-token / gateway profile prints the Cloud ID line and runs the
+        extra 'gateway route resolved' step (and the gateway api-mode label)."""
+        from confluence_export.config import gateway_url
+
+        client = _mock_client()
+        cache = MagicMock()
+        cache.refresh.return_value = _cached_space()
+        profile = _profile(
+            auth_mode=AuthMode.SCOPED_API_TOKEN,
+            api_dialect=ApiDialect.GATEWAY_V2,
+            cloud_id="cloud-123",
+            api_base_url=gateway_url("cloud-123"),
+            email="a@b.com",
+        )
+        out = str(tmp_path / "out")
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media", "--no-git"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=profile), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
+            main()
+
+        err = capsys.readouterr().err
+        assert "Cloud ID: cloud-123" in err
+        assert "scoped API token" in err  # _auth_label SCOPED_API_TOKEN
+        assert "OAuth gateway" in err  # _api_mode_label GATEWAY_V2
+        assert "gateway route resolved" in err
+
+    def test_preflight_skips_page_and_attachment_when_space_unresolved(self, tmp_path, capsys):
+        """If the space cannot be resolved, the page-listing step is marked failed
+        and the attachment step is skipped — and preflight aborts."""
+        client = _mock_client(spaces=[_space(key="OTHER")])
+        out = str(tmp_path / "out")
+        with patch("sys.argv", ["confluence-export", "export", "MISSING", "-o", out, "--no-git"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore") as cache_cls:
+            with pytest.raises(SystemExit):
+                main()
+
+        err = capsys.readouterr().err
+        assert "✗ page listing available" in err
+        assert "Preflight failed" in err
+        cache_cls.assert_not_called()
+
+    def test_preflight_skips_attachment_listing_when_no_pages(self, tmp_path, capsys):
+        """Space resolves but probe returns no sample page → attachment listing is
+        skipped (not failed)."""
+        client = _mock_client()
+        client.probe_page_listing.return_value = None  # no sample page id
+        cache = MagicMock()
+        cache.refresh.return_value = _cached_space()
+        out = str(tmp_path / "out")
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-git"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
+            main()
+
+        err = capsys.readouterr().err
+        assert "attachment listing skipped (no pages)" in err
+
+    def test_preflight_warns_when_git_unavailable(self, tmp_path, capsys):
+        client = _mock_client()
+        cache = MagicMock()
+        cache.refresh.return_value = _cached_space()
+        out = str(tmp_path / "out")
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-media"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache), \
+             patch("confluence_export.git.git_available", return_value=False):
+            main()
+
+        err = capsys.readouterr().err
+        # Preflight prints the warning, and the export body re-checks git_available.
+        assert "git unavailable; export will continue without git" in err
+        assert "Warning: git not found" in err
+
+
+# -- _find_space fallback ----------------------------------------------------
+
+
+class TestFindSpaceFallback:
+    def test_falls_back_to_full_list_on_case_mismatch(self):
+        """When the server-side key lookup misses (case difference), the full-list
+        fallback resolves the space."""
+        from confluence_export.cli import _find_space
+
+        client = MagicMock()
+        client.get_space_by_key.return_value = None  # server-side filter misses
+        client.get_spaces.return_value = [_space(key="TEST")]
+        result = _find_space(client, "test", announce=False)
+        assert result is not None
+        assert result.key == "TEST"
+
+
+# -- configure: existing-config defaults -------------------------------------
+
+
+class TestConfigureExistingDefaults:
+    def test_looks_like_cookie_header_rejects_empty_name_or_value(self):
+        from confluence_export.cli import _looks_like_cookie_header
+
+        assert _looks_like_cookie_header("=value") is False
+        assert _looks_like_cookie_header("name=") is False
+
+    def test_reuses_existing_v2_config_when_inputs_blank(self, tmp_path):
+        """Pressing enter at each prompt keeps the values from an existing v2
+        config file (covers the v2 default-extraction path)."""
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://prior.atlassian.net",
+            "auth": {"email": "prior@b.com", "token": "prior-token"},
+        }))
+        inputs = iter(["", "", ""])  # all blank → reuse existing
+        with patch("sys.argv", ["confluence-export", "configure"]), \
+             patch("builtins.input", side_effect=inputs), \
+             patch("confluence_export.cli.config_path", return_value=config_file):
+            main()
+
+        data = json.loads(config_file.read_text())
+        assert data["site_url"] == "https://prior.atlassian.net"
+        assert data["auth"]["email"] == "prior@b.com"
+        assert data["auth"]["token"] == "prior-token"
+
+    def test_legacy_gateway_base_url_is_dropped(self, tmp_path, capsys):
+        """A legacy (v1) config whose base_url is an OAuth gateway URL must NOT be
+        offered as the site-url default; the user is prompted for the real one."""
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({
+            "base_url": "https://api.atlassian.com/ex/confluence/cloud-123",
+            "email": "old@b.com",
+            "api_token": "old-token",
+        }))
+        inputs = iter(["https://real.atlassian.net", "", ""])
+        with patch("sys.argv", ["confluence-export", "configure"]), \
+             patch("builtins.input", side_effect=inputs), \
+             patch("confluence_export.cli.config_path", return_value=config_file):
+            main()
+
+        assert "OAuth gateway URL" in capsys.readouterr().err
+        data = json.loads(config_file.read_text())
+        assert data["site_url"] == "https://real.atlassian.net"
+        # email/token still reused from the legacy config defaults.
+        assert data["auth"]["email"] == "old@b.com"
+
+    def test_scoped_token_with_email_resolves_cloud_id(self, tmp_path, capsys):
+        """A scoped token + email triggers cloud-id resolution and gateway routing
+        during configure."""
+        config_file = tmp_path / "config.json"
+        inputs = iter([
+            "https://acme.atlassian.net",
+            "a@b.com",
+            "ATATT3xDummy=ADA456abc",  # is_scoped_token → True
+        ])
+        with patch("sys.argv", ["confluence-export", "configure"]), \
+             patch("builtins.input", side_effect=inputs), \
+             patch("confluence_export.cli.config_path", return_value=config_file), \
+             patch("confluence_export.cli.resolve_cloud_id", return_value="cloud-999") as resolve:
+            main()
+
+        resolve.assert_called_once_with("https://acme.atlassian.net")
+        out = capsys.readouterr().out
+        assert "scoped API token" in out  # _auth_label SCOPED_API_TOKEN
+        data = json.loads(config_file.read_text())
+        assert data["auth"]["type"] == "scoped_api_token"
+        assert data["cloud_id"] == "cloud-999"
+        assert data["api_base_url"] == "https://api.atlassian.com/ex/confluence/cloud-999"

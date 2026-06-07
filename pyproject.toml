@@ -25,3 +25,8 @@ packages = ["src/confluence_export"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+# __main__.py is the `python -m confluence_export` entrypoint (a bare main() call);
+# it is never imported under test, so exclude it from coverage rather than fake it.
+omit = ["*/__main__.py"]
