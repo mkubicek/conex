@@ -211,6 +211,31 @@ def _preprocess_html(
     for tag_name in ("ac:adf-fallback", "ac:adf-attribute", "ac:adf-mark"):
         for tag in list(soup.find_all(tag_name)):
             tag.decompose()
+    # Decision lists (ADF) must be rendered BEFORE the generic adf-node unwrap
+    # below, which would otherwise flatten them to plain text and drop both the
+    # list structure and the decided/undecided state (issue #40). A decisionItem's
+    # state lives in a ``state`` node attribute ("DECIDED"); its text is in child
+    # nodes. Render each list as a bullet list; mark decided items with a ✓.
+    for dlist in list(soup.find_all(
+        lambda t: t.name == "ac:adf-node"
+        and t.get("type") in ("decisionList", "decision-list")
+    )):
+        ul = soup.new_tag("ul")
+        for item in dlist.find_all(
+            lambda t: t.name == "ac:adf-node"
+            and t.get("type") in ("decisionItem", "decision-item")
+        ):
+            text = item.get_text().strip()
+            if not text:
+                continue
+            decided = (item.get("state", "") or "").strip().upper() == "DECIDED"
+            li = soup.new_tag("li")
+            li.string = ("✓ " if decided else "") + text
+            ul.append(li)
+        if ul.find("li"):
+            dlist.replace_with(ul)
+        else:
+            dlist.decompose()
     # Unwrap adf-content, adf-extension, adf-node so their inner HTML is preserved
     for tag_name in ("ac:adf-content", "ac:adf-extension", "ac:adf-node"):
         for tag in list(soup.find_all(tag_name)):
@@ -257,11 +282,7 @@ def _preprocess_html(
             ul.append(li)
         task_list.replace_with(ul)
 
-    # NOTE: decision lists (ac:adf-node type="decisionList"/"decisionItem") are not
-    # specially handled — the generic ac:adf-node unwrap above already strips every
-    # adf-node, so their text content survives as plain markdown. A dedicated
-    # decision-list handler used to live here but was dead (shadowed by that unwrap);
-    # removed. If richer decision rendering is wanted, it must run BEFORE the unwrap.
+    # (Decision lists are handled above, before the adf-node unwrap.)
 
     # --- User mentions (ri:user inside ac:link or standalone) ---
     for user_tag in list(soup.find_all("ri:user")):

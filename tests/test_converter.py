@@ -35,6 +35,27 @@ def test_convert_page_basic():
     assert "**world**" in md
 
 
+def test_convert_page_decision_list_renders_as_markdown_list():
+    # #40: an ADF decision list renders as a real markdown bullet list, with decided
+    # items marked, instead of flattening to plain text.
+    page = Page(
+        id="124",
+        title="Decisions",
+        space_id="100",
+        version=Version(created_at="2025-01-01T00:00:00Z", number=1),
+        body_storage=(
+            '<ac:adf-node type="decisionList">'
+            '<ac:adf-node type="decisionItem" state="DECIDED"><p>Ship it</p></ac:adf-node>'
+            '<ac:adf-node type="decisionItem" state="UNDECIDED"><p>Maybe later</p></ac:adf-node>'
+            "</ac:adf-node>"
+        ),
+    )
+    md = convert_page(page, base_url="https://x.atlassian.net", space_key="TEST", path="/Decisions")
+    assert "* ✓ Ship it" in md  # decided item, marked, as a markdown list item
+    assert "* Maybe later" in md  # undecided item, no marker
+    assert "✓ Maybe later" not in md
+
+
 def test_convert_page_frontmatter_has_attachments():
     page = Page(
         id="123",

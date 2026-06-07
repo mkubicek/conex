@@ -117,6 +117,19 @@ PREPROCESS_CASES = [
     # Decision lists
     ("decision item with text", '<ac:adf-node type="decisionItem" state="DECIDED"><p>Decided X</p></ac:adf-node>', ["Decided X"], []),
     ("decision item empty removed", '<ac:adf-node type="decisionItem"></ac:adf-node>', [], []),
+    (
+        "decision list renders as bullet list, decided marked (#40)",
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem" state="DECIDED"><p>Ship it</p></ac:adf-node>'
+        '<ac:adf-node type="decisionItem" state="UNDECIDED"><p>Maybe later</p></ac:adf-node>'
+        "</ac:adf-node>",
+        ["<li>", "✓ Ship it", "Maybe later"], ["ac:adf-node", "✓ Maybe later"],
+    ),
+    (
+        "decision list with only empty items is dropped (#40)",
+        '<ac:adf-node type="decisionList"><ac:adf-node type="decisionItem"></ac:adf-node></ac:adf-node>',
+        [], ["<li>", "ac:adf-node"],
+    ),
 
     # Layout & cleanup
     ("layout tags unwrapped", "<ac:layout><ac:layout-section><ac:layout-cell><p>Inner</p></ac:layout-cell></ac:layout-section></ac:layout>", ["Inner"], ["ac:layout"]),
