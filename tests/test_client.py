@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
@@ -91,6 +92,91 @@ class TestGet:
             mock_get.side_effect = requests.exceptions.ConnectionError()
             with pytest.raises(requests.exceptions.ConnectionError):
                 client._get("/test", max_retries=2)
+
+    def test_read_timeout_retries_then_succeeds(self):
+        # #39 follow-up: a per-page attachment-list ReadTimeout (a Timeout, NOT a
+        # ConnectionError) must be retried, not escape uncaught and abort the export.
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            ok = MagicMock()
+            ok.status_code = 200
+            ok.raise_for_status.return_value = None
+            ok.json.return_value = {"ok": True}
+            mock_get.side_effect = [requests.exceptions.ReadTimeout(), ok]
+            assert client._get("/test") == {"ok": True}
+
+    def test_read_timeout_exhausted_raises(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            mock_get.side_effect = requests.exceptions.ReadTimeout()
+            with pytest.raises(requests.exceptions.ReadTimeout):
+                client._get("/test", max_retries=2)
+
+
+class TestCrossHostRedirectAuth:
+    """A Confluence attachment download 302-redirects to the media CDN, whose signed
+    URL self-authenticates. `requests` must DROP our Atlassian Authorization header on
+    the host change — re-attaching it to the media host is the exact bug that turns
+    working downloads into 403s in other Confluence clients. This pins that behavior
+    for conex's session so a future auth/redirect change can't silently regress it."""
+
+    @staticmethod
+    def _resp(status, request, headers=None):
+        resp = requests.models.Response()
+        resp.status_code = status
+        resp.headers = requests.structures.CaseInsensitiveDict(headers or {})
+        resp.url = request.url
+        resp.request = request
+        resp.raw = io.BytesIO(b"")
+        resp._content = b""
+        resp._content_consumed = True
+        return resp
+
+    def _drive_redirect(self, client, first_url, media_url):
+        """Send a real request through the client's session, with the transport
+        adapter mocked to 302 cross-host then 200, capturing each hop's auth header."""
+        sent: list[tuple[str, str | None]] = []
+
+        def fake_send(_adapter, request, **_kwargs):
+            sent.append((request.url, request.headers.get("Authorization")))
+            if len(sent) == 1:
+                return self._resp(302, request, {"Location": media_url})
+            return self._resp(200, request)
+
+        with patch("requests.adapters.HTTPAdapter.send", new=fake_send):
+            resp = client.session.get(first_url, allow_redirects=True, stream=True)
+        return resp, sent
+
+    def test_basic_auth_header_stripped_on_media_redirect(self):
+        client = _make_client()  # email+token -> HTTPBasicAuth on the session
+        first_url = "https://x.atlassian.net/wiki/rest/api/content/1/child/attachment/2/download"
+        media_url = "https://api.media.atlassian.com/file/abc/binary?token=signed"
+
+        resp, sent = self._drive_redirect(client, first_url, media_url)
+
+        assert resp.status_code == 200
+        assert len(sent) == 2
+        (first_hop_url, first_auth), (media_hop_url, media_auth) = sent
+        # First hop to Atlassian carries our credentials...
+        assert "x.atlassian.net" in first_hop_url and first_auth is not None
+        # ...the cross-host hop to the media CDN must NOT.
+        assert "api.media.atlassian.com" in media_hop_url
+        assert media_auth is None
+
+    def test_bearer_pat_header_stripped_on_media_redirect(self):
+        client = _make_client()
+        # Simulate Bearer-PAT auth (header on the session rather than session.auth).
+        client.session.auth = None
+        client.session.headers["Authorization"] = "Bearer pat-secret"
+        first_url = "https://x.atlassian.net/wiki/rest/api/content/1/child/attachment/2/download"
+        media_url = "https://api.media.atlassian.com/file/abc/binary?token=signed"
+
+        _resp, sent = self._drive_redirect(client, first_url, media_url)
+
+        assert sent[0][1] == "Bearer pat-secret"
+        assert sent[1][1] is None  # stripped on the media host
 
 
 class TestPaginate:
@@ -650,3 +736,127 @@ class TestGetFolderByIdV1:
         client.set_cookies("session=abc")
         with patch.object(client, "_get", side_effect=Exception("boom")):
             assert client.get_folder_by_id("77") is None
+
+
+class TestGetRawRetryAndRateLimit:
+    """#39: attachment downloads (_get_raw) share _get's retry/rate-limit path, and a
+    429 sets a shared backoff window all requests honor."""
+
+    def _http_error(self, status, retry_after=None):
+        resp = MagicMock()
+        resp.status_code = status
+        resp.headers = {"Retry-After": str(retry_after)} if retry_after is not None else {}
+        resp.raise_for_status.side_effect = requests.exceptions.HTTPError(response=resp)
+        return resp
+
+    def _ok(self):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        return resp
+
+    def test_get_raw_retries_on_429_then_succeeds(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            ok = self._ok()
+            mock_get.side_effect = [self._http_error(429, retry_after=0), ok]
+            assert client._get_raw("/d") is ok
+            assert client.stats["retries"] >= 1
+            assert client.stats["requests"] >= 2
+
+    def test_get_raw_retries_on_500_then_succeeds(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            ok = self._ok()
+            mock_get.side_effect = [self._http_error(500), ok]
+            assert client._get_raw("/d") is ok
+
+    def test_get_raw_closes_failed_streamed_response_before_retry(self):
+        # raise_for_status leaves a stream=True body unread; the failed response must
+        # be closed so its pooled connection is released rather than leaked until GC.
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            failed = self._http_error(500)
+            ok = self._ok()
+            mock_get.side_effect = [failed, ok]
+            assert client._get_raw("/d") is ok
+            failed.close.assert_called_once()
+            # The successful response must NOT be closed (the caller streams it).
+            ok.close.assert_not_called()
+
+    def test_get_raw_retries_on_connection_error(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            ok = self._ok()
+            mock_get.side_effect = [requests.exceptions.ConnectionError(), ok]
+            assert client._get_raw("/d") is ok
+
+    def test_get_raw_auth_error_not_retried(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get:
+            mock_get.return_value = self._http_error(403)
+            with pytest.raises(AuthenticationError):
+                client._get_raw("/d")
+
+    def test_get_raw_500_exhausted_raises_httperror(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            mock_get.return_value = self._http_error(500)
+            with pytest.raises(requests.exceptions.HTTPError):
+                client._get_raw("/d", max_retries=2)
+
+    def test_get_raw_429_exhausted_raises_runtime(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            mock_get.return_value = self._http_error(429, retry_after=0)
+            with pytest.raises(RuntimeError, match="Max retries"):
+                client._get_raw("/d", max_retries=2)
+
+    def test_get_raw_connection_error_exhausted_raises(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            mock_get.side_effect = requests.exceptions.ConnectionError()
+            with pytest.raises(requests.exceptions.ConnectionError):
+                client._get_raw("/d", max_retries=2)
+
+    def test_shared_window_makes_next_request_wait(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep") as sleep:
+            ok = self._ok()
+            ok.json.return_value = {}
+            mock_get.return_value = ok
+            client._note_rate_limit(5)  # a 429 elsewhere set a 5s window
+            client._get("/x")  # must wait the window before its request
+            assert sleep.called
+            assert client.stats["rate_limit_sleep_s"] > 0
+
+    def test_stats_count_successful_requests(self):
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get:
+            ok = self._ok()
+            ok.json.return_value = {"ok": True}
+            mock_get.return_value = ok
+            client._get("/x")
+            assert client.stats["requests"] == 1
+            assert client.stats["retries"] == 0
+
+    def test_non_numeric_retry_after_falls_back(self):
+        # A date-form or junk Retry-After must not crash the retryable 429.
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            bad = MagicMock()
+            bad.status_code = 429
+            bad.headers = {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+            bad.raise_for_status.side_effect = requests.exceptions.HTTPError(response=bad)
+            ok = self._ok()
+            ok.json.return_value = {"ok": True}
+            mock_get.side_effect = [bad, ok]
+            assert client._get("/x") == {"ok": True}  # retried, did not crash

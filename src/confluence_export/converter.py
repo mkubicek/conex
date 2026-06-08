@@ -211,6 +211,31 @@ def _preprocess_html(
     for tag_name in ("ac:adf-fallback", "ac:adf-attribute", "ac:adf-mark"):
         for tag in list(soup.find_all(tag_name)):
             tag.decompose()
+    # Decision lists (ADF) must be rendered BEFORE the generic adf-node unwrap
+    # below, which would otherwise flatten them to plain text and drop both the
+    # list structure and the decided/undecided state (issue #40). A decisionItem's
+    # state lives in a ``state`` node attribute ("DECIDED"); its text is in child
+    # nodes. Render each list as a bullet list; mark decided items with a ✓.
+    for dlist in list(soup.find_all(
+        lambda t: t.name == "ac:adf-node"
+        and t.get("type") in ("decisionList", "decision-list")
+    )):
+        ul = soup.new_tag("ul")
+        for item in dlist.find_all(
+            lambda t: t.name == "ac:adf-node"
+            and t.get("type") in ("decisionItem", "decision-item")
+        ):
+            text = item.get_text().strip()
+            if not text:
+                continue
+            decided = (item.get("state", "") or "").strip().upper() == "DECIDED"
+            li = soup.new_tag("li")
+            li.string = ("✓ " if decided else "") + text
+            ul.append(li)
+        if ul.find("li"):
+            dlist.replace_with(ul)
+        else:
+            dlist.decompose()
     # Unwrap adf-content, adf-extension, adf-node so their inner HTML is preserved
     for tag_name in ("ac:adf-content", "ac:adf-extension", "ac:adf-node"):
         for tag in list(soup.find_all(tag_name)):
@@ -257,11 +282,7 @@ def _preprocess_html(
             ul.append(li)
         task_list.replace_with(ul)
 
-    # NOTE: decision lists (ac:adf-node type="decisionList"/"decisionItem") are not
-    # specially handled — the generic ac:adf-node unwrap above already strips every
-    # adf-node, so their text content survives as plain markdown. A dedicated
-    # decision-list handler used to live here but was dead (shadowed by that unwrap);
-    # removed. If richer decision rendering is wanted, it must run BEFORE the unwrap.
+    # (Decision lists are handled above, before the adf-node unwrap.)
 
     # --- User mentions (ri:user inside ac:link or standalone) ---
     for user_tag in list(soup.find_all("ri:user")):
@@ -329,15 +350,23 @@ def _preprocess_html(
                 soup, macro, rendered, attach_map, name_plan,
                 media_downloaded=media_downloaded, available_media=available_media,
             )
+        elif macro_name == "drawio-sketch":
+            _convert_drawio_sketch(
+                soup, macro, rendered, attach_map, name_plan,
+                media_downloaded=media_downloaded, available_media=available_media,
+            )
         elif macro_name == "profile":
             _convert_profile(soup, macro, user_resolver)
         elif macro_name == "profile-picture":
             # A profile-picture with a user was already resolved to an inline
-            # mention in the user-mention pre-pass. If it still holds that
-            # resolved content (e.g. a nested profile-picture whose inner mention
-            # we kept — F4), unwrap to preserve it; an empty one (no user) is
-            # dropped rather than emitting a dynamic-content placeholder.
-            if macro.get_text(strip=True):
+            # mention <span> in the user-mention pre-pass (converter.py:312-314) —
+            # including the nested case (F4), where the inner macro is replaced by a
+            # span that ends up inside this outer one. Unwrap ONLY when that resolved
+            # span is present; a macro whose only text is a raw ac:parameter value
+            # (a bare account-id with no nested ri:user) carries no span and is
+            # dropped, so the raw id is never leaked as body text. An empty one (no
+            # user) is likewise dropped rather than emitting a placeholder.
+            if macro.find("span"):
                 macro.unwrap()
             else:
                 macro.decompose()
@@ -701,36 +730,52 @@ def _convert_drawio_placeholder(
     ``rendered``."""
     name_param = macro.find("ac:parameter", attrs={"ac:name": "diagramName"})
     diagram_name = name_param.get_text().strip() if name_param else "diagram"
-    bare = diagram_name.removesuffix(".drawio")
-
     # F6/F7: resolve the diagramName to the real on-disk attachment, tolerant of
     # the .drawio extension and case/whitespace, rather than reconstructing a name.
     matched = _match_drawio_attachment(diagram_name, attach_map)
-    source_name = matched.title if matched is not None else f"{bare}.drawio"
+    _emit_drawio(
+        soup, macro, diagram_name, matched, rendered, name_plan,
+        media_downloaded=media_downloaded, available_media=available_media,
+    )
+
+
+def _emit_drawio(
+    soup: BeautifulSoup,
+    macro: Tag,
+    source_name: str,
+    matched: Attachment | None,
+    rendered: dict[str, Path],
+    name_plan: AttachmentNamePlan,
+    *,
+    media_downloaded: bool,
+    available_media: set[str] | None,
+) -> None:
+    """Emit the rendered-PNG ``<img>`` (+ a source link when the .drawio is on disk)
+    for a drawio / drawio-sketch macro resolved to ``matched``, or a graceful
+    "not rendered" note when no PNG is available."""
+    bare = source_name.removesuffix(".drawio")
+    source_title = matched.title if matched is not None else f"{bare}.drawio"
     source_local_name = (
         name_plan.for_attachment(matched)
         if matched is not None
-        else safe_attachment_name(source_name)
+        else safe_attachment_name(source_title)
     )
 
     # Rendered-PNG lookup: the exporter keys rendered[att.title]; try the matched
     # title first, then the reconstructed names (F7).
     png_path = None
     for key in ([matched.title] if matched is not None else []) + [
-        diagram_name, f"{bare}.drawio", bare,
+        source_name, f"{bare}.drawio", bare,
     ]:
         if key in rendered:
             png_path = rendered[key]
             break
 
     # F5: a source link only when the source is actually on disk.
-    source_tracked = (
-        matched is not None
-        and (
-            source_local_name in available_media
-            if available_media is not None
-            else media_downloaded
-        )
+    source_tracked = matched is not None and (
+        source_local_name in available_media
+        if available_media is not None
+        else media_downloaded
     )
 
     p = soup.new_tag("p")
@@ -742,16 +787,50 @@ def _convert_drawio_placeholder(
         ))
     else:
         em = soup.new_tag("em")
-        em.string = f"[Draw.io diagram not rendered: {_markdown_label(source_name)}]"
+        em.string = f"[Draw.io diagram not rendered: {_markdown_label(source_title)}]"
         p.append(em)
     if source_tracked:
         p.append(soup.new_tag("br"))
         src_em = soup.new_tag("em")
         src_em.append("Draw.io source: ")
         link = soup.new_tag("a", href=_markdown_media_url(source_local_name))
-        link.string = _markdown_label(source_name)
+        link.string = _markdown_label(source_title)
         src_em.append(link)
         p.append(src_em)
+    macro.replace_with(p)
+
+
+def _convert_drawio_sketch(
+    soup: BeautifulSoup,
+    macro: Tag,
+    rendered: dict[str, Path],
+    attach_map: dict[str, Attachment],
+    name_plan: AttachmentNamePlan,
+    *,
+    media_downloaded: bool = True,
+    available_media: set[str] | None = None,
+) -> None:
+    """drawio-sketch macro (#6). Render it like a drawio diagram when it is
+    attachment-backed (carries an ``ri:attachment``); otherwise emit a graceful
+    ``[Draw.io sketch]`` note instead of the generic dynamic-content placeholder.
+
+    The inline-payload render path (writing an embedded sketch to a temp ``.drawio``
+    and rendering it) is intentionally deferred until a real drawio-sketch storage
+    sample confirms the shape — until then an inline sketch degrades to a clean note
+    rather than a confusing ``[Confluence dynamic content: drawio-sketch]``."""
+    ri = macro.find("ri:attachment")
+    filename = ri.get("ri:filename", "").strip() if ri is not None else ""
+    if filename:
+        matched = _match_drawio_attachment(filename, attach_map)
+        _emit_drawio(
+            soup, macro, filename, matched, rendered, name_plan,
+            media_downloaded=media_downloaded, available_media=available_media,
+        )
+        return
+    p = soup.new_tag("p")
+    em = soup.new_tag("em")
+    em.string = "[Draw.io sketch]"
+    p.append(em)
     macro.replace_with(p)
 
 

@@ -8,9 +8,13 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
+from confluence_export.client import AuthenticationError
+from confluence_export.diagnostics import WarningCollector
 from confluence_export.media import (
     _VERSIONS_FILE,
+    _record_download_warning,
     _save_versions,
     available_attachment_names,
     download_attachments,
@@ -1495,3 +1499,58 @@ class TestPathTraversal:
         for title in ("report.pdf", "My Diagram (v2).png", "data.final.xlsx"):
             download_attachments(client, [_att(title=title, att_id=title)], media_dir)
             assert (media_dir / title).exists(), f"benign name changed: {title}"
+
+
+class TestRecordDownloadWarning:
+    def test_404_reads_as_unavailable_content_not_an_error(self, capsys):
+        wc = WarningCollector()
+        exc = requests.exceptions.HTTPError()
+        exc.response = MagicMock(status_code=404)
+
+        _record_download_warning(_att(title="gone.png"), exc, wc)
+
+        err = capsys.readouterr().err
+        assert "metadata exists but its binary is unavailable (HTTP 404)" in err
+        assert wc.counts() == {"attachment unavailable (HTTP 404)": 1}
+
+    def test_non_404_http_error_is_a_plain_failure(self, capsys):
+        wc = WarningCollector()
+        exc = requests.exceptions.HTTPError()
+        exc.response = MagicMock(status_code=500)
+
+        _record_download_warning(_att(title="boom.png"), exc, wc)
+
+        assert "failed to download" in capsys.readouterr().err
+        assert wc.counts() == {"attachment download failed": 1}
+
+    def test_timeout_is_its_own_category(self, capsys):
+        wc = WarningCollector()
+        _record_download_warning(
+            _att(title="slow.png"), requests.exceptions.ReadTimeout("slow"), wc
+        )
+
+        assert "timed out downloading slow.png" in capsys.readouterr().err
+        assert wc.counts() == {"attachment download timeout": 1}
+
+    def test_401_points_at_token_type_not_generic_failure(self, capsys):
+        # A 401/403 lists fine but the binary is rejected — usually a scoped/granular
+        # token. It must NOT fall into the opaque generic bucket.
+        wc = WarningCollector()
+        _record_download_warning(_att(title="secret.png"), AuthenticationError(401, "/d"), wc)
+
+        err = capsys.readouterr().err
+        assert "HTTP 401 downloading 'secret.png'" in err
+        assert "classic (unscoped) API token" in err
+        assert wc.counts() == {"attachment download forbidden (HTTP 401/403)": 1}
+
+    def test_403_uses_the_same_forbidden_category(self, capsys):
+        wc = WarningCollector()
+        _record_download_warning(_att(title="x.png"), AuthenticationError(403, "/d"), wc)
+
+        assert "HTTP 403 downloading 'x.png'" in capsys.readouterr().err
+        assert wc.counts() == {"attachment download forbidden (HTTP 401/403)": 1}
+
+    def test_collector_is_optional(self, capsys):
+        # The helper still prints when no collector is supplied.
+        _record_download_warning(_att(title="x.png"), ValueError("nope"), None)
+        assert "failed to download x.png" in capsys.readouterr().err

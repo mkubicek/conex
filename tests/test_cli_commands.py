@@ -191,6 +191,42 @@ class TestExportCommand:
         md_files = list(Path(out).rglob("*.md"))
         assert len(md_files) == 2
 
+    def test_prints_warning_summary_to_stderr_when_degraded(self, tmp_path, capsys):
+        client = _mock_client()
+        export_result = ExportResult(
+            count=3,
+            written_files=[tmp_path / "out" / "P" / "P.md"],
+            warnings={"attachment unavailable (HTTP 404)": 2, "draw.io produced no output": 1},
+        )
+        exporter = MagicMock()
+        exporter.export_space.return_value = export_result
+        out = str(tmp_path / "out")
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-git"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.Exporter", return_value=exporter):
+            main()
+
+        captured = capsys.readouterr()
+        assert "Exported 3 page(s)" in captured.out
+        # The grouped one-liner goes to stderr so it does not pollute piped stdout.
+        assert "3 warning(s):" in captured.err
+        assert "attachment unavailable (HTTP 404) ×2" in captured.err
+
+    def test_no_warning_summary_when_clean(self, tmp_path, capsys):
+        client = _mock_client()
+        export_result = ExportResult(count=1, written_files=[], warnings={})
+        exporter = MagicMock()
+        exporter.export_space.return_value = export_result
+        out = str(tmp_path / "out")
+        with patch("sys.argv", ["confluence-export", "export", "TEST", "-o", out, "--no-git"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.Exporter", return_value=exporter):
+            main()
+
+        assert "warning(s):" not in capsys.readouterr().err
+
 
     def test_export_migrates_legacy_media_dirs(self, tmp_path, capsys):
         client = _mock_client()
@@ -987,3 +1023,65 @@ class TestConfigureExistingDefaults:
         assert data["auth"]["type"] == "scoped_api_token"
         assert data["cloud_id"] == "cloud-999"
         assert data["api_base_url"] == "https://api.atlassian.com/ex/confluence/cloud-999"
+
+
+class TestPageOnlyWiring:
+    """#39: tree/find/diff refresh page-only (skip the per-page attachment listing)."""
+
+    def _patches(self, argv, cache, client):
+        return [
+            patch("sys.argv", argv),
+            patch("confluence_export.cli.load_connection_profile", return_value=_profile()),
+            patch("confluence_export.cli.ConfluenceClient", return_value=client),
+            patch("confluence_export.cli.CacheStore", return_value=cache),
+        ]
+
+    def _run(self, argv, cache, client):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(argv, cache, client):
+                stack.enter_context(p)
+            main()
+
+    def test_tree_uses_page_only(self):
+        cache = MagicMock()
+        cache.ensure_loaded.return_value = _cached_space()
+        self._run(["confluence-export", "tree", "TEST"], cache, _mock_client())
+        assert cache.ensure_loaded.call_args.kwargs.get("need_attachments") is False
+
+    def test_find_uses_page_only(self):
+        cache = MagicMock()
+        cache.ensure_loaded.return_value = _cached_space()
+        self._run(["confluence-export", "find", "TEST", "Child"], cache, _mock_client())
+        assert cache.ensure_loaded.call_args.kwargs.get("need_attachments") is False
+
+    def test_diff_uses_page_only(self, tmp_path):
+        cache = MagicMock()
+        cache.load.return_value = None
+        cache.refresh.return_value = _cached_space()
+        export_dir = tmp_path / "export"
+        export_dir.mkdir()
+        self._run(
+            ["confluence-export", "diff", "TEST", str(export_dir)], cache, _mock_client()
+        )
+        assert cache.refresh.call_args.kwargs.get("fetch_attachments") is False
+
+
+class TestNetworkErrorHandling:
+    """#39 follow-up: a network failure that exhausts retries exits cleanly, not as
+    an uncaught traceback (a read timeout during refresh aborted a bulk export)."""
+
+    def test_persistent_read_timeout_exits_cleanly(self, capsys):
+        client = _mock_client()
+        cache = MagicMock()
+        cache.refresh.side_effect = requests.exceptions.ReadTimeout("read timed out")
+        with patch("sys.argv", ["confluence-export", "refresh", "TEST"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
+            with pytest.raises(SystemExit) as exc:
+                main()
+            assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "network request to Confluence failed" in err
+        assert "re-run to retry" in err.lower()

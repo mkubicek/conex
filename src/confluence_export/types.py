@@ -198,6 +198,11 @@ class CachedSpace:
     attachments: dict[str, list[Attachment]]  # page_id -> attachments
     updated_at: str = ""
     include_archived: bool = False
+    # Whether per-page attachment metadata was fetched this refresh. A page-only
+    # refresh (tree/find/diff) sets this False; export must NOT treat such a cache
+    # as authoritative for attachments/media-prune. Old caches (no flag) predate
+    # page-only mode and were always full, so they default to True.
+    attachments_complete: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -217,6 +222,7 @@ class CachedSpace:
             },
             "updated_at": self.updated_at,
             "include_archived": self.include_archived,
+            "attachments_complete": self.attachments_complete,
         }
 
     @classmethod
@@ -230,4 +236,5 @@ class CachedSpace:
             },
             updated_at=data.get("updated_at", ""),
             include_archived=bool(data.get("include_archived", False)),
+            attachments_complete=bool(data.get("attachments_complete", True)),
         )

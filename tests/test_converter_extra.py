@@ -84,6 +84,7 @@ PREPROCESS_CASES = [
     ("view-file via name param", '<ac:structured-macro ac:name="view-file"><ac:parameter ac:name="name">doc.pdf</ac:parameter></ac:structured-macro>', [".media/doc.pdf"], []),
     ("view-file empty", '<ac:structured-macro ac:name="view-file"></ac:structured-macro>', [], ["ac:structured-macro"]),
     ("drawio not rendered falls back", '<ac:structured-macro ac:name="drawio"><ac:parameter ac:name="diagramName">arch</ac:parameter></ac:structured-macro>', ["Draw.io diagram not rendered: arch.drawio"], ["[drawio:"]),
+    ("drawio-sketch inline -> graceful note not dynamic placeholder (#6)", '<ac:structured-macro ac:name="drawio-sketch"><ac:parameter ac:name="mVer">2</ac:parameter></ac:structured-macro>', ["[Draw.io sketch]"], ["Confluence dynamic content"]),
 
     # Structural macros
     ("toc placeholder", '<ac:structured-macro ac:name="toc"></ac:structured-macro>', ["[Confluence dynamic content: toc]"], ["ac:structured-macro"]),
@@ -117,6 +118,19 @@ PREPROCESS_CASES = [
     # Decision lists
     ("decision item with text", '<ac:adf-node type="decisionItem" state="DECIDED"><p>Decided X</p></ac:adf-node>', ["Decided X"], []),
     ("decision item empty removed", '<ac:adf-node type="decisionItem"></ac:adf-node>', [], []),
+    (
+        "decision list renders as bullet list, decided marked (#40)",
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem" state="DECIDED"><p>Ship it</p></ac:adf-node>'
+        '<ac:adf-node type="decisionItem" state="UNDECIDED"><p>Maybe later</p></ac:adf-node>'
+        "</ac:adf-node>",
+        ["<li>", "✓ Ship it", "Maybe later"], ["ac:adf-node", "✓ Maybe later"],
+    ),
+    (
+        "decision list with only empty items is dropped (#40)",
+        '<ac:adf-node type="decisionList"><ac:adf-node type="decisionItem"></ac:adf-node></ac:adf-node>',
+        [], ["<li>", "ac:adf-node"],
+    ),
 
     # Layout & cleanup
     ("layout tags unwrapped", "<ac:layout><ac:layout-section><ac:layout-cell><p>Inner</p></ac:layout-cell></ac:layout-section></ac:layout>", ["Inner"], ["ac:layout"]),
@@ -192,6 +206,20 @@ def test_profile_picture_empty_account_id_dropped():
     )
     result = _preprocess_html(html, [])
     assert "@" not in result
+    assert "Confluence dynamic content" not in result
+
+
+def test_profile_picture_with_plain_text_param_does_not_leak_raw_id():
+    # A profile-picture whose only content is a raw ac:parameter value (no nested
+    # ri:user to resolve) must be dropped, not unwrapped — otherwise the raw
+    # account-id leaks as visible body text.
+    html = (
+        '<p>Author: <ac:structured-macro ac:name="profile-picture">'
+        '<ac:parameter ac:name="user">5f1a-accountid</ac:parameter>'
+        "</ac:structured-macro></p>"
+    )
+    result = _preprocess_html(html, [])
+    assert "5f1a-accountid" not in result
     assert "Confluence dynamic content" not in result
 
 
@@ -345,6 +373,34 @@ def test_drawio_nested_in_panel_still_renders():
     result = _preprocess_html(html, atts, rendered={"arch.drawio": Path(".media/arch.drawio.png")})
     assert 'src=".media/arch.drawio.png"' in result
     assert "[drawio:" not in result
+
+
+def test_drawio_sketch_attachment_backed_renders_png():
+    # #6: an attachment-backed drawio-sketch renders its PNG like a full drawio macro.
+    html = (
+        '<ac:structured-macro ac:name="drawio-sketch">'
+        '<ac:parameter ac:name="mVer">2</ac:parameter>'
+        '<ri:attachment ri:filename="sketch.drawio"/>'
+        "</ac:structured-macro>"
+    )
+    atts = [Attachment(id="a", title="sketch.drawio", media_type="application/x-drawio")]
+    result = _preprocess_html(html, atts, rendered={"sketch.drawio": Path(".media/sketch.drawio.png")})
+    assert 'src=".media/sketch.drawio.png"' in result
+    assert "Confluence dynamic content" not in result
+
+
+def test_drawio_sketch_attachment_backed_not_rendered_falls_back():
+    # #6: attachment-backed sketch with no rendered PNG degrades to the same graceful
+    # "not rendered" note as a drawio diagram, not a dynamic-content placeholder.
+    html = (
+        '<ac:structured-macro ac:name="drawio-sketch">'
+        '<ri:attachment ri:filename="sketch.drawio"/>'
+        "</ac:structured-macro>"
+    )
+    atts = [Attachment(id="a", title="sketch.drawio", media_type="application/x-drawio")]
+    result = _preprocess_html(html, atts)
+    assert "Draw.io diagram not rendered: sketch.drawio" in result
+    assert "Confluence dynamic content" not in result
 
 
 def test_drawio_rendered_lookup_is_case_and_space_insensitive():

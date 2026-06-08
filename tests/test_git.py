@@ -756,7 +756,12 @@ class TestCommitExport:
             protection=_prot(page_exact=[page]),
         )
 
+        # Security invariant (must ALWAYS hold): the protected symlinked .media dir
+        # is never followed to write/restore into its outside target.
         assert not (outside / "img.png").exists()
+        # Healing: the symlink ancestor is unlinked and the file restored as a real
+        # dir. The restore now retries a transient git failure once (#41), so this is
+        # deterministic rather than load-flaky.
         assert not media.is_symlink()
         assert (media / "img.png").read_bytes() == b"PNG"
         ls = subprocess.run(

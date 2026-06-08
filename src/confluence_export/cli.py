@@ -12,6 +12,7 @@ import requests
 
 from confluence_export.cache import CacheStore
 from confluence_export.client import AuthenticationError, ConfluenceClient
+from confluence_export.diagnostics import format_warning_summary
 from confluence_export.config import (
     ApiDialect,
     AuthConfig,
@@ -188,41 +189,50 @@ def main() -> None:
 
     client = ConfluenceClient(profile, verbose=args.verbose)
 
-    match args.command:
-        case "spaces":
-            _exit_on_auth_error(lambda: _cmd_spaces(client))
-        case "tree":
-            _cmd_tree(client, CacheStore(), profile, args.space_key)
-        case "find":
-            _cmd_find(client, CacheStore(), profile, args.space_key, args.query)
-        case "export":
-            _cmd_export(
-                client,
-                profile,
-                space_key=args.space_key,
-                path_filter=args.path,
-                output_dir=args.output,
-                no_children=args.no_children,
-                no_media=args.no_media,
-                no_drawio_render=args.no_drawio_render,
-                force_refresh=not args.cached,
-                debug=args.include_html,
-                include_archived=args.include_archived,
-                no_git=args.no_git,
-                no_author_lookup=args.no_author_lookup,
-            )
-        case "diff":
-            _cmd_diff(
-                client,
-                CacheStore(),
-                profile,
-                space_key=args.space_key,
-                export_dir=args.export_dir,
-                path_filter=args.path,
-                include_archived=args.include_archived,
-            )
-        case "refresh":
-            _cmd_refresh(client, CacheStore(), profile, args.space_key)
+    try:
+        match args.command:
+            case "spaces":
+                _exit_on_auth_error(lambda: _cmd_spaces(client))
+            case "tree":
+                _cmd_tree(client, CacheStore(), profile, args.space_key)
+            case "find":
+                _cmd_find(client, CacheStore(), profile, args.space_key, args.query)
+            case "export":
+                _cmd_export(
+                    client,
+                    profile,
+                    space_key=args.space_key,
+                    path_filter=args.path,
+                    output_dir=args.output,
+                    no_children=args.no_children,
+                    no_media=args.no_media,
+                    no_drawio_render=args.no_drawio_render,
+                    force_refresh=not args.cached,
+                    debug=args.include_html,
+                    include_archived=args.include_archived,
+                    no_git=args.no_git,
+                    no_author_lookup=args.no_author_lookup,
+                )
+            case "diff":
+                _cmd_diff(
+                    client,
+                    CacheStore(),
+                    profile,
+                    space_key=args.space_key,
+                    export_dir=args.export_dir,
+                    path_filter=args.path,
+                    include_archived=args.include_archived,
+                )
+            case "refresh":
+                _cmd_refresh(client, CacheStore(), profile, args.space_key)
+    except requests.exceptions.RequestException as exc:
+        # A network request that exhausted the client's retries (e.g. a persistent
+        # read timeout or connection drop) should fail with a clear message, not an
+        # uncaught traceback (issue #39 follow-up). Transient blips are retried in
+        # the client; this is the genuine-outage path.
+        print(f"Error: a network request to Confluence failed: {exc}", file=sys.stderr)
+        print("Likely transient (read timeout / connection drop) — re-run to retry.", file=sys.stderr)
+        sys.exit(1)
 
 
 # -- command implementations -------------------------------------------------
@@ -404,7 +414,7 @@ def _cmd_tree(
 ) -> None:
     """Show page hierarchy."""
     space = _exit_on_auth_error(lambda: _resolve_space(client, space_key))
-    cs = cache.ensure_loaded(client, space)
+    cs = cache.ensure_loaded(client, space, need_attachments=False)
 
     roots = build_tree(cs.pages)
     tree_str = format_tree(roots)
@@ -421,7 +431,7 @@ def _cmd_find(
 ) -> None:
     """Search pages by title."""
     space = _exit_on_auth_error(lambda: _resolve_space(client, space_key))
-    cs = cache.ensure_loaded(client, space)
+    cs = cache.ensure_loaded(client, space, need_attachments=False)
 
     results = find_pages(cs.pages, query)
     if not results:
@@ -660,6 +670,9 @@ def _cmd_export(
         )
 
     print(f"\nExported {result.count} page(s) to {out.resolve()}")
+    summary = format_warning_summary(result.warnings)
+    if summary:
+        print(summary, file=sys.stderr)
 
 
 def _cmd_diff(
@@ -682,14 +695,18 @@ def _cmd_diff(
     exported = scan_export_dir(export_path, space_key)
     print(f"Scanned {len(exported)} page(s) from export directory.", file=sys.stderr)
 
-    # Always refresh — diff against stale cache is useless
+    # Always refresh — diff against stale cache is useless. Page-only: diff compares
+    # page ids/versions/paths (compute_diff takes pages, not attachments), so skip
+    # the per-page attachment listing (#39).
     cs = cache.load(space_key)
     if cs is not None:
         space = cs.space
     else:
         space = _exit_on_auth_error(lambda: _resolve_space(client, space_key))
     cs = _exit_on_auth_error(
-        lambda: cache.refresh(client, space, include_archived=include_archived)
+        lambda: cache.refresh(
+            client, space, include_archived=include_archived, fetch_attachments=False
+        )
     )
 
     # Filter API pages

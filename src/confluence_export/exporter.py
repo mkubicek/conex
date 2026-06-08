@@ -30,6 +30,7 @@ from confluence_export.provenance import (
     recursive_archived_dirs,
 )
 from confluence_export.protection import ProtectionSet, move_window_dirs
+from confluence_export.diagnostics import WarningCollector
 from confluence_export.media import (
     MEDIA_DIR_NAME,
     WORKSPACE_DIR_NAME,
@@ -77,6 +78,10 @@ class ExportResult:
     # though no current media file was written, so stale tracked media can be
     # pruned during --no-media exports.
     prune_media_dirs: list[Path] = field(default_factory=list)
+    # Best-effort warnings this run, grouped by category (e.g. "attachment
+    # unavailable (HTTP 404)" -> count). Printed as one end-of-run summary by the
+    # cli so a clean exit (0) doesn't hide soft losses.
+    warnings: dict[str, int] = field(default_factory=dict)
 
     def protection(self, output_dir: Path) -> ProtectionSet:
         """Compile this run's protected-path accumulators into the typed bundle the
@@ -172,6 +177,8 @@ class Exporter:
         self._skipped_paths: list[Path] = []
         self._preserved_page_paths: list[Path] = []
         self._preserved_paths: list[Path] = []
+        # Best-effort warnings collected across this run (reset in export_space).
+        self._warnings = WarningCollector()
         self._prune_media_dirs: list[Path] = []
         # page_id -> on-disk dirs as they existed BEFORE reconcile ran this run.
         # Used to protect a moved-then-skipped page's old path from the prune (M2).
@@ -234,6 +241,7 @@ class Exporter:
                     page.webui = full_page.webui
             except Exception as exc:
                 print(f"  Warning: could not fetch body for {page.title}: {exc}", file=sys.stderr)
+                self._warnings.record("page body fetch failed")
             with lock:
                 counter[0] += 1
                 print(
@@ -260,6 +268,7 @@ class Exporter:
         self._preserved_page_paths = []
         self._preserved_paths = []
         self._prune_media_dirs = []
+        self._warnings = WarningCollector()
         self._pre_reconcile_dirs = {}
         self._scan_grouped = {}
         # Ensure cache
@@ -421,6 +430,7 @@ class Exporter:
                 node_result.preserved_page_paths = list(self._preserved_page_paths)
                 node_result.preserved_paths = list(self._preserved_paths)
                 node_result.prune_media_dirs = list(self._prune_media_dirs)
+                node_result.warnings = self._warnings.counts()
                 return node_result
         else:
             if no_children:
@@ -435,6 +445,7 @@ class Exporter:
                 result.preserved_page_paths = list(self._preserved_page_paths)
                 result.preserved_paths = list(self._preserved_paths)
                 result.prune_media_dirs = list(self._prune_media_dirs)
+                result.warnings = self._warnings.counts()
                 return result
 
         # Export flat list (no_children case)
@@ -447,6 +458,7 @@ class Exporter:
         result.preserved_page_paths = list(self._preserved_page_paths)
         result.preserved_paths = list(self._preserved_paths)
         result.prune_media_dirs = list(self._prune_media_dirs)
+        result.warnings = self._warnings.counts()
         return result
 
     def _mark_skipped_subtree(self, node: PageNode, page_dir: Path) -> None:
@@ -525,6 +537,7 @@ class Exporter:
                     page.webui = full_page.webui
             except Exception as exc:
                 print(f"  Warning: could not fetch body for {page.title}: {exc}", file=sys.stderr)
+                self._warnings.record("page body fetch failed")
                 # M2: also protect the page's pre-reconcile (old) path so a moved
                 # page that fails to refetch keeps its last-good committed export.
                 self._skipped_paths.extend(
@@ -629,7 +642,11 @@ class Exporter:
                 snapshot_file(media_dir / _VERSIONS_FILE)
                 for name in current_attachment_names:
                     snapshot_file(resolve_within(media_dir, name))
-                written.extend(download_attachments(self.client, attachments, media_dir))
+                written.extend(
+                    download_attachments(
+                        self.client, attachments, media_dir, warnings=self._warnings
+                    )
+                )
             elif not self.download_media and attachments:
                 existing_media_dir = page_dir / MEDIA_DIR_NAME
                 if existing_media_dir.is_dir():
@@ -684,6 +701,7 @@ class Exporter:
                                 drawio_file,
                                 output_path=output_path,
                                 force=force_render,
+                                warnings=self._warnings,
                             )
                             if png_path:
                                 rendered[att.title] = png_path
@@ -720,6 +738,7 @@ class Exporter:
             )
         except Exception as exc:
             print(f"  Warning: could not convert {page.title}: {exc}", file=sys.stderr)
+            self._warnings.record("page conversion failed")
             # M2: also protect the page's pre-reconcile (old) path (see above).
             self._skipped_paths.extend(
                 move_window_dirs(page_dir, page.id, self._pre_reconcile_dirs)
@@ -735,6 +754,7 @@ class Exporter:
             _write_text_atomic(md_path, markdown, encoding="utf-8")
         except Exception as exc:
             print(f"  Warning: could not write {page.title}: {exc}", file=sys.stderr)
+            self._warnings.record("page write failed")
             self._skipped_paths.extend(
                 move_window_dirs(page_dir, page.id, self._pre_reconcile_dirs)
             )
