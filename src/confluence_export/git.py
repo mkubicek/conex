@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -189,7 +189,12 @@ def commit_export(
     if is_full:
         # Compile the typed protections ONCE into dual-form matchers shared by the
         # prune and the restore so they cannot drift (protection.build_protected).
-        page_dirs, sub_dirs = build_protected(output_dir, protection)
+        # One fold (case-insensitive FS → NFC+casefold, else NFC) is shared by the
+        # protection matchers AND the staleness key, so a protected dir whose
+        # committed path differs only in case/Unicode form from this run's planned
+        # name is matched rather than pruned (#44). Probe the FS once here.
+        fold = nfc_casefold if _fs_is_case_insensitive(output_dir) else nfc
+        page_dirs, sub_dirs = build_protected(output_dir, protection, fold)
         # DATA-SAFETY DECISION 1: prune ONLY when this run actually wrote live
         # pages. A full export that wrote nothing has no authority to reconcile
         # deletions — a transient/auth-failed empty response, or a v2 space that
@@ -203,6 +208,7 @@ def commit_export(
                 page_dirs=page_dirs, sub_dirs=sub_dirs,
                 prune_media_owners=protection.prune_media_owners,
                 preserve_media=preserve_media,
+                fold=fold,
             )
         # Restore any tracked file reconcile deleted from disk under a protected
         # dir, so the worktree matches the copy we kept in HEAD and the next run's
@@ -210,7 +216,7 @@ def commit_export(
         # it only re-adds protected files, never deletes — so it runs even on a
         # write-less run (e.g. all pages skipped this run).
         _restore_protected_deletions(
-            output_dir, page_dirs=page_dirs, sub_dirs=sub_dirs,
+            output_dir, page_dirs=page_dirs, sub_dirs=sub_dirs, fold=fold,
         )
 
     # Check if anything was staged
@@ -259,6 +265,7 @@ def _remove_stale_files(
     sub_dirs: list[ProtectedDir] | None = None,
     prune_media_owners: frozenset[Path] = frozenset(),
     preserve_media: bool = False,
+    fold: Callable[[str], str] | None = None,
 ) -> None:
     """Remove tracked files that are no longer part of the export.
 
@@ -274,19 +281,6 @@ def _remove_stale_files(
 
     page_dirs = page_dirs or []
     sub_dirs = sub_dirs or []
-    written_page_dirs = (
-        page_dirs_from_written_files(output_dir, written_files)
-        if preserve_media else frozenset()
-    )
-    written_media_dirs = (
-        media_owner_dirs_from_written_files(output_dir, written_files)
-        if preserve_media else frozenset()
-    )
-
-    result = _run_git(output_dir, "ls-files", "-z", ".", check=False)
-    if result is None or not result.stdout.strip("\0"):
-        return
-
     # Normalize the comparison key on two axes that git itself folds but
     # Path.resolve() does not:
     #   - Unicode form: a macOS attachment title can arrive NFD (decomposed); git
@@ -298,8 +292,33 @@ def _remove_stale_files(
     #     differ only in case (a re-cased title, or legacy content from another
     #     machine); git folds those to one path, so we must too, or the same file
     #     is both git-added (new case) and flagged stale (old case).
-    # One shared fold definition with layout's collision keys (Q6).
-    fold = nfc_casefold if _fs_is_case_insensitive(output_dir) else nfc
+    # One shared fold definition with layout's collision keys (Q6). commit_export
+    # passes the same fold it gave build_protected, so the protection matchers and
+    # this staleness key agree under case/Unicode drift (#44); fall back to probing
+    # the FS for direct callers (tests).
+    if fold is None:
+        fold = nfc_casefold if _fs_is_case_insensitive(output_dir) else nfc
+
+    def _fp(p: Path) -> Path:
+        """Fold a path into the shared comparison space (same fold as the matchers)."""
+        return Path(fold(str(p)))
+
+    # The media-keep predicate compares owner dirs against these sets, so fold them
+    # too — otherwise a re-cased owner dir misses its own written/preserved entry.
+    written_page_dirs = (
+        frozenset(_fp(p) for p in page_dirs_from_written_files(output_dir, written_files))
+        if preserve_media else frozenset()
+    )
+    written_media_dirs = (
+        frozenset(_fp(p) for p in media_owner_dirs_from_written_files(output_dir, written_files))
+        if preserve_media else frozenset()
+    )
+    prune_media_owners = frozenset(_fp(p) for p in prune_media_owners)
+
+    result = _run_git(output_dir, "ls-files", "-z", ".", check=False)
+    if result is None or not result.stdout.strip("\0"):
+        return
+
     written_keys = {fold(str(f.resolve())) for f in written_files}
 
     stale = []
@@ -318,7 +337,7 @@ def _remove_stale_files(
         if preserve_media and MEDIA_DIR_NAME in parts and (output_dir / rel_path).is_file():
             owner = _media_owner_dir(output_dir, rel_path)
             if owner is not None and media_file_is_preserved(
-                owner,
+                _fp(owner),
                 written_page_dirs=written_page_dirs,
                 written_media_dirs=written_media_dirs,
                 prune_media_owners=prune_media_owners,
@@ -332,9 +351,13 @@ def _remove_stale_files(
         full = full_lexical.resolve()
         # Dual-form (resolved OR lexical) match, one matcher object, shared with
         # the restore — see protection.ProtectedDir (pair-argument is load-bearing).
-        if any(d.owns_exactly(full, full_lexical) for d in page_dirs):
+        # Fold each form into the matchers' (folded) comparison space, per form so
+        # the symlink-safe resolved/lexical dual is preserved (#44).
+        full_f = _fp(full)
+        full_lexical_f = _fp(full_lexical)
+        if any(d.owns_exactly(full_f, full_lexical_f) for d in page_dirs):
             continue
-        if any(d.contains_subtree(full, full_lexical) for d in sub_dirs):
+        if any(d.contains_subtree(full_f, full_lexical_f) for d in sub_dirs):
             continue
         if fold(str(full)) not in written_keys:
             stale.append(rel_path)
@@ -366,6 +389,7 @@ def _restore_protected_deletions(
     *,
     page_dirs: list[ProtectedDir],
     sub_dirs: list[ProtectedDir],
+    fold: Callable[[str], str] | None = None,
 ) -> None:
     """Restore tracked-but-deleted files under a protected dir from HEAD.
 
@@ -383,6 +407,15 @@ def _restore_protected_deletions(
     drift — the original RF-B failure class."""
     if not page_dirs and not sub_dirs:
         return
+    # Must use the SAME fold the prune/build_protected used, or restore and prune
+    # drift under case/Unicode (#44 / RF-B). commit_export passes it; fall back to
+    # probing for direct callers.
+    if fold is None:
+        fold = nfc_casefold if _fs_is_case_insensitive(output_dir) else nfc
+
+    def _fp(p: Path) -> Path:
+        return Path(fold(str(p)))
+
     result = _run_git(output_dir, "ls-files", "--deleted", "-z", check=False)
     if result is None:  # pragma: no cover - transient git failure under load
         # Retry once: a transient git failure here would silently skip the heal,
@@ -400,9 +433,11 @@ def _restore_protected_deletions(
             continue
         full_lexical = (output_dir / rel_path).absolute()
         full = full_lexical.resolve()
+        full_f = _fp(full)
+        full_lexical_f = _fp(full_lexical)
         if (
-            any(d.owns_exactly(full, full_lexical) for d in page_dirs)
-            or any(d.contains_subtree(full, full_lexical) for d in sub_dirs)
+            any(d.owns_exactly(full_f, full_lexical_f) for d in page_dirs)
+            or any(d.contains_subtree(full_f, full_lexical_f) for d in sub_dirs)
         ):
             ancestor = _symlink_ancestor(output_dir, rel_path)
             if ancestor is not None:

@@ -27,6 +27,7 @@ This module welds each decision into exactly one shape:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -164,18 +165,40 @@ class ProtectedDir:
 
 
 def build_protected(
-    output_dir: Path, protection: ProtectionSet
+    output_dir: Path,
+    protection: ProtectionSet,
+    fold: Callable[[str], str] | None = None,
 ) -> tuple[list[ProtectedDir], list[ProtectedDir]]:
     """Compile a ``ProtectionSet`` into ``(page_exact_dirs, subtree_dirs)`` of
     ``ProtectedDir``, each carrying both path forms with ``output_dir`` self-
     excluded per-form. Built ONCE and shared by ``_remove_stale_files`` and
-    ``_restore_protected_deletions`` so the two can never drift."""
-    out_resolved = output_dir.resolve()
-    out_absolute = output_dir.absolute()
+    ``_restore_protected_deletions`` so the two can never drift.
+
+    Each stored path form is run through ``fold`` — the SAME case/NFC fold the
+    prune applies to its staleness key — so a protected dir whose on-disk case or
+    Unicode form differs from this run's planned name still matches. Without it, a
+    case-only title change on a case-insensitive filesystem makes the protected
+    page compare unequal to its committed (other-case) path and the prune deletes
+    it (#44). ``fold`` is applied PER FORM, so the resolved/lexical dual remains two
+    independent symlink-safe values (never unioned).
+
+    CONTRACT: this is half of a "compiled once, shared, cannot drift" pair — the
+    matchers it returns are queried by ``_remove_stale_files`` /
+    ``_restore_protected_deletions``, which MUST fold the queried file forms with
+    the SAME function or matching silently drifts and a protected dir is pruned
+    (#44). Production (``commit_export``) probes the FS once and threads one fold to
+    all three, so they always agree. ``fold`` defaults to identity (a no-op) — NOT
+    the prune's fold (that is ``nfc`` on a case-sensitive FS, which still folds
+    NFD→NFC, and ``nfc_casefold`` on a case-insensitive one). The identity default
+    is for unit tests over fold-invariant/ASCII inputs only; any direct caller that
+    pairs this with a consumer MUST pass that consumer's exact fold."""
+    f = fold or (lambda s: s)
+    out_resolved = Path(f(str(output_dir.resolve())))
+    out_absolute = Path(f(str(output_dir.absolute())))
 
     def compile_dir(p: Path) -> ProtectedDir:
-        resolved = p.resolve()
-        lexical = p.absolute()
+        resolved = Path(f(str(p.resolve())))
+        lexical = Path(f(str(p.absolute())))
         return ProtectedDir(
             resolved=(resolved if resolved != out_resolved else None),
             lexical=(lexical if lexical != out_absolute else None),

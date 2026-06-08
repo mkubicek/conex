@@ -497,6 +497,83 @@ class TestCommitExport:
         assert (tmp_path / "P" / "P.md").exists()  # and still on disk
         assert "Gone/Gone.md" not in ls  # genuine upstream deletion still pruned
 
+    def test_case_only_recased_protected_page_survives_prune(self, tmp_path):
+        """#44: on a case-insensitive FS a page whose title changed only in case is
+        protected at the NEW case while its committed dir is still the OLD case. The
+        prune folds case for its staleness key but used to match protection
+        case-sensitively, so the protected page was silently git-rm'd. It must fold
+        protection too. (_fs_is_case_insensitive is forced so Linux CI exercises the
+        folded path deterministically.)"""
+        self._init_repo(tmp_path)
+        (tmp_path / "Foo").mkdir()
+        (tmp_path / "Foo" / "Foo.md").write_text("# Foo last-good")
+        (tmp_path / "Other").mkdir()
+        (tmp_path / "Other" / "Other.md").write_text("# Other")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        with patch("confluence_export.git._fs_is_case_insensitive", return_value=True):
+            commit_export(
+                tmp_path, [tmp_path / "Other" / "Other.md"], "TEST",
+                is_full=True, protection=_prot(subtrees=[tmp_path / "FOO"]),
+            )
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Foo/Foo.md" in ls  # protected despite case-only drift, not pruned
+        assert (tmp_path / "Foo" / "Foo.md").exists()  # and kept on disk
+        assert "Other/Other.md" in ls
+
+    def test_case_only_recased_protected_deletion_is_restored(self, tmp_path):
+        """#44: the restore folds case too, so a protected re-cased page whose
+        old-case file reconcile removed from disk is re-checked-out from HEAD
+        (RF-B heal), instead of being left a tracked deletion the next run drops."""
+        self._init_repo(tmp_path)
+        (tmp_path / "Foo").mkdir()
+        (tmp_path / "Foo" / "Foo.md").write_text("# Foo last-good")
+        (tmp_path / "Live").mkdir()
+        (tmp_path / "Live" / "Live.md").write_text("# Live")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        # Simulate reconcile having removed the old-case file from disk.
+        (tmp_path / "Foo" / "Foo.md").unlink()
+
+        with patch("confluence_export.git._fs_is_case_insensitive", return_value=True):
+            commit_export(
+                tmp_path, [tmp_path / "Live" / "Live.md"], "TEST",
+                is_full=True, protection=_prot(subtrees=[tmp_path / "FOO"]),
+            )
+
+        assert (tmp_path / "Foo" / "Foo.md").exists()  # restored from HEAD
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Foo/Foo.md" in ls
+
+    def test_case_only_recased_protected_media_kept_on_no_media_run(self, tmp_path):
+        """#44 (--no-media / RF-C): committed media under a re-cased protected page
+        must be kept, not pruned, when the protection's case differs from the
+        committed media path. Exercises the folded media-keep predicate."""
+        self._init_repo(tmp_path)
+        media = tmp_path / "Foo" / ".media" / "img.png"
+        media.parent.mkdir(parents=True)
+        media.write_bytes(b"\x89PNG")
+        (tmp_path / "Foo" / "Foo.md").write_text("# Foo")
+        (tmp_path / "Live").mkdir()
+        (tmp_path / "Live" / "Live.md").write_text("# Live")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        # --no-media full export; Foo skipped & protected at the new (upper) case.
+        with patch("confluence_export.git._fs_is_case_insensitive", return_value=True):
+            commit_export(
+                tmp_path, [tmp_path / "Live" / "Live.md"], "TEST",
+                is_full=True, preserve_media=True,
+                protection=_prot(subtrees=[tmp_path / "FOO"]),
+            )
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Foo/.media/img.png" in ls  # committed media kept under case drift
+        assert media.exists()
+
     def test_page_exact_protection_not_child(self, tmp_path):
         """PageExactProtection is page-EXACT (e.g. an archived page whose precise
         target is known, M1-exact): it preserves the page's own files but NOT a
@@ -1315,6 +1392,29 @@ class TestGitDefensiveBranches:
 
         monkeypatch.setattr(G, "_run_git", fake)
         G._remove_stale_files(tmp_path, [])  # hits the empty-index guard; no raise
+
+    def test_restore_protected_deletions_without_fold_probes_fs(self, tmp_path):
+        # Covers the fold=None PROBE fallback in _restore_protected_deletions.
+        # Uses a fold-invariant (lowercase ASCII) name so the identity-built
+        # protection and the probed fold agree on either FS; the fold SEMANTICS are
+        # exercised by the FS-patched case-drift tests and the build_protected unit
+        # tests, not here.
+        from confluence_export import git as G
+        from confluence_export.protection import build_protected
+
+        ensure_repo(tmp_path)
+        (tmp_path / "page").mkdir()
+        (tmp_path / "page" / "page.md").write_text("# page")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "i"], cwd=tmp_path, capture_output=True)
+
+        (tmp_path / "page" / "page.md").unlink()  # tracked deletion under protection
+        _, sub = build_protected(
+            tmp_path, ProtectionSet(subtrees=(SubtreeProtection(tmp_path / "page"),))
+        )
+        G._restore_protected_deletions(tmp_path, page_dirs=[], sub_dirs=sub)  # no fold
+
+        assert (tmp_path / "page" / "page.md").exists()  # restored from HEAD
 
     def test_remove_stale_files_warns_when_rm_fails(self, tmp_path, monkeypatch, capsys):
         from confluence_export import git as G

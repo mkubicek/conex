@@ -9,6 +9,7 @@ instead of a buried end-to-end prune path. This file is that boundary.
 from pathlib import Path
 
 from confluence_export.media import MEDIA_DIR_NAME
+from confluence_export.paths import nfc_casefold
 from confluence_export.protection import (
     PageExactProtection,
     ProtectedDir,
@@ -89,6 +90,62 @@ class TestBuildProtected:
         assert d.resolved == outside.resolve()  # resolved follows the symlink
         assert d.lexical == link.absolute()  # lexical does not
         assert d.resolved != d.lexical
+
+
+class TestBuildProtectedCaseFold:
+    """#44: with a case/Unicode fold, a protected dir matches a committed path that
+    differs only in case — the prune folds its staleness key, so protection must
+    fold too or a re-cased page is silently pruned. Folding is applied PER FORM so
+    the resolved/lexical symlink dual is preserved. FS-independent (the fold is
+    passed explicitly, not probed)."""
+
+    @staticmethod
+    def _f(p: Path) -> Path:
+        return Path(nfc_casefold(str(p)))
+
+    def test_folded_subtree_matches_other_case_file(self, tmp_path):
+        out = tmp_path / "out"
+        out.mkdir()
+        _, sub = build_protected(
+            out, ProtectionSet(subtrees=(SubtreeProtection(out / "FOO"),)), fold=nfc_casefold
+        )
+        committed = out / "Foo" / "Foo.md"  # same dir, different case
+        assert sub[0].contains_subtree(
+            self._f(committed.resolve()), self._f(committed.absolute())
+        )
+
+    def test_folded_page_exact_matches_other_case_owned_file(self, tmp_path):
+        out = tmp_path / "out"
+        out.mkdir()
+        page, _ = build_protected(
+            out, ProtectionSet(page_exact=(PageExactProtection(out / "FOO"),)), fold=nfc_casefold
+        )
+        owned = out / "Foo" / "Foo.md"
+        assert page[0].owns_exactly(
+            self._f(owned.resolve()), self._f(owned.absolute())
+        )
+
+    def test_identity_fold_stays_case_sensitive(self, tmp_path):
+        # The identity default does no folding, so a different-case file does NOT
+        # match. (It is a test-only no-op — NOT the prune's case-sensitive-FS fold,
+        # which is `nfc` and still folds NFD→NFC; see build_protected's contract.)
+        out = tmp_path / "out"
+        out.mkdir()
+        _, sub = build_protected(out, ProtectionSet(subtrees=(SubtreeProtection(out / "FOO"),)))
+        other = out / "Foo" / "Foo.md"
+        assert not sub[0].contains_subtree(other.resolve(), other.absolute())
+
+    def test_fold_does_not_overmatch_sibling(self, tmp_path):
+        # Folding must not make 'Foo' protect 'Foobar' — distinct dirs stay distinct.
+        out = tmp_path / "out"
+        out.mkdir()
+        _, sub = build_protected(
+            out, ProtectionSet(subtrees=(SubtreeProtection(out / "Foo"),)), fold=nfc_casefold
+        )
+        sibling = out / "Foobar" / "x.md"
+        assert not sub[0].contains_subtree(
+            self._f(sibling.resolve()), self._f(sibling.absolute())
+        )
 
 
 class TestProtectedDirDualForm:
