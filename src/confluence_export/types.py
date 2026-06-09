@@ -144,9 +144,11 @@ class Attachment:
         links = data.get("_links", {})
         return cls(
             id=str(data.get("id", "")),
-            title=data.get("title", ""),
-            media_type=data.get("mediaType", ""),
-            media_type_description=data.get("mediaTypeDescription", ""),
+            # `or ""`: the API/cache can carry an explicit null (the key default
+            # only applies when absent); None crashes .casefold() consumers (#47).
+            title=data.get("title") or "",
+            media_type=data.get("mediaType") or "",
+            media_type_description=data.get("mediaTypeDescription") or "",
             file_size=data.get("fileSize", 0),
             page_id=str(data.get("pageId", "")),
             comment=data.get("comment", ""),

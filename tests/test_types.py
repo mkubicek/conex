@@ -96,6 +96,16 @@ class TestAttachment:
         assert a.download_link == "/wiki/download/att1"
         assert a.file_size == 1024
 
+    def test_from_api_null_strings_coalesced(self):
+        # #47: the API/cache can carry an explicit null for these fields (the
+        # dict-key defaults only apply when the key is ABSENT); a None would
+        # crash every .casefold()/.endswith() consumer (the drawio matchers).
+        data = {"id": "att1", "title": None, "mediaType": None, "mediaTypeDescription": None}
+        a = Attachment.from_api(data)
+        assert a.title == ""
+        assert a.media_type == ""
+        assert a.media_type_description == ""
+
     def test_round_trip(self):
         a = Attachment(id="a1", title="f.pdf", media_type="application/pdf",
                        file_size=2048, page_id="p1",

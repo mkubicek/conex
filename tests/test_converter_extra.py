@@ -852,3 +852,14 @@ def test_nested_decision_list_not_double_rendered():
     result = _preprocess_html(html, [])
     assert result.count("Inner") == 1
     assert result.count("Outer") == 1
+
+
+def test_drawio_matcher_tolerates_null_media_type_attachment():
+    # #47: a sibling attachment with "title"/"mediaType": null must not crash
+    # _match_drawio_attachment's _is_drawio scan while matching another one.
+    from confluence_export.converter import _match_drawio_attachment
+
+    noise = Attachment.from_api({"id": "a", "title": None, "mediaType": None})
+    target = Attachment.from_api({"id": "b", "title": "arch.drawio", "mediaType": None})
+    attach_map = {noise.title: noise, target.title: target}
+    assert _match_drawio_attachment("arch", attach_map) is target
