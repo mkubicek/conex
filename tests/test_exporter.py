@@ -736,6 +736,44 @@ class TestMediaDownload:
             # Verify media dir was created and passed
             assert mock_dl.call_args[0][2].name == ".media"
 
+    def test_sweeps_stale_temp_artifacts_before_download(self, tmp_path):
+        # #48: temps a hard-killed earlier run left in .media are swept at the
+        # start of the media phase. The run's own .rollback- snapshots are
+        # created right after the sweep, so they are never caught by it.
+        exporter, _, _ = _make_exporter(download_media=True)
+        att = Attachment(id="a1", title="img.png", file_size=100,
+                         download_link="/wiki/download/a1", page_id="p1")
+        page = _make_page()
+        cs = _make_cached_space(attachments={"p1": [att]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / ".download-stale.tmp").write_bytes(b"x")
+        (media_dir / ".rollback-stale.tmp").write_bytes(b"x")
+
+        with patch("confluence_export.exporter.download_attachments") as mock_dl:
+            mock_dl.return_value = []
+            exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert not (media_dir / ".download-stale.tmp").exists()
+        assert not (media_dir / ".rollback-stale.tmp").exists()
+
+    def test_no_media_sweeps_stale_temp_artifacts(self, tmp_path):
+        # #48: the materialize (no-download) branch sweeps too.
+        exporter, _, _ = _make_exporter(download_media=False)
+        att = Attachment(id="att1", title="img.png", file_size=100, page_id="p1",
+                         download_link="/wiki/download/att1")
+        page = _make_page()
+        cs = _make_cached_space(attachments={"p1": [att]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        stale = media_dir / ".preserve-stale"
+        stale.mkdir()
+        (stale / "0").write_bytes(b"x")
+
+        exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert not stale.exists()
+
     def test_no_media_materializes_planned_name_from_existing_manifest(self, tmp_path):
         exporter, _, _ = _make_exporter(download_media=False)
         moved = Attachment(

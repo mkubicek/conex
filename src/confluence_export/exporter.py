@@ -41,6 +41,7 @@ from confluence_export.media import (
     download_attachments,
     ensure_media_dir,
     materialize_existing_attachments,
+    sweep_stale_media_temps,
 )
 from confluence_export.tree import (
     build_tree,
@@ -639,6 +640,9 @@ class Exporter:
         try:
             if self.download_media and attachments:
                 media_dir = ensure_media_dir(page_dir)
+                # Sweep BEFORE the first snapshot_file: this run's own
+                # .rollback- snapshots live in media_dir too (#48).
+                sweep_stale_media_temps(media_dir)
                 snapshot_file(media_dir / _VERSIONS_FILE)
                 for name in current_attachment_names:
                     snapshot_file(resolve_within(media_dir, name))
@@ -655,6 +659,7 @@ class Exporter:
                             f"refusing to use symlinked media directory: {existing_media_dir}"
                         )
                     media_dir = existing_media_dir
+                    sweep_stale_media_temps(media_dir)
                     snapshot_file(media_dir / _VERSIONS_FILE)
                     snapshot_manifest_owned_files(media_dir)
                     for name in current_attachment_names:

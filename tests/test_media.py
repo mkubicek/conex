@@ -1554,3 +1554,74 @@ class TestRecordDownloadWarning:
         # The helper still prints when no collector is supplied.
         _record_download_warning(_att(title="x.png"), ValueError("nope"), None)
         assert "failed to download x.png" in capsys.readouterr().err
+
+
+class TestSweepStaleMediaTemps:
+    """#48: leftover atomic-write/rollback temp artifacts from a hard-killed run
+    are swept at the start of the next run's media phase."""
+
+    def test_removes_all_temp_artifact_kinds(self, tmp_path):
+        from confluence_export.media import sweep_stale_media_temps
+
+        media = tmp_path / ".media"
+        media.mkdir()
+        (media / ".download-abc123.tmp").write_bytes(b"x")
+        (media / ".copy-abc123.tmp").write_bytes(b"x")
+        (media / ".versions-abc123.tmp").write_bytes(b"x")
+        (media / ".rollback-abc123.tmp").write_bytes(b"x")
+        preserve = media / ".preserve-abc123"
+        preserve.mkdir()
+        (preserve / "0").write_bytes(b"snap")
+        # The live manifest and real media files must survive.
+        (media / _VERSIONS_FILE).write_text("{}")
+        (media / "img.png").write_bytes(b"real")
+
+        sweep_stale_media_temps(media)
+
+        assert sorted(p.name for p in media.iterdir()) == [_VERSIONS_FILE, "img.png"]
+
+    def test_unremovable_entry_is_skipped_not_fatal(self, tmp_path):
+        from pathlib import Path as _P
+
+        from confluence_export.media import sweep_stale_media_temps
+
+        media = tmp_path / ".media"
+        media.mkdir()
+        (media / ".download-a.tmp").write_bytes(b"x")
+        with patch.object(_P, "unlink", side_effect=OSError("busy")):
+            sweep_stale_media_temps(media)  # best-effort: no raise
+        assert (media / ".download-a.tmp").exists()
+
+    def test_symlinked_preserve_entry_unlinked_without_following(self, tmp_path):
+        from confluence_export.media import sweep_stale_media_temps
+
+        media = tmp_path / ".media"
+        media.mkdir()
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "keep.txt").write_text("keep")
+        (media / ".preserve-link").symlink_to(target, target_is_directory=True)
+
+        sweep_stale_media_temps(media)
+
+        assert not (media / ".preserve-link").is_symlink()
+        assert (target / "keep.txt").exists()  # never rmtree'd through the link
+
+    def test_mid_snapshot_failure_cleans_up_preserve_dir(self, tmp_path):
+        # #48: a copy2 raise happens before the caller binds tmp_dir to its
+        # try/finally, so without the internal cleanup the .preserve- dir
+        # lingered until GC.
+        from confluence_export.media import _manifest_entry, _snapshot_previous_owned_files
+
+        media = tmp_path / ".media"
+        media.mkdir()
+        att = _att(title="new.png")
+        versions = {"old.png": _manifest_entry(att)}
+        (media / "old.png").write_bytes(b"bytes")
+        name_plan = plan_attachment_names([att])
+
+        with patch("confluence_export.media.shutil.copy2", side_effect=OSError("disk full")):
+            with pytest.raises(OSError, match="disk full"):
+                _snapshot_previous_owned_files(versions, media, [att], name_plan, set())
+
+        assert list(media.glob(".preserve-*")) == []

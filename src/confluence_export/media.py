@@ -77,6 +77,38 @@ def migrate_media_dirs(root_dir: Path) -> list[tuple[Path, Path]]:
     return renamed
 
 
+# Dot-prefixed temp artifacts of the atomic-write/rollback machinery. A hard
+# kill (SIGKILL / power loss) between create and cleanup can leave them behind;
+# they are never staged or pruned (commit_export stages explicit paths, the
+# stale-prune walks tracked files only), so the worst case is untracked litter
+# the user notices. safe_attachment_name rejects leading-dot titles, so no real
+# attachment can ever carry one of these names — and the live ".versions.json"
+# matches none of the patterns.
+_TEMP_ARTIFACT_PATTERNS = (
+    ".download-*.tmp",
+    ".copy-*.tmp",
+    ".versions-*.tmp",
+    ".rollback-*.tmp",
+    ".preserve-*",
+)
+
+
+def sweep_stale_media_temps(media_dir: Path) -> None:
+    """Best-effort removal of temp artifacts a hard-killed earlier run left in
+    ``media_dir`` (#48). MUST run before the current run creates its own temps
+    and rollback snapshots there — anything matching at that point is stale by
+    definition; afterwards it would delete the live transaction's files."""
+    for pattern in _TEMP_ARTIFACT_PATTERNS:
+        for stale in media_dir.glob(pattern):
+            try:
+                if stale.is_dir() and not stale.is_symlink():
+                    shutil.rmtree(stale, ignore_errors=True)
+                else:
+                    stale.unlink()
+            except OSError:
+                continue
+
+
 def _load_versions(media_dir: Path) -> dict:
     """Load the version manifest from a media directory."""
     p = media_dir / _VERSIONS_FILE
@@ -339,17 +371,24 @@ def _snapshot_previous_owned_files(
 ) -> tuple[dict[int, tuple[str, Path, object, Path]], tempfile.TemporaryDirectory | None]:
     snapshots: dict[int, tuple[str, Path, object, Path]] = {}
     tmp_dir: tempfile.TemporaryDirectory | None = None
-    for index, att in enumerate(attachments):
-        name = name_plan.for_attachment(att)
-        found = _find_previous_owned_file(versions, media_dir, name, att, collision_bases)
-        if found is None:
-            continue
-        old_name, old_path, old_record = found
-        if tmp_dir is None:
-            tmp_dir = tempfile.TemporaryDirectory(dir=media_dir, prefix=".preserve-")
-        snapshot_path = Path(tmp_dir.name) / f"{index}"
-        shutil.copy2(old_path, snapshot_path)
-        snapshots[id(att)] = (old_name, snapshot_path, old_record, old_path)
+    try:
+        for index, att in enumerate(attachments):
+            name = name_plan.for_attachment(att)
+            found = _find_previous_owned_file(versions, media_dir, name, att, collision_bases)
+            if found is None:
+                continue
+            old_name, old_path, old_record = found
+            if tmp_dir is None:
+                tmp_dir = tempfile.TemporaryDirectory(dir=media_dir, prefix=".preserve-")
+            snapshot_path = Path(tmp_dir.name) / f"{index}"
+            shutil.copy2(old_path, snapshot_path)
+            snapshots[id(att)] = (old_name, snapshot_path, old_record, old_path)
+    except Exception:
+        # A raise here happens before the caller binds tmp_dir to its
+        # try/finally, which would leave the .preserve- dir behind until GC (#48).
+        if tmp_dir is not None:
+            tmp_dir.cleanup()
+        raise
     return snapshots, tmp_dir
 
 
