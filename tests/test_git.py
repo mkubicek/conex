@@ -1395,11 +1395,13 @@ class TestGitDefensiveBranches:
 
     def test_restore_protected_deletions_without_fold_probes_fs(self, tmp_path):
         # Covers the fold=None PROBE fallback in _restore_protected_deletions.
-        # Uses a fold-invariant (lowercase ASCII) name so the identity-built
-        # protection and the probed fold agree on either FS; the fold SEMANTICS are
-        # exercised by the FS-patched case-drift tests and the build_protected unit
-        # tests, not here.
+        # Per the build_protected contract, build with the same fold the consumer
+        # will use — here the probed FS fold, since the consumer gets fold=None.
+        # An identity-built protection is NOT enough even with a lowercase leaf
+        # name: on macOS pytest's tmp_path contains an uppercase /T/ component,
+        # which the probed nfc_casefold lowercases on the query side only.
         from confluence_export import git as G
+        from confluence_export.paths import nfc, nfc_casefold
         from confluence_export.protection import build_protected
 
         ensure_repo(tmp_path)
@@ -1409,8 +1411,9 @@ class TestGitDefensiveBranches:
         subprocess.run(["git", "commit", "-m", "i"], cwd=tmp_path, capture_output=True)
 
         (tmp_path / "page" / "page.md").unlink()  # tracked deletion under protection
+        fold = nfc_casefold if G._fs_is_case_insensitive(tmp_path) else nfc
         _, sub = build_protected(
-            tmp_path, ProtectionSet(subtrees=(SubtreeProtection(tmp_path / "page"),))
+            tmp_path, ProtectionSet(subtrees=(SubtreeProtection(tmp_path / "page"),)), fold
         )
         G._restore_protected_deletions(tmp_path, page_dirs=[], sub_dirs=sub)  # no fold
 
