@@ -834,3 +834,21 @@ def test_untitled_expand_does_not_steal_nested_panel_title():
     assert "<h4>Details</h4>" in result
     assert result.count("Inner") == 1
     assert "Body" in result
+
+
+def test_nested_decision_list_not_double_rendered():
+    # #43: a decisionList nested inside a decisionItem is not producible by real
+    # Confluence ADF (item content is inline-only) — hardening. The outer list's
+    # recursive item scan must not emit the inner list's items a second time.
+    html = (
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem" state="DECIDED"><p>Outer</p>'
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem"><p>Inner</p></ac:adf-node>'
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("Inner") == 1
+    assert result.count("Outer") == 1

@@ -216,15 +216,20 @@ def _preprocess_html(
     # list structure and the decided/undecided state (issue #40). A decisionItem's
     # state lives in a ``state`` node attribute ("DECIDED"); its text is in child
     # nodes. Render each list as a bullet list; mark decided items with a ✓.
-    for dlist in list(soup.find_all(
-        lambda t: t.name == "ac:adf-node"
-        and t.get("type") in ("decisionList", "decision-list")
-    )):
+    def _is_decision_list(t: Tag) -> bool:
+        return t.name == "ac:adf-node" and t.get("type") in ("decisionList", "decision-list")
+
+    def _is_decision_item(t: Tag) -> bool:
+        return t.name == "ac:adf-node" and t.get("type") in ("decisionItem", "decision-item")
+
+    for dlist in list(soup.find_all(_is_decision_list)):
         ul = soup.new_tag("ul")
-        for item in dlist.find_all(
-            lambda t: t.name == "ac:adf-node"
-            and t.get("type") in ("decisionItem", "decision-item")
-        ):
+        for item in dlist.find_all(_is_decision_item):
+            # Items of a nested decisionList (not real ADF — item content is
+            # inline-only — but harden anyway, #43) belong to that inner list;
+            # emitting them here too would duplicate them.
+            if item.find_parent(_is_decision_list) is not dlist:
+                continue
             text = item.get_text().strip()
             if not text:
                 continue
