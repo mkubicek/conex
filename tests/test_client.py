@@ -273,7 +273,10 @@ class TestApiMethods:
 
 
 class TestMaxRetriesExhausted:
-    def test_raises_runtime_error(self):
+    def test_429_exhausted_raises_typed_http_error(self):
+        # #46: a sustained 429 must surface the typed HTTPError (a
+        # RequestException the CLI handler catches), not a generic RuntimeError
+        # that escapes it as a raw traceback.
         client = _make_client()
         with patch.object(client.session, "get") as mock_get, \
              patch("confluence_export.client.time.sleep"):
@@ -283,8 +286,20 @@ class TestMaxRetriesExhausted:
             mock_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(response=mock_resp)
             mock_get.return_value = mock_resp
 
-            with pytest.raises(RuntimeError, match="Max retries"):
+            with pytest.raises(requests.exceptions.HTTPError) as excinfo:
                 client._get("/test", max_retries=3)
+            assert excinfo.value.response.status_code == 429
+            # Two retries were attempted before the final raise.
+            assert mock_get.call_count == 3
+
+    def test_zero_retries_backstop_raises_runtime_error(self):
+        # max_retries=0 skips the request loop entirely; the defensive backstop
+        # raise is all that's left (every in-loop path now returns or raises).
+        client = _make_client()
+        with pytest.raises(RuntimeError, match="Max retries"):
+            client._get("/test", max_retries=0)
+        with pytest.raises(RuntimeError, match="Max retries"):
+            client._get_raw("/test", max_retries=0)
 
 
 class TestGetRaw:
@@ -809,13 +824,15 @@ class TestGetRawRetryAndRateLimit:
             with pytest.raises(requests.exceptions.HTTPError):
                 client._get_raw("/d", max_retries=2)
 
-    def test_get_raw_429_exhausted_raises_runtime(self):
+    def test_get_raw_429_exhausted_raises_typed_http_error(self):
+        # #46: mirror the 5xx branch — exhausted 429 raises the typed HTTPError.
         client = _make_client()
         with patch.object(client.session, "get") as mock_get, \
              patch("confluence_export.client.time.sleep"):
             mock_get.return_value = self._http_error(429, retry_after=0)
-            with pytest.raises(RuntimeError, match="Max retries"):
+            with pytest.raises(requests.exceptions.HTTPError) as excinfo:
                 client._get_raw("/d", max_retries=2)
+            assert excinfo.value.response.status_code == 429
 
     def test_get_raw_connection_error_exhausted_raises(self):
         client = _make_client()

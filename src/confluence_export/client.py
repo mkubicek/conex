@@ -209,17 +209,23 @@ class ConfluenceClient:
             if status in (401, 403):
                 raise AuthenticationError(status, url) from exc
             if status == 429:
-                # Retry-After is normally delta-seconds, but a proxy/gateway can send
-                # an HTTP-date (or junk). Don't let int() raise a ValueError that would
-                # escape the (HTTPError, ConnectionError)-only except and crash a
-                # retryable 429; fall back to 60s.
-                try:
-                    retry_after = float(exc.response.headers.get("Retry-After", 60))
-                except (TypeError, ValueError):
-                    retry_after = 60.0
-                self._log(f"Rate limited, waiting {retry_after}s")
-                self._note_rate_limit(retry_after)
-                return
+                if attempt < max_retries - 1:
+                    # Retry-After is normally delta-seconds, but a proxy/gateway can
+                    # send an HTTP-date (or junk). Don't let int() raise a ValueError
+                    # that would escape the (HTTPError, ConnectionError)-only except
+                    # and crash a retryable 429; fall back to 60s.
+                    try:
+                        retry_after = float(exc.response.headers.get("Retry-After", 60))
+                    except (TypeError, ValueError):
+                        retry_after = 60.0
+                    self._log(f"Rate limited, waiting {retry_after}s")
+                    self._note_rate_limit(retry_after)
+                    return
+                # Exhausted: surface the typed HTTPError (status 429 + Retry-After)
+                # like the 5xx branch below, so the CLI's RequestException handler
+                # reports it cleanly — the generic RuntimeError fallback isn't a
+                # RequestException and escaped that handler as a traceback (#46).
+                raise exc
             if status >= 500 and attempt < max_retries - 1:
                 self._backoff(attempt)
                 return
