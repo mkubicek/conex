@@ -798,3 +798,39 @@ def test_ac_image_resolves_id_specific_local_name_via_content_id():
     result = _preprocess_html(html, atts)
     assert ".media/shot-id2.png" in result
     assert 'src=".media/shot.png"' not in result
+
+
+# -- #45: untitled panel/expand must not steal a nested macro's title ---------
+
+def test_untitled_panel_does_not_steal_nested_macro_title():
+    # #45: the recursive title lookup reached INTO the nested status macro and
+    # stole its title param — the Info header became "DONE" and the status text
+    # was emitted twice (once as the header, once by the nested conversion).
+    html = (
+        '<ac:structured-macro ac:name="info"><ac:rich-text-body>'
+        '<ac:structured-macro ac:name="status">'
+        '<ac:parameter ac:name="title">DONE</ac:parameter>'
+        "</ac:structured-macro>Some text"
+        "</ac:rich-text-body></ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [])
+    assert "<strong>Info</strong>" in result
+    assert result.count("DONE") == 1
+    assert "Some text" in result
+
+
+def test_untitled_expand_does_not_steal_nested_panel_title():
+    # #45: same steal in _convert_expand — an untitled expand around a titled
+    # inner panel must fall back to "Details", and the inner panel must keep its
+    # own header (one "Inner", not an expand header + a panel header).
+    html = (
+        '<ac:structured-macro ac:name="expand"><ac:rich-text-body>'
+        '<ac:structured-macro ac:name="info">'
+        '<ac:parameter ac:name="title">Inner</ac:parameter>'
+        "<ac:rich-text-body><p>Body</p></ac:rich-text-body>"
+        "</ac:structured-macro></ac:rich-text-body></ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [])
+    assert "<h4>Details</h4>" in result
+    assert result.count("Inner") == 1
+    assert "Body" in result

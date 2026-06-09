@@ -510,10 +510,12 @@ def _replace_ac_link(
 
 def _convert_panel(soup: BeautifulSoup, macro: Tag, macro_name: str) -> None:
     """Convert info/tip/note/warning/panel to blockquotes."""
-    title_param = macro.find("ac:parameter", attrs={"ac:name": "title"})
+    # Direct children only (#45): a recursive lookup on an untitled panel reached
+    # into a nested macro and stole its title (wrong header + duplicated text).
+    title_param = macro.find("ac:parameter", attrs={"ac:name": "title"}, recursive=False)
     title = title_param.get_text().strip() if title_param else macro_name.capitalize()
 
-    body = macro.find("ac:rich-text-body")
+    body = macro.find("ac:rich-text-body", recursive=False)
 
     blockquote = soup.new_tag("blockquote")
     strong = soup.new_tag("strong")
@@ -573,10 +575,12 @@ def _convert_status(soup: BeautifulSoup, macro: Tag) -> None:
 
 def _convert_expand(soup: BeautifulSoup, macro: Tag) -> None:
     """Convert expand macro to a details/summary block (rendered as heading + content)."""
-    title_param = macro.find("ac:parameter", attrs={"ac:name": "title"})
+    # Direct children only (#45): see _convert_panel — an untitled expand must not
+    # steal a nested macro's title or body.
+    title_param = macro.find("ac:parameter", attrs={"ac:name": "title"}, recursive=False)
     title = title_param.get_text().strip() if title_param else "Details"
 
-    body = macro.find("ac:rich-text-body")
+    body = macro.find("ac:rich-text-body", recursive=False)
 
     # Heading + content. Move the LIVE body children (not a re-parsed copy) so a
     # macro nested in the expand body — e.g. a drawio diagram — stays attached and
