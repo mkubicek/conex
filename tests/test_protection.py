@@ -356,3 +356,31 @@ class TestMediaOwnerDirsFromWrittenFiles:
         inside = out / "Page" / MEDIA_DIR_NAME / "b.png"
         owners = media_owner_dirs_from_written_files(out, [outside, inside])
         assert owners == frozenset({(out / "Page").resolve()})
+
+
+def test_folded_subtree_matches_nfd_committed_path_with_nfc_fold(tmp_path):
+    # The OTHER #44 axis: Unicode-form drift on a case-SENSITIVE filesystem,
+    # where the shared fold is plain nfc (no casefold). A protected dir
+    # registered in NFD must match a committed path in NFC form.
+    import unicodedata
+
+    from confluence_export.paths import nfc
+    from confluence_export.protection import (
+        ProtectionSet,
+        SubtreeProtection,
+        build_protected,
+    )
+
+    out = tmp_path / "out"
+    out.mkdir()
+    name_nfd = unicodedata.normalize("NFD", "Übersicht")
+    name_nfc = unicodedata.normalize("NFC", "Übersicht")
+    assert name_nfd != name_nfc
+
+    _, sub = build_protected(
+        out, ProtectionSet(subtrees=(SubtreeProtection(out / name_nfd),)), fold=nfc
+    )
+    committed = out / name_nfc / "x.md"
+    folded_resolved = Path(nfc(str(committed.resolve())))
+    folded_lexical = Path(nfc(str(committed.absolute())))
+    assert sub[0].contains_subtree(folded_resolved, folded_lexical)

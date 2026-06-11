@@ -231,9 +231,11 @@ def media_file_is_preserved(
     not force-pruned; OR the owner is page-exact protected; OR the owner lives under
     a recursively-protected subtree.
 
-    RESOLVED-ONLY by construction: ``owner`` is already a resolved path and the old
-    inline check (``owner in protected`` / ``is_relative_to`` over the resolved
-    subtree set) had no lexical variant, so this queries ``d.resolved`` only — never
+    RESOLVED-ONLY by construction: ``owner`` is a resolved path FOLDED into the
+    shared comparison space (the caller applies the same fold the matchers and
+    written/preserved sets were built with, #44), and the old inline check
+    (``owner in protected`` / ``is_relative_to`` over the resolved subtree set)
+    had no lexical variant, so this queries ``d.resolved`` only — never
     ``d.lexical`` — preserving that asymmetry exactly."""
     keep_by_write = (
         owner in written_page_dirs

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 import subprocess
@@ -193,7 +194,7 @@ def commit_export(
         # protection matchers AND the staleness key, so a protected dir whose
         # committed path differs only in case/Unicode form from this run's planned
         # name is matched rather than pruned (#44). Probe the FS once here.
-        fold = nfc_casefold if _fs_is_case_insensitive(output_dir) else nfc
+        fold = _fold_for(output_dir)
         page_dirs, sub_dirs = build_protected(output_dir, protection, fold)
         # DATA-SAFETY DECISION 1: prune ONLY when this run actually wrote live
         # pages. A full export that wrote nothing has no authority to reconcile
@@ -240,7 +241,10 @@ def _fs_is_case_insensitive(output_dir: Path) -> bool:
 
     The probe is a uniquely-named temp file created with O_EXCL (via mkstemp), so
     it can never clobber or be spoofed by a real user file: it tests whether an
-    upper-cased variant of *that unique name* resolves to the same file."""
+    upper-cased variant of *that unique name* resolves to the same file.
+
+    Use ``_fold_for`` rather than calling this directly when choosing the
+    case/Unicode fold — that keeps the fold POLICY in one place (#44)."""
     try:
         fd, probe_name = tempfile.mkstemp(dir=output_dir, prefix=".conex-case-")
     except OSError:
@@ -255,6 +259,20 @@ def _fs_is_case_insensitive(output_dir: Path) -> bool:
             probe.unlink()
         except OSError:
             pass
+
+
+def _fold_for(output_dir: Path) -> Callable[[str], str]:
+    """The ONE case/Unicode fold policy for ``output_dir``'s filesystem:
+    NFC+casefold when it folds case, plain NFC otherwise. commit_export probes
+    once and threads the result to build_protected, the prune, and the restore;
+    the prune/restore ``fold=None`` fallbacks (direct callers, tests) call this
+    too, so the policy cannot drift between sites (#44)."""
+    return nfc_casefold if _fs_is_case_insensitive(output_dir) else nfc
+
+
+def _fold_path(fold: Callable[[str], str], p: Path) -> Path:
+    """Fold a path into the shared (#44) comparison space."""
+    return Path(fold(str(p)))
 
 
 def _remove_stale_files(
@@ -297,14 +315,17 @@ def _remove_stale_files(
     # this staleness key agree under case/Unicode drift (#44); fall back to probing
     # the FS for direct callers (tests).
     if fold is None:
-        fold = nfc_casefold if _fs_is_case_insensitive(output_dir) else nfc
+        fold = _fold_for(output_dir)
+    _fp = functools.partial(_fold_path, fold)
 
-    def _fp(p: Path) -> Path:
-        """Fold a path into the shared comparison space (same fold as the matchers)."""
-        return Path(fold(str(p)))
+    result = _run_git(output_dir, "ls-files", "-z", ".", check=False)
+    if result is None or not result.stdout.strip("\0"):
+        return
 
     # The media-keep predicate compares owner dirs against these sets, so fold them
     # too — otherwise a re-cased owner dir misses its own written/preserved entry.
+    # All three are only consulted under preserve_media, so don't build them
+    # otherwise.
     written_page_dirs = (
         frozenset(_fp(p) for p in page_dirs_from_written_files(output_dir, written_files))
         if preserve_media else frozenset()
@@ -313,11 +334,10 @@ def _remove_stale_files(
         frozenset(_fp(p) for p in media_owner_dirs_from_written_files(output_dir, written_files))
         if preserve_media else frozenset()
     )
-    prune_media_owners = frozenset(_fp(p) for p in prune_media_owners)
-
-    result = _run_git(output_dir, "ls-files", "-z", ".", check=False)
-    if result is None or not result.stdout.strip("\0"):
-        return
+    prune_media_owners = (
+        frozenset(_fp(p) for p in prune_media_owners)
+        if preserve_media else frozenset()
+    )
 
     written_keys = {fold(str(f.resolve())) for f in written_files}
 
@@ -353,13 +373,14 @@ def _remove_stale_files(
         # the restore — see protection.ProtectedDir (pair-argument is load-bearing).
         # Fold each form into the matchers' (folded) comparison space, per form so
         # the symlink-safe resolved/lexical dual is preserved (#44).
-        full_f = _fp(full)
+        full_key = fold(str(full))
+        full_f = Path(full_key)
         full_lexical_f = _fp(full_lexical)
         if any(d.owns_exactly(full_f, full_lexical_f) for d in page_dirs):
             continue
         if any(d.contains_subtree(full_f, full_lexical_f) for d in sub_dirs):
             continue
-        if fold(str(full)) not in written_keys:
+        if full_key not in written_keys:
             stale.append(rel_path)
 
     if stale:
@@ -411,10 +432,8 @@ def _restore_protected_deletions(
     # drift under case/Unicode (#44 / RF-B). commit_export passes it; fall back to
     # probing for direct callers.
     if fold is None:
-        fold = nfc_casefold if _fs_is_case_insensitive(output_dir) else nfc
-
-    def _fp(p: Path) -> Path:
-        return Path(fold(str(p)))
+        fold = _fold_for(output_dir)
+    _fp = functools.partial(_fold_path, fold)
 
     result = _run_git(output_dir, "ls-files", "--deleted", "-z", check=False)
     if result is None:  # pragma: no cover - transient git failure under load

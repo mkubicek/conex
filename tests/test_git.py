@@ -1401,7 +1401,6 @@ class TestGitDefensiveBranches:
         # name: on macOS pytest's tmp_path contains an uppercase /T/ component,
         # which the probed nfc_casefold lowercases on the query side only.
         from confluence_export import git as G
-        from confluence_export.paths import nfc, nfc_casefold
         from confluence_export.protection import build_protected
 
         ensure_repo(tmp_path)
@@ -1411,7 +1410,9 @@ class TestGitDefensiveBranches:
         subprocess.run(["git", "commit", "-m", "i"], cwd=tmp_path, capture_output=True)
 
         (tmp_path / "page" / "page.md").unlink()  # tracked deletion under protection
-        fold = nfc_casefold if G._fs_is_case_insensitive(tmp_path) else nfc
+        # The SAME policy helper the fold=None fallback calls — never re-derive
+        # the fold inline (#44: one policy, no drift).
+        fold = G._fold_for(tmp_path)
         _, sub = build_protected(
             tmp_path, ProtectionSet(subtrees=(SubtreeProtection(tmp_path / "page"),)), fold
         )
