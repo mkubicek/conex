@@ -28,6 +28,21 @@ class TestSpace:
         assert s.homepage_id == "42"
         assert s.webui == "/wiki/spaces/TEST"
 
+    def test_from_api_null_links_coalesced(self):
+        # #47 class: an explicit null _links must not crash from_api.
+        s = Space.from_api({"id": "1", "key": "TEST", "_links": None})
+        assert s.webui == ""
+        assert s.base == ""
+
+    def test_from_api_explicit_nulls_coalesced_everywhere(self):
+        # #47 class: space.key/name feed directory naming; a None crashes it.
+        s = Space.from_api({"id": None, "key": None, "name": None,
+                            "type": None, "status": None, "homepageId": None})
+        assert s.id == ""        # not the truthy string "None"
+        assert s.key == ""
+        assert s.name == ""
+        assert s.homepage_id == ""
+
 
 class TestVersion:
     def test_from_api_none(self):
@@ -57,6 +72,32 @@ class TestPage:
         assert p.id == "42"
         assert p.body_storage == "<p>content</p>"
         assert p.webui == "/wiki/42"
+
+    def test_from_api_null_links_coalesced(self):
+        # #47 class: an explicit null _links must not crash from_api.
+        p = Page.from_api({"id": "42", "title": "Hello", "_links": None})
+        assert p.webui == ""
+        assert p.editui == ""
+        assert p.tinyui == ""
+
+    def test_from_api_explicit_nulls_coalesced_everywhere(self):
+        # #47 class: a null title used to abort the WHOLE space export in the
+        # layout planner — and to_dict round-tripped the None into the cache,
+        # so every --cached run crashed too until a refresh.
+        p = Page.from_api({
+            "id": "42", "title": None, "spaceId": None, "parentId": None,
+            "parentType": None, "position": None, "status": None,
+            "authorId": None, "createdAt": None,
+            "version": {"number": None, "createdAt": None},
+        })
+        assert p.title == ""
+        assert p.space_id == ""      # not the truthy string "None"
+        assert p.parent_id == ""
+        assert p.position == 0
+        assert p.version.number == 0
+        d = p.to_dict()
+        p2 = Page.from_dict(d)
+        assert p2.title == ""        # the cache round-trip stays clean
 
     def test_round_trip(self):
         p = Page(id="1", title="Test", space_id="s1", parent_id="p1",
@@ -105,6 +146,22 @@ class TestAttachment:
         assert a.title == ""
         assert a.media_type == ""
         assert a.media_type_description == ""
+
+    def test_from_api_null_links_coalesced(self):
+        # #47 class: an explicit null _links crashed from_api itself
+        # (links.get on None), one line above the fields #47 fixed.
+        a = Attachment.from_api({"id": "att1", "title": "f.png", "_links": None})
+        assert a.download_link == ""
+        assert a.webui == ""
+
+    def test_from_api_null_page_id_and_file_size_coalesced(self):
+        # str(None) is the TRUTHY string "None": a null pageId used to defeat
+        # the `if att.page_id` guard and build a /content/None/ download URL.
+        a = Attachment.from_api({"id": "a1", "title": "f.png",
+                                 "pageId": None, "fileSize": None, "comment": None})
+        assert a.page_id == ""
+        assert a.file_size == 0
+        assert a.comment == ""
 
     def test_round_trip(self):
         a = Attachment(id="a1", title="f.pdf", media_type="application/pdf",
