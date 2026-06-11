@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 import sys
 import threading
@@ -19,6 +20,15 @@ from confluence_export.config import (
     ConnectionProfile,
 )
 from confluence_export.types import Attachment, Page, Space, Version
+
+# Longest Retry-After a server/proxy can impose on the shared backoff window.
+# Real throttling waits are seconds to minutes; anything longer is a hostile
+# or buggy header that would otherwise stall a CLI export for hours.
+_RETRY_AFTER_CAP_S = 300.0
+
+# Wait used when the header is absent or junk (unparseable, non-finite,
+# negative). One constant for all three fallback sites so they cannot drift.
+_RETRY_AFTER_DEFAULT_S = 60.0
 
 
 class AuthenticationError(Exception):
@@ -186,7 +196,10 @@ class ConfluenceClient:
                 self.stats["rate_limit_sleep_s"] += wait
 
     def _note_rate_limit(self, retry_after: float) -> None:
-        """Record a 429: extend the shared backoff window and count the retry."""
+        """Record a 429: extend the shared backoff window and count the
+        rate-limited attempt in ``stats["retries"]``. Runs on EVERY 429 —
+        including an exhausted final attempt, where no retry follows but the
+        pool-wide pacing must survive the raise."""
         with self._rate_lock:
             self._rate_limit_until = max(
                 self._rate_limit_until, time.monotonic() + retry_after
@@ -209,17 +222,35 @@ class ConfluenceClient:
             if status in (401, 403):
                 raise AuthenticationError(status, url) from exc
             if status == 429:
-                # Retry-After is normally delta-seconds, but a proxy/gateway can send
-                # an HTTP-date (or junk). Don't let int() raise a ValueError that would
-                # escape the (HTTPError, ConnectionError)-only except and crash a
-                # retryable 429; fall back to 60s.
+                # Retry-After is normally delta-seconds, but a proxy/gateway can
+                # send an HTTP-date (or junk). Don't let int() raise a ValueError
+                # that would escape the (HTTPError, ConnectionError)-only except
+                # and crash a retryable 429; fall back to 60s.
                 try:
-                    retry_after = float(exc.response.headers.get("Retry-After", 60))
+                    retry_after = float(
+                        exc.response.headers.get("Retry-After", _RETRY_AFTER_DEFAULT_S)
+                    )
                 except (TypeError, ValueError):
-                    retry_after = 60.0
-                self._log(f"Rate limited, waiting {retry_after}s")
+                    retry_after = _RETRY_AFTER_DEFAULT_S
+                # Trust the header only within reason: float() accepts "inf"
+                # (time.sleep(inf) raises OverflowError OUTSIDE the requests-
+                # only except — a raw traceback), and a huge finite value
+                # would stall every worker via the shared window for days.
+                if not math.isfinite(retry_after) or retry_after < 0:
+                    retry_after = _RETRY_AFTER_DEFAULT_S
+                retry_after = min(retry_after, _RETRY_AFTER_CAP_S)
+                # Extend the shared cross-thread backoff window on EVERY 429,
+                # including the exhausted last attempt: concurrent download/
+                # prefetch workers must still honor the final Retry-After
+                # instead of firing straight into a throttling server.
                 self._note_rate_limit(retry_after)
-                return
+                if attempt < max_retries - 1:
+                    self._log(f"Rate limited, waiting {retry_after}s")
+                    return
+                # Exhausted: fall through (429 < 500) to the typed-HTTPError
+                # raise below, so the CLI's RequestException handler reports it
+                # cleanly — the generic RuntimeError fallback isn't a
+                # RequestException and escaped that handler as a traceback (#46).
             if status >= 500 and attempt < max_retries - 1:
                 self._backoff(attempt)
                 return
@@ -292,9 +323,13 @@ class ConfluenceClient:
 
         while True:
             data = self._get(current_path, current_params)
-            all_results.extend(data.get("results", []))
+            # `or` coalescing (#47 class): an explicit-null envelope field
+            # would raise TypeError/AttributeError here — not a
+            # RequestException, so it would escape the CLI's network-error
+            # handler as a raw traceback.
+            all_results.extend(data.get("results") or [])
 
-            next_link = data.get("_links", {}).get("next")
+            next_link = (data.get("_links") or {}).get("next")
             if not next_link:
                 break
 
@@ -313,9 +348,13 @@ class ConfluenceClient:
 
         while True:
             data = self._get(current_path, current_params)
-            all_results.extend(data.get("results", []))
+            # `or` coalescing (#47 class): an explicit-null envelope field
+            # would raise TypeError/AttributeError here — not a
+            # RequestException, so it would escape the CLI's network-error
+            # handler as a raw traceback.
+            all_results.extend(data.get("results") or [])
 
-            next_link = data.get("_links", {}).get("next")
+            next_link = (data.get("_links") or {}).get("next")
             if not next_link:
                 break
 
@@ -341,11 +380,12 @@ class ConfluenceClient:
     def _version_from_v1(cls, data: dict | None) -> Version:
         if not data:
             return Version()
+        # `or` coalescing (#47 class) — see types.Version.from_api.
         return Version(
-            created_at=data.get("createdAt", "") or data.get("when", ""),
-            message=data.get("message", ""),
-            number=data.get("number", 0),
-            minor_edit=data.get("minorEdit", False),
+            created_at=data.get("createdAt") or data.get("when") or "",
+            message=data.get("message") or "",
+            number=data.get("number") or 0,
+            minor_edit=data.get("minorEdit") or False,
             author_id=cls._account_id(data.get("by")),
         )
 
@@ -366,87 +406,94 @@ class ConfluenceClient:
         return space_id
 
     def _space_from_v1(self, data: dict) -> Space:
-        links = data.get("_links", {})
+        # `or` coalescing everywhere: a v1 record can carry explicit nulls just
+        # like v2 (#47 class) — see types.Space.from_api.
+        links = data.get("_links") or {}
         homepage = data.get("homepage") or {}
         return self._remember_space(
             Space(
-                id=str(data.get("id", "")),
-                key=data.get("key", ""),
-                name=data.get("name", ""),
-                type=data.get("type", ""),
-                status=data.get("status", ""),
-                homepage_id=str(data.get("homepageId", "") or homepage.get("id", "")),
-                webui=links.get("webui", ""),
-                base=links.get("base", ""),
+                id=str(data.get("id") or ""),
+                key=data.get("key") or "",
+                name=data.get("name") or "",
+                type=data.get("type") or "",
+                status=data.get("status") or "",
+                homepage_id=str(data.get("homepageId") or homepage.get("id") or ""),
+                webui=links.get("webui") or "",
+                base=links.get("base") or "",
             )
         )
 
     def _page_from_v1(self, data: dict) -> Page:
-        links = data.get("_links", {})
+        # `or` coalescing everywhere (#47 class) — see types.Page.from_api.
+        links = data.get("_links") or {}
         body = data.get("body", {})
         storage = body.get("storage", {}) if body else {}
         space = data.get("space") or {}
         history = data.get("history") or {}
         ancestors = data.get("ancestors") or []
-        parent = ancestors[-1] if ancestors else {}
+        parent = (ancestors[-1] if ancestors else {}) or {}
         extensions = data.get("extensions") or {}
         return Page(
-            id=str(data.get("id", "")),
-            title=data.get("title", ""),
-            space_id=str(space.get("id", "")),
-            parent_id=str(parent.get("id", "") or ""),
-            parent_type=parent.get("type", ""),
-            position=extensions.get("position", 0) or 0,
-            status=data.get("status", ""),
+            id=str(data.get("id") or ""),
+            title=data.get("title") or "",
+            space_id=str(space.get("id") or ""),
+            parent_id=str(parent.get("id") or ""),
+            parent_type=parent.get("type") or "",
+            position=extensions.get("position") or 0,
+            status=data.get("status") or "",
             author_id=self._account_id(history.get("createdBy")),
-            created_at=history.get("createdDate", ""),
+            created_at=history.get("createdDate") or "",
             version=self._version_from_v1(data.get("version")),
-            body_storage=storage.get("value", "") if storage else "",
-            webui=links.get("webui", ""),
-            editui=links.get("editui", ""),
-            tinyui=links.get("tinyui", ""),
+            body_storage=(storage.get("value") or "") if storage else "",
+            webui=links.get("webui") or "",
+            editui=links.get("editui") or "",
+            tinyui=links.get("tinyui") or "",
         )
 
     def _folder_from_v1(self, data: dict) -> dict:
         ancestors = data.get("ancestors") or []
-        parent = ancestors[-1] if ancestors else {}
+        parent = (ancestors[-1] if ancestors else {}) or {}
         space = data.get("space") or {}
         extensions = data.get("extensions") or {}
         return {
-            "id": str(data.get("id", "")),
-            "title": data.get("title", ""),
-            "spaceId": str(space.get("id", "")),
-            "parentId": str(parent.get("id", "") or ""),
-            "parentType": parent.get("type", ""),
-            "position": extensions.get("position", 0) or 0,
+            "id": str(data.get("id") or ""),
+            "title": data.get("title") or "",
+            "spaceId": str(space.get("id") or ""),
+            "parentId": str(parent.get("id") or ""),
+            "parentType": parent.get("type") or "",
+            "position": extensions.get("position") or 0,
             "status": "folder",
         }
 
     def _attachment_from_v1(self, data: dict, page_id: str) -> Attachment:
-        links = data.get("_links", {})
+        # `or` coalescing: a v1 record can carry explicit nulls just like v2;
+        # None here crashes .casefold()/.get() consumers (#47 class).
+        links = data.get("_links") or {}
         metadata = data.get("metadata") or {}
         extensions = data.get("extensions") or {}
         history = data.get("history") or {}
         version = self._version_from_v1(data.get("version"))
         return Attachment(
-            id=str(data.get("id", "")),
-            title=data.get("title", ""),
+            id=str(data.get("id") or ""),
+            title=data.get("title") or "",
             media_type=(
-                data.get("mediaType", "")
-                or metadata.get("mediaType", "")
-                or extensions.get("mediaType", "")
+                data.get("mediaType")
+                or metadata.get("mediaType")
+                or extensions.get("mediaType")
+                or ""
             ),
             media_type_description=(
-                data.get("mediaTypeDescription", "")
-                or metadata.get("mediaTypeDescription", "")
+                data.get("mediaTypeDescription")
+                or metadata.get("mediaTypeDescription")
+                or ""
             ),
-            file_size=data.get("fileSize", 0) or extensions.get("fileSize", 0) or 0,
+            file_size=data.get("fileSize") or extensions.get("fileSize") or 0,
             page_id=page_id,
-            comment=data.get("comment", ""),
-            created_at=history.get("createdDate", "") or version.created_at,
+            comment=data.get("comment") or "",
+            created_at=history.get("createdDate") or version.created_at,
             version=version,
-            download_link=links.get("download", "") or data.get("downloadLink", ""),
-            webui=links.get("webui", ""),
+            download_link=links.get("download") or data.get("downloadLink") or "",
+            webui=links.get("webui") or "",
         )
 
     # -- API methods ---------------------------------------------------------

@@ -37,10 +37,12 @@ from confluence_export.media import (
     _VERSIONS_FILE,
     _load_versions,
     _resolve_manifest_entry,
+    ROLLBACK_TMP_PREFIX,
     available_attachment_names,
     download_attachments,
     ensure_media_dir,
     materialize_existing_attachments,
+    sweep_stale_media_temps,
 )
 from confluence_export.tree import (
     build_tree,
@@ -577,7 +579,7 @@ class Exporter:
                 return
             fd, tmp_name = tempfile.mkstemp(
                 dir=path.parent,
-                prefix=".rollback-",
+                prefix=ROLLBACK_TMP_PREFIX,
                 suffix=".tmp",
             )
             os.close(fd)
@@ -590,6 +592,13 @@ class Exporter:
                 except OSError:  # pragma: no cover
                     pass
                 raise
+            # copy2 stamps the SOURCE file's (arbitrarily old) mtime onto the
+            # snapshot, which the #48 sweep's age gate would misread as a
+            # crashed run's litter — a concurrent run could sweep this LIVE
+            # snapshot mid-transaction. Reset to now; nothing consumes the
+            # snapshot's own mtime (worst case a rollback-restored .drawio
+            # source triggers one spurious re-render).
+            os.utime(tmp)
             media_file_snapshots[tracked] = tmp
 
         def cleanup_media_snapshots() -> None:
@@ -636,7 +645,15 @@ class Exporter:
         available_media: set[str] = set()
         current_attachment_names = {name_plan.for_attachment(att) for att in attachments}
         reserved_media_names = set(current_attachment_names)
+        existing_media_dir = page_dir / MEDIA_DIR_NAME
         try:
+            # Sweep BEFORE the first snapshot_file (this run's own .rollback-
+            # snapshots live in media_dir too) and regardless of whether the
+            # page still HAS attachments — a hard-killed run's temps must not
+            # survive forever just because the attachments were since deleted
+            # upstream (#48). A fresh dir created below has nothing to sweep.
+            if existing_media_dir.is_dir() and not existing_media_dir.is_symlink():
+                sweep_stale_media_temps(existing_media_dir)
             if self.download_media and attachments:
                 media_dir = ensure_media_dir(page_dir)
                 snapshot_file(media_dir / _VERSIONS_FILE)
@@ -648,7 +665,6 @@ class Exporter:
                     )
                 )
             elif not self.download_media and attachments:
-                existing_media_dir = page_dir / MEDIA_DIR_NAME
                 if existing_media_dir.is_dir():
                     if existing_media_dir.is_symlink():
                         raise ValueError(
@@ -661,7 +677,6 @@ class Exporter:
                         snapshot_file(resolve_within(media_dir, name))
                     written.extend(materialize_existing_attachments(attachments, media_dir))
             elif not self.download_media and not attachments:
-                existing_media_dir = page_dir / MEDIA_DIR_NAME
                 if existing_media_dir.is_dir():
                     if existing_media_dir.is_symlink():
                         raise ValueError(

@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -77,6 +78,84 @@ def migrate_media_dirs(root_dir: Path) -> list[tuple[Path, Path]]:
     return renamed
 
 
+# Prefixes of the dot-prefixed temp artifacts of the atomic-write/rollback
+# machinery. The mkstemp/TemporaryDirectory creation sites and the sweep
+# patterns below derive from the SAME constants, so renaming a prefix (or
+# adding a new temp kind) cannot silently regress the sweep (#48).
+DOWNLOAD_TMP_PREFIX = ".download-"
+COPY_TMP_PREFIX = ".copy-"
+VERSIONS_TMP_PREFIX = ".versions-"
+ROLLBACK_TMP_PREFIX = ".rollback-"  # exporter.py snapshot_file
+PRESERVE_TMP_PREFIX = ".preserve-"
+DRAWIO_TMP_PREFIX = ".drawio-"  # drawio.py render temps land in the media dir
+
+# A hard kill (SIGKILL / power loss) between create and cleanup can leave these
+# behind; they are never staged or pruned (commit_export stages explicit paths,
+# the stale-prune walks tracked files only), so the worst case is untracked
+# litter the user notices. safe_attachment_name rejects leading-dot titles, so
+# no NEW attachment can be allocated one of these names — and the live
+# ".versions.json" matches none of the patterns. But LEGACY (pre-sanitizer)
+# exports wrote raw titles to disk and _resolve_manifest_entry deliberately
+# keeps honoring those names, so the sweep must spare anything the manifest
+# still resolves (see sweep_stale_media_temps).
+_TEMP_ARTIFACT_PATTERNS = (
+    f"{DOWNLOAD_TMP_PREFIX}*.tmp",
+    f"{COPY_TMP_PREFIX}*.tmp",
+    f"{VERSIONS_TMP_PREFIX}*.tmp",
+    f"{ROLLBACK_TMP_PREFIX}*.tmp",
+    f"{PRESERVE_TMP_PREFIX}*",
+    f"{DRAWIO_TMP_PREFIX}*.png",
+)
+
+# A matching artifact YOUNGER than this is treated as another live run's
+# in-flight transaction file, not a crashed run's litter. Nothing enforces
+# single-process exclusivity on an output tree (no lockfile), so without the
+# age gate an overlapping export would sweep its peer's live .rollback-/
+# .download- temps — turning best-effort cleanup into a cross-process
+# data-loss race. Litter from a crash is still swept by any run starting at
+# least this much later.
+_TEMP_ARTIFACT_MIN_AGE_S = 3600.0
+
+
+def sweep_stale_media_temps(media_dir: Path) -> None:
+    """Best-effort removal of temp artifacts a hard-killed earlier run left in
+    ``media_dir`` (#48). MUST run before the current run creates its own temps
+    and rollback snapshots there. Only entries older than
+    ``_TEMP_ARTIFACT_MIN_AGE_S`` are removed — a younger match may belong to a
+    concurrently running export (see the constant's comment) — and never a
+    name the version manifest still resolves (a legacy-named REAL attachment,
+    see the patterns' comment)."""
+    now = time.time()
+    manifest_names = {nfc_casefold(n) for n in _load_versions(media_dir)}
+    for pattern in _TEMP_ARTIFACT_PATTERNS:
+        for stale in media_dir.glob(pattern):
+            try:
+                # Folded compare: a legacy manifest key's case/Unicode form
+                # can differ from the on-disk name. Sparing too much keeps
+                # litter; deleting too much destroys a committed attachment.
+                if nfc_casefold(stale.name) in manifest_names:
+                    continue
+                if now - stale.lstat().st_mtime < _TEMP_ARTIFACT_MIN_AGE_S:
+                    continue
+                if stale.is_dir() and not stale.is_symlink():
+                    shutil.rmtree(stale, ignore_errors=True)
+                elif (
+                    stale.name.startswith(PRESERVE_TMP_PREFIX)
+                    and not stale.is_symlink()
+                ):
+                    # .preserve-* snapshots are always DIRECTORIES
+                    # (TemporaryDirectory); a regular file matching the one
+                    # suffix-less pattern can only be a legacy-named real
+                    # attachment — never ours to delete. (A symlink is still
+                    # unlinked: conex never creates those here either, and
+                    # unlinking cannot destroy the target's content.)
+                    continue
+                else:
+                    stale.unlink()
+            except OSError:
+                continue
+
+
 def _load_versions(media_dir: Path) -> dict:
     """Load the version manifest from a media directory."""
     p = media_dir / _VERSIONS_FILE
@@ -94,7 +173,7 @@ def _save_versions(media_dir: Path, versions: dict) -> None:
     """Save the version manifest to a media directory."""
     target = media_dir / _VERSIONS_FILE
     mode = replacement_mode(target)
-    fd, tmp_name = tempfile.mkstemp(dir=media_dir, prefix=".versions-", suffix=".tmp")
+    fd, tmp_name = tempfile.mkstemp(dir=media_dir, prefix=VERSIONS_TMP_PREFIX, suffix=".tmp")
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "w") as f:
@@ -271,7 +350,7 @@ def _unmanifested_file_can_preserve(
 
 
 def _copy_media_file(src: Path, dest: Path) -> None:
-    fd, tmp_name = tempfile.mkstemp(dir=dest.parent, prefix=".copy-", suffix=".tmp")
+    fd, tmp_name = tempfile.mkstemp(dir=dest.parent, prefix=COPY_TMP_PREFIX, suffix=".tmp")
     os.close(fd)
     tmp = Path(tmp_name)
     try:
@@ -339,17 +418,24 @@ def _snapshot_previous_owned_files(
 ) -> tuple[dict[int, tuple[str, Path, object, Path]], tempfile.TemporaryDirectory | None]:
     snapshots: dict[int, tuple[str, Path, object, Path]] = {}
     tmp_dir: tempfile.TemporaryDirectory | None = None
-    for index, att in enumerate(attachments):
-        name = name_plan.for_attachment(att)
-        found = _find_previous_owned_file(versions, media_dir, name, att, collision_bases)
-        if found is None:
-            continue
-        old_name, old_path, old_record = found
-        if tmp_dir is None:
-            tmp_dir = tempfile.TemporaryDirectory(dir=media_dir, prefix=".preserve-")
-        snapshot_path = Path(tmp_dir.name) / f"{index}"
-        shutil.copy2(old_path, snapshot_path)
-        snapshots[id(att)] = (old_name, snapshot_path, old_record, old_path)
+    try:
+        for index, att in enumerate(attachments):
+            name = name_plan.for_attachment(att)
+            found = _find_previous_owned_file(versions, media_dir, name, att, collision_bases)
+            if found is None:
+                continue
+            old_name, old_path, old_record = found
+            if tmp_dir is None:
+                tmp_dir = tempfile.TemporaryDirectory(dir=media_dir, prefix=PRESERVE_TMP_PREFIX)
+            snapshot_path = Path(tmp_dir.name) / f"{index}"
+            shutil.copy2(old_path, snapshot_path)
+            snapshots[id(att)] = (old_name, snapshot_path, old_record, old_path)
+    except Exception:
+        # A raise here happens before the caller binds tmp_dir to its
+        # try/finally, which would leave the .preserve- dir behind until GC (#48).
+        if tmp_dir is not None:
+            tmp_dir.cleanup()
+        raise
     return snapshots, tmp_dir
 
 
@@ -559,7 +645,7 @@ def download_attachments(
             mode = replacement_mode(dest, default_mode=download_default_mode)
             fd, tmp_name = tempfile.mkstemp(
                 dir=dest.parent,
-                prefix=".download-",
+                prefix=DOWNLOAD_TMP_PREFIX,
                 suffix=".tmp",
             )
             os.close(fd)

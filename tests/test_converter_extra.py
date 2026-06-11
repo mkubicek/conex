@@ -798,3 +798,381 @@ def test_ac_image_resolves_id_specific_local_name_via_content_id():
     result = _preprocess_html(html, atts)
     assert ".media/shot-id2.png" in result
     assert 'src=".media/shot.png"' not in result
+
+
+# -- #45: untitled panel/expand must not steal a nested macro's title ---------
+
+def test_untitled_panel_does_not_steal_nested_macro_title():
+    # #45: the recursive title lookup reached INTO the nested status macro and
+    # stole its title param — the Info header became "DONE" and the status text
+    # was emitted twice (once as the header, once by the nested conversion).
+    html = (
+        '<ac:structured-macro ac:name="info"><ac:rich-text-body>'
+        '<ac:structured-macro ac:name="status">'
+        '<ac:parameter ac:name="title">DONE</ac:parameter>'
+        "</ac:structured-macro>Some text"
+        "</ac:rich-text-body></ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [])
+    assert "<strong>Info</strong>" in result
+    assert result.count("DONE") == 1
+    assert "Some text" in result
+
+
+def test_untitled_expand_does_not_steal_nested_panel_title():
+    # #45: same steal in _convert_expand — an untitled expand around a titled
+    # inner panel must fall back to "Details", and the inner panel must keep its
+    # own header (one "Inner", not an expand header + a panel header).
+    html = (
+        '<ac:structured-macro ac:name="expand"><ac:rich-text-body>'
+        '<ac:structured-macro ac:name="info">'
+        '<ac:parameter ac:name="title">Inner</ac:parameter>'
+        "<ac:rich-text-body><p>Body</p></ac:rich-text-body>"
+        "</ac:structured-macro></ac:rich-text-body></ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [])
+    assert "<h4>Details</h4>" in result
+    assert result.count("Inner") == 1
+    assert "Body" in result
+
+
+def test_nested_decision_list_not_double_rendered():
+    # #43: a decisionList nested inside a decisionItem is not producible by real
+    # Confluence ADF (item content is inline-only) — hardening. The outer list's
+    # recursive item scan must not emit the inner list's items a second time.
+    html = (
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem" state="DECIDED"><p>Outer</p>'
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem"><p>Inner</p></ac:adf-node>'
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("Inner") == 1
+    assert result.count("Outer") == 1
+
+
+def test_drawio_matcher_tolerates_null_media_type_attachment():
+    # #47: a sibling attachment with "title"/"mediaType": null must not crash
+    # _match_drawio_attachment's _is_drawio scan while matching another one.
+    from confluence_export.converter import _match_drawio_attachment
+
+    noise = Attachment.from_api({"id": "a", "title": None, "mediaType": None})
+    target = Attachment.from_api({"id": "b", "title": "arch.drawio", "mediaType": None})
+    attach_map = {noise.title: noise, target.title: target}
+    assert _match_drawio_attachment("arch", attach_map) is target
+
+
+# -- nested decision/task lists must lose nothing and duplicate nothing -------
+
+def test_nested_decision_list_in_item_renders_as_sublist():
+    # The #43 guard alone processed lists outermost-first: the outer
+    # replace_with detached the not-yet-rendered inner list, losing its
+    # structured render (the ✓ marker) and gluing its text into the outer
+    # item. Innermost-first keeps it as a real sublist.
+    html = (
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem"><p>Outer</p>'
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem" state="DECIDED"><p>Inner</p></ac:adf-node>'
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("Inner") == 1
+    assert "✓ Inner" in result
+    assert "OuterInner" not in result
+
+
+def test_nested_decision_list_sibling_of_items_content_kept():
+    # An inner decisionList that is a SIBLING of the outer list's items (not
+    # inside any item): its content must survive the outer replace_with.
+    html = (
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem"><p>Alpha</p></ac:adf-node>'
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem"><p>Beta</p></ac:adf-node>'
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("Alpha") == 1
+    assert result.count("Beta") == 1
+
+
+def test_decision_list_directly_inside_decision_list_content_kept():
+    # A decisionList whose only child is another decisionList: the outer <ul>
+    # had no items of its own, and decompose() destroyed the not-yet-rendered
+    # inner list with it — the page rendered empty.
+    html = (
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem"><p>Inner</p></ac:adf-node>'
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+    )
+    result = _preprocess_html(html, [])
+    assert "<li>Inner</li>" in result
+
+
+def test_nested_task_list_not_double_rendered():
+    # Tab-indented action items nest an ac:task-list inside an ac:task-body —
+    # producible in the real editor, unlike nested decisionLists. The
+    # outermost-first pass emitted the inner task twice AND leaked the raw
+    # status word into the outer item's text ("OutercompleteInner").
+    html = (
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>incomplete</ac:task-status>"
+        "<ac:task-body>Outer"
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>complete</ac:task-status>"
+        "<ac:task-body>Inner</ac:task-body>"
+        "</ac:task></ac:task-list>"
+        "</ac:task-body>"
+        "</ac:task></ac:task-list>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("Inner") == 1
+    assert "[x] Inner" in result
+    assert "[ ] Outer" in result
+    assert "complete" not in result  # the status word must not leak as text
+
+
+def test_panel_body_recovered_from_malformed_storage():
+    # An unclosed ac:parameter makes html.parser nest the rich-text-body
+    # INSIDE the parameter. recursive=False alone (#45) then found no body and
+    # replace_with silently discarded it; the descendant fallback recovers it
+    # (it is still THIS macro's body) without re-opening the #45 steal, and
+    # the body text must not duplicate into the title.
+    html = (
+        '<ac:structured-macro ac:name="info">'
+        '<ac:parameter ac:name="title">MyTitle'
+        "<ac:rich-text-body><p>Important body</p></ac:rich-text-body>"
+        "</ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("Important body") == 1
+    assert "<strong>MyTitle</strong>" in result
+
+
+def test_decision_item_with_only_a_nested_list_keeps_nested_items():
+    # An item with NO own text whose content is just a nested list: the empty
+    # item must not drop the nested items with it.
+    html = (
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem">'
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem"><p>Kept</p></ac:adf-node>'
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+    )
+    result = _preprocess_html(html, [])
+    assert "<li>Kept</li>" in result
+
+
+def test_task_list_directly_inside_task_list_content_kept():
+    # A task-list as a DIRECT child of a task-list (no task-body between):
+    # the inner list's rendered items must survive the outer replace_with.
+    html = (
+        "<ac:task-list>"
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>complete</ac:task-status>"
+        "<ac:task-body>Inner</ac:task-body>"
+        "</ac:task></ac:task-list>"
+        "</ac:task-list>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("Inner") == 1
+    assert "[x] Inner" in result
+
+
+def test_task_list_inside_decision_item_renders_as_sublist():
+    # Cross-type nesting: decision lists and task lists render in ONE
+    # innermost-first pass — with separate passes the unrendered task list
+    # was get_text()-flattened into the decision item ('d-outercompletet-inner',
+    # status word fused into prose, checkbox lost).
+    html = (
+        '<ac:adf-node type="decisionList"><ac:adf-node type="decisionItem">'
+        "<p>d-outer</p>"
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>complete</ac:task-status>"
+        "<ac:task-body>t-inner</ac:task-body>"
+        "</ac:task></ac:task-list>"
+        "</ac:adf-node></ac:adf-node>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("t-inner") == 1
+    assert "[x] t-inner" in result
+    assert "complete" not in result
+    assert "d-outer" in result
+
+
+def test_decision_list_inside_task_body_renders_as_sublist():
+    # The reverse nesting direction must hold by design, not pass-order luck.
+    html = (
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>incomplete</ac:task-status>"
+        "<ac:task-body>t-outer"
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem" state="DECIDED"><p>d-inner</p></ac:adf-node>'
+        "</ac:adf-node>"
+        "</ac:task-body>"
+        "</ac:task></ac:task-list>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("d-inner") == 1
+    assert "✓ d-inner" in result
+    assert "[ ] t-outer" in result
+
+
+def test_emoticon_inside_task_body_survives():
+    # Emoticons are replaced BEFORE the list pass; a task body renders via
+    # get_text(), so an unreplaced <ac:emoticon> would silently vanish.
+    html = (
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>incomplete</ac:task-status>"
+        '<ac:task-body>Ship it <ac:emoticon ac:name="thumbs-up"/></ac:task-body>'
+        "</ac:task></ac:task-list>"
+    )
+    result = _preprocess_html(html, [])
+    assert "Ship it" in result
+    assert "👍" in result
+
+
+def test_panel_without_own_body_keeps_nested_macro_content():
+    # A panel with NO own rich-text-body wrapping a real macro (malformed
+    # storage): the nested macro must be moved LIVE into the blockquote and
+    # still be converted — replace_with used to destroy it wholesale.
+    html = (
+        '<ac:structured-macro ac:name="info">'
+        '<ac:structured-macro ac:name="note">'
+        '<ac:parameter ac:name="title">NestedTitle</ac:parameter>'
+        "<ac:rich-text-body><p>NestedBody</p></ac:rich-text-body>"
+        "</ac:structured-macro></ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [])
+    assert "NestedBody" in result
+    assert result.count("NestedTitle") == 1
+    assert "<strong>Info</strong>" in result  # outer keeps its default title (#45)
+
+
+def test_expand_body_recovered_from_malformed_storage():
+    # Expand twin of the panel test: an unclosed ac:parameter swallowing the
+    # body must not discard it, and the body text must not leak into the title.
+    html = (
+        '<ac:structured-macro ac:name="expand">'
+        '<ac:parameter ac:name="title">MyTitle'
+        "<ac:rich-text-body><p>Important body</p></ac:rich-text-body>"
+        "</ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("Important body") == 1
+    assert "<h4>MyTitle</h4>" in result
+
+
+def test_panel_keeps_all_mis_nested_bodies():
+    # Multiple bodies swallowed by one unclosed parameter: ALL owned bodies'
+    # content survives, not just the first match.
+    html = (
+        '<ac:structured-macro ac:name="info">'
+        '<ac:parameter ac:name="title">T'
+        "<ac:rich-text-body><p>First body</p></ac:rich-text-body>"
+        "<ac:rich-text-body><p>Second body</p></ac:rich-text-body>"
+        "</ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [])
+    assert "First body" in result
+    assert "Second body" in result
+
+
+def test_three_level_task_list_preserves_middle_nesting():
+    # find_all("ul") is recursive: extracting both the mid and inner rendered
+    # lists pulled Inner OUT of Mid's just-extracted subtree and re-attached
+    # it one level too high — "Outer > Mid" + "Outer > Inner", losing
+    # "Mid > Inner". Three-level Tab-indented action items are producible in
+    # the real editor.
+    html = (
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>incomplete</ac:task-status>"
+        "<ac:task-body>Outer"
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>incomplete</ac:task-status>"
+        "<ac:task-body>Mid"
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>complete</ac:task-status>"
+        "<ac:task-body>Inner</ac:task-body>"
+        "</ac:task></ac:task-list>"
+        "</ac:task-body>"
+        "</ac:task></ac:task-list>"
+        "</ac:task-body>"
+        "</ac:task></ac:task-list>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("Inner") == 1
+    # Inner's sublist lives INSIDE Mid's <li>, not as its sibling.
+    assert "<li>[ ] Mid<ul><li>[x] Inner</li></ul></li>" in result
+
+
+def test_three_level_decision_list_preserves_middle_nesting():
+    # Decision twin of the three-level task case (same extraction sites).
+    html = (
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem"><p>Outer</p>'
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem"><p>Mid</p>'
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem" state="DECIDED"><p>Inner</p></ac:adf-node>'
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("Inner") == 1
+    assert "<li>Mid<ul><li>✓ Inner</li></ul></li>" in result
+
+
+def test_stray_splice_keeps_deep_nesting():
+    # The stray-splice loop had the same recursive find_all("ul") shape: an
+    # outer list whose DIRECT CHILD is a list whose task carries its own
+    # sublist — the deep sublist was yanked back out of Mid's already-spliced
+    # <li> and its items appended flat beside it.
+    html = (
+        "<ac:task-list>"
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>incomplete</ac:task-status>"
+        "<ac:task-body>Mid"
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>complete</ac:task-status>"
+        "<ac:task-body>Inner</ac:task-body>"
+        "</ac:task></ac:task-list>"
+        "</ac:task-body>"
+        "</ac:task></ac:task-list>"
+        "</ac:task-list>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("Inner") == 1
+    assert "<li>[ ] Mid<ul><li>[x] Inner</li></ul></li>" in result
+
+
+def test_unknown_bodyless_macro_wrapping_real_macro_keeps_it():
+    # Default branch: an unknown macro with no own body WRAPPING a real macro
+    # must unwrap (children stay live and convert), not stamp a placeholder
+    # over the whole subtree or steal the nested macro's body (#45 shape).
+    html = (
+        '<ac:structured-macro ac:name="future-widget">'
+        '<ac:parameter ac:name="conf">x</ac:parameter>'
+        '<ac:structured-macro ac:name="info">'
+        "<ac:rich-text-body><p>Inner panel body</p></ac:rich-text-body>"
+        "</ac:structured-macro></ac:structured-macro>"
+    )
+    result = _preprocess_html(html, [])
+    assert "Inner panel body" in result
+    assert "<strong>Info</strong>" in result  # nested macro converted, not stolen
+    assert "future-widget" not in result.replace("[future-widget]", "")  # no param leak
+    assert ">x<" not in result  # the conf parameter must not leak as text

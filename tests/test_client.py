@@ -199,6 +199,16 @@ class TestPaginate:
             assert results[0]["id"] == "1"
             assert results[1]["id"] == "2"
 
+    def test_null_envelope_fields_coalesced(self):
+        # #47 class: an explicit-null envelope ("results"/"_links": null) must
+        # not raise a TypeError/AttributeError — neither is a
+        # RequestException, so it would escape the CLI's network-error
+        # handler as a raw traceback aborting the whole refresh.
+        client = _make_client()
+        with patch.object(client, "_get") as mock:
+            mock.return_value = {"results": None, "_links": None}
+            assert client._paginate("/test") == []
+
 
 class TestApiMethods:
     def test_get_spaces(self):
@@ -273,7 +283,10 @@ class TestApiMethods:
 
 
 class TestMaxRetriesExhausted:
-    def test_raises_runtime_error(self):
+    def test_429_exhausted_raises_typed_http_error(self):
+        # #46: a sustained 429 must surface the typed HTTPError (a
+        # RequestException the CLI handler catches), not a generic RuntimeError
+        # that escapes it as a raw traceback.
         client = _make_client()
         with patch.object(client.session, "get") as mock_get, \
              patch("confluence_export.client.time.sleep"):
@@ -283,8 +296,20 @@ class TestMaxRetriesExhausted:
             mock_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(response=mock_resp)
             mock_get.return_value = mock_resp
 
-            with pytest.raises(RuntimeError, match="Max retries"):
+            with pytest.raises(requests.exceptions.HTTPError) as excinfo:
                 client._get("/test", max_retries=3)
+            assert excinfo.value.response.status_code == 429
+            # Two retries were attempted before the final raise.
+            assert mock_get.call_count == 3
+
+    def test_zero_retries_backstop_raises_runtime_error(self):
+        # max_retries=0 skips the request loop entirely; the defensive backstop
+        # raise is all that's left (every in-loop path now returns or raises).
+        client = _make_client()
+        with pytest.raises(RuntimeError, match="Max retries"):
+            client._get("/test", max_retries=0)
+        with pytest.raises(RuntimeError, match="Max retries"):
+            client._get_raw("/test", max_retries=0)
 
 
 class TestGetRaw:
@@ -484,6 +509,93 @@ class TestCookieV1Mode:
             {"expand": "version,metadata,extensions,history", "limit": "250"},
         )
 
+    def test_get_attachments_v1_null_fields_coalesced(self):
+        # #47 parity for the v1 dialect: _attachment_from_v1 builds Attachment
+        # directly (not via from_api), so explicit nulls must coalesce here too
+        # or the same .casefold() crash class comes back on the cookie path.
+        client = _make_client()
+        client.set_cookies("session=abc")
+
+        with patch.object(client, "_paginate_offset") as mock:
+            mock.return_value = [
+                {
+                    "id": "att1",
+                    "title": None,
+                    "mediaType": None,
+                    "mediaTypeDescription": None,
+                    "extensions": {"mediaType": None},
+                    "_links": None,
+                }
+            ]
+            atts = client.get_attachments("42")
+
+        assert atts[0].title == ""
+        assert atts[0].media_type == ""
+        assert atts[0].media_type_description == ""
+        assert atts[0].download_link == ""
+        assert atts[0].webui == ""
+
+
+class TestV1BuilderNullShapes:
+    """#47 parity for the remaining v1 builders: like _attachment_from_v1 they
+    build their records directly (not via from_api), and `x.get(k) or ""` is a
+    single line — so line coverage alone cannot catch a regression back to the
+    dict-key-default idiom. These pin the null shape per builder."""
+
+    def test_page_from_v1_explicit_nulls_coalesced(self):
+        client = _make_client()
+        p = client._page_from_v1({
+            "id": None, "title": None, "status": None,
+            "space": {"id": None}, "history": None,
+            "ancestors": [None], "extensions": {"position": None},
+            "body": {"storage": {"value": None}},
+            "_links": None,
+        })
+        assert p.id == ""            # not the truthy string "None"
+        assert p.title == ""
+        assert p.space_id == ""
+        assert p.parent_id == ""
+        assert p.parent_type == ""
+        assert p.position == 0
+        assert p.body_storage == ""
+        assert p.webui == ""
+
+    def test_space_from_v1_explicit_nulls_coalesced(self):
+        client = _make_client()
+        s = client._space_from_v1({
+            "id": None, "key": None, "name": None, "type": None,
+            "status": None, "homepageId": None, "homepage": None,
+            "_links": None,
+        })
+        assert s.id == ""
+        assert s.key == ""
+        assert s.name == ""
+        assert s.homepage_id == ""
+        assert s.webui == ""
+
+    def test_version_from_v1_explicit_nulls_coalesced(self):
+        client = _make_client()
+        v = client._version_from_v1({
+            "createdAt": None, "when": None, "message": None,
+            "number": None, "minorEdit": None, "by": None,
+        })
+        assert v.created_at == ""
+        assert v.message == ""
+        assert v.number == 0
+        assert v.minor_edit is False
+
+    def test_folder_from_v1_explicit_nulls_coalesced(self):
+        client = _make_client()
+        f = client._folder_from_v1({
+            "id": None, "title": None, "space": {"id": None},
+            "ancestors": [None], "extensions": {"position": None},
+        })
+        assert f["id"] == ""
+        assert f["title"] == ""
+        assert f["spaceId"] == ""
+        assert f["parentId"] == ""
+        assert f["position"] == 0
+
 
 class TestVerboseLogging:
     def test_log_when_verbose(self, capsys):
@@ -630,6 +742,13 @@ class TestPaginateOffset:
         second_path, second_params = mock.call_args_list[1].args
         assert second_path == "/wiki/rest/api/space"
         assert second_params == {"start": "25", "limit": "25"}
+
+    def test_null_envelope_fields_coalesced(self):
+        # #47 class: v1 twin of TestPaginate's null-envelope test.
+        client = _make_client()
+        with patch.object(client, "_get") as mock:
+            mock.return_value = {"results": None, "_links": None}
+            assert client._paginate_offset("/wiki/rest/api/space") == []
 
 
 class TestSpaceKeyForV1:
@@ -809,13 +928,51 @@ class TestGetRawRetryAndRateLimit:
             with pytest.raises(requests.exceptions.HTTPError):
                 client._get_raw("/d", max_retries=2)
 
-    def test_get_raw_429_exhausted_raises_runtime(self):
+    def test_get_raw_429_exhausted_raises_typed_http_error(self):
+        # #46: mirror the 5xx branch — exhausted 429 raises the typed HTTPError.
         client = _make_client()
         with patch.object(client.session, "get") as mock_get, \
              patch("confluence_export.client.time.sleep"):
             mock_get.return_value = self._http_error(429, retry_after=0)
-            with pytest.raises(RuntimeError, match="Max retries"):
+            with pytest.raises(requests.exceptions.HTTPError) as excinfo:
                 client._get_raw("/d", max_retries=2)
+            assert excinfo.value.response.status_code == 429
+
+    def test_429_exhausted_still_extends_shared_rate_limit_window(self):
+        # The FINAL 429's Retry-After must still extend the cross-thread
+        # backoff window before the typed HTTPError surfaces (#46): the pool
+        # swallows the per-item failure and moves on, so without the window
+        # the peer workers fire straight into the throttling server.
+        import time as _time
+
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            mock_get.return_value = self._http_error(429, retry_after=120)
+            before = _time.monotonic()
+            with pytest.raises(requests.exceptions.HTTPError):
+                client._get_raw("/d", max_retries=1)
+        assert client._rate_limit_until >= before + 119
+        assert client.stats["retries"] == 1
+
+    @pytest.mark.parametrize("header", ["inf", "nan", "-5", "864000"])
+    def test_retry_after_clamped_to_sane_window(self, header):
+        # float() accepts 'inf'/'nan' — an unclamped value reaches
+        # time.sleep via the shared window (OverflowError as a raw
+        # traceback); a huge finite value would stall every worker for
+        # days. The header is server/proxy-controlled: trust it only
+        # within the cap.
+        import time as _time
+
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            mock_get.return_value = self._http_error(429, retry_after=header)
+            before = _time.monotonic()
+            with pytest.raises(requests.exceptions.HTTPError):
+                client._get_raw("/d", max_retries=1)
+        window = client._rate_limit_until - before
+        assert 0 <= window <= 301  # finite, never past the cap
 
     def test_get_raw_connection_error_exhausted_raises(self):
         client = _make_client()

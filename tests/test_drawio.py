@@ -98,3 +98,14 @@ def test_forced_render_uses_umask_mode_for_new_png(tmp_path):
     assert result == output
     assert output.read_bytes() == b"PNG"
     assert output.stat().st_mode & 0o777 == 0o640
+
+
+def test_find_drawio_attachments_tolerates_null_media_type():
+    # #47: an attachment record with "mediaType": null reaches consumers as a
+    # real None unless from_api coalesces it; the matcher must not crash and
+    # must still match by title.
+    atts = [
+        Attachment.from_api({"id": "a", "title": None, "mediaType": None}),
+        Attachment.from_api({"id": "b", "title": "d.drawio", "mediaType": None}),
+    ]
+    assert [a.id for a in find_drawio_attachments(atts)] == ["b"]

@@ -7,6 +7,7 @@ import os
 from pathlib import Path, PurePosixPath
 from unittest.mock import MagicMock, patch
 
+import pytest
 import yaml
 
 from confluence_export.exporter import (
@@ -735,6 +736,127 @@ class TestMediaDownload:
             mock_dl.assert_called_once()
             # Verify media dir was created and passed
             assert mock_dl.call_args[0][2].name == ".media"
+
+    @staticmethod
+    def _backdate(p):
+        # Age past the sweep's min-age gate (young matches are spared as a
+        # possibly-concurrent run's live transaction files).
+        import time
+
+        from confluence_export.media import _TEMP_ARTIFACT_MIN_AGE_S
+
+        old = time.time() - 2 * _TEMP_ARTIFACT_MIN_AGE_S
+        os.utime(p, (old, old), follow_symlinks=False)
+
+    def test_sweeps_stale_temp_artifacts_before_download(self, tmp_path):
+        # #48: temps a hard-killed earlier run left in .media are swept at the
+        # start of the media phase. The run's own .rollback- snapshots are
+        # created right after the sweep, so they are never caught by it.
+        exporter, _, _ = _make_exporter(download_media=True)
+        att = Attachment(id="a1", title="img.png", file_size=100,
+                         download_link="/wiki/download/a1", page_id="p1")
+        page = _make_page()
+        cs = _make_cached_space(attachments={"p1": [att]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / ".download-stale.tmp").write_bytes(b"x")
+        (media_dir / ".rollback-stale.tmp").write_bytes(b"x")
+        self._backdate(media_dir / ".download-stale.tmp")
+        self._backdate(media_dir / ".rollback-stale.tmp")
+
+        with patch("confluence_export.exporter.download_attachments") as mock_dl:
+            mock_dl.return_value = []
+            exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert not (media_dir / ".download-stale.tmp").exists()
+        assert not (media_dir / ".rollback-stale.tmp").exists()
+
+    def test_rollback_snapshot_mtime_is_fresh_not_inherited(self, tmp_path):
+        # copy2 stamps the SOURCE file's old mtime onto the snapshot; the #48
+        # sweep's age gate would misread that LIVE snapshot as crashed-run
+        # litter and a concurrent run could sweep it mid-transaction.
+        # snapshot_file resets the snapshot's mtime to now.
+        import time
+
+        exporter, _, _ = _make_exporter(download_media=True)
+        att = Attachment(id="a1", title="img.png", file_size=100,
+                         download_link="/wiki/download/a1", page_id="p1")
+        page = _make_page()
+        cs = _make_cached_space(attachments={"p1": [att]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / _VERSIONS_FILE).write_text("{}")
+        self._backdate(media_dir / _VERSIONS_FILE)
+
+        ages = []
+
+        def capture(*args, **kwargs):
+            ages.extend(
+                time.time() - p.lstat().st_mtime
+                for p in media_dir.glob(".rollback-*.tmp")
+            )
+            return []
+
+        with patch("confluence_export.exporter.download_attachments",
+                   side_effect=capture):
+            exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert ages  # the .versions.json snapshot existed during the download
+        assert all(age < 600 for age in ages)  # fresh, not the source's mtime
+
+    def test_no_media_sweeps_stale_temp_artifacts(self, tmp_path):
+        # #48: the materialize (no-download) branch sweeps too.
+        exporter, _, _ = _make_exporter(download_media=False)
+        att = Attachment(id="att1", title="img.png", file_size=100, page_id="p1",
+                         download_link="/wiki/download/att1")
+        page = _make_page()
+        cs = _make_cached_space(attachments={"p1": [att]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        stale = media_dir / ".preserve-stale"
+        stale.mkdir()
+        (stale / "0").write_bytes(b"x")
+        self._backdate(stale)
+
+        exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert not stale.exists()
+
+    @pytest.mark.parametrize("download_media", [True, False])
+    def test_sweeps_even_when_page_has_no_attachments(self, tmp_path, download_media):
+        # #48: a page whose attachments were all since deleted upstream takes
+        # no media branch at all — stale temps from a hard-killed earlier run
+        # must still be swept (they are untracked, so the prune can't remove
+        # them either).
+        exporter, _, _ = _make_exporter(download_media=download_media)
+        page = _make_page()
+        cs = _make_cached_space(attachments={"p1": []})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        stale = media_dir / ".download-stale.tmp"
+        stale.write_bytes(b"x")
+        self._backdate(stale)
+
+        exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert not stale.exists()
+
+    def test_sweep_never_reaches_through_symlinked_media_dir(self, tmp_path):
+        # The sweep guard must not follow a symlinked .media into an arbitrary
+        # target tree — sweep_stale_media_temps unlinks/rmtrees its matches.
+        exporter, _, _ = _make_exporter(download_media=False)
+        page = _make_page()
+        cs = _make_cached_space(attachments={"p1": []})
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        bait = outside / ".download-x.tmp"
+        bait.write_bytes(b"x")
+        self._backdate(bait)
+        (tmp_path / ".media").symlink_to(outside, target_is_directory=True)
+
+        exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert bait.exists()  # never swept through the link
 
     def test_no_media_materializes_planned_name_from_existing_manifest(self, tmp_path):
         exporter, _, _ = _make_exporter(download_media=False)

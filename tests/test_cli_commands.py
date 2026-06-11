@@ -1085,3 +1085,25 @@ class TestNetworkErrorHandling:
         err = capsys.readouterr().err
         assert "network request to Confluence failed" in err
         assert "re-run to retry" in err.lower()
+
+    def test_persistent_429_exits_cleanly(self, capsys):
+        # #46: an exhausted 429 now raises the typed HTTPError (a
+        # RequestException), so it lands in the same clean-exit handler instead
+        # of escaping as a RuntimeError traceback.
+        resp = MagicMock()
+        resp.status_code = 429
+        client = _mock_client()
+        cache = MagicMock()
+        cache.refresh.side_effect = requests.exceptions.HTTPError(
+            "429 Too Many Requests", response=resp
+        )
+        with patch("sys.argv", ["confluence-export", "refresh", "TEST"]), \
+             patch("confluence_export.cli.load_connection_profile", return_value=_profile()), \
+             patch("confluence_export.cli.ConfluenceClient", return_value=client), \
+             patch("confluence_export.cli.CacheStore", return_value=cache):
+            with pytest.raises(SystemExit) as exc:
+                main()
+            assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "network request to Confluence failed" in err
+        assert "429" in err

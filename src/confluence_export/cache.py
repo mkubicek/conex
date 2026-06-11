@@ -177,13 +177,17 @@ class CacheStore:
             for data in results:
                 if not data:
                     continue
+                # `or` coalescing (#47 class): the v2 dialect returns the RAW
+                # folder dict (no builder), so an explicit null must coalesce
+                # HERE — a None title/position crashes the layout planner/tree
+                # sort outside every per-page guard, aborting the whole export.
                 folder_page = Page(
-                    id=str(data.get("id", "")),
-                    title=data.get("title", ""),
-                    space_id=str(data.get("spaceId", "")),
-                    parent_id=str(data.get("parentId", "") or ""),
-                    parent_type=data.get("parentType", ""),
-                    position=data.get("position", 0),
+                    id=str(data.get("id") or ""),
+                    title=data.get("title") or "",
+                    space_id=str(data.get("spaceId") or ""),
+                    parent_id=str(data.get("parentId") or ""),
+                    parent_type=data.get("parentType") or "",
+                    position=data.get("position") or 0,
                     status="folder",
                 )
                 pages.append(folder_page)

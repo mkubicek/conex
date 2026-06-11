@@ -1554,3 +1554,137 @@ class TestRecordDownloadWarning:
         # The helper still prints when no collector is supplied.
         _record_download_warning(_att(title="x.png"), ValueError("nope"), None)
         assert "failed to download x.png" in capsys.readouterr().err
+
+
+def _backdate(p: Path) -> None:
+    """Age a temp artifact past the sweep's min-age gate (a young match is
+    treated as another live run's transaction file and spared)."""
+    import time
+
+    from confluence_export.media import _TEMP_ARTIFACT_MIN_AGE_S
+
+    old = time.time() - 2 * _TEMP_ARTIFACT_MIN_AGE_S
+    os.utime(p, (old, old), follow_symlinks=False)
+
+
+class TestSweepStaleMediaTemps:
+    """#48: leftover atomic-write/rollback temp artifacts from a hard-killed run
+    are swept at the start of the next run's media phase."""
+
+    def test_removes_all_temp_artifact_kinds(self, tmp_path):
+        from confluence_export.media import sweep_stale_media_temps
+
+        media = tmp_path / ".media"
+        media.mkdir()
+        for name in (".download-abc123.tmp", ".copy-abc123.tmp",
+                     ".versions-abc123.tmp", ".rollback-abc123.tmp",
+                     ".drawio-abc123.png"):
+            (media / name).write_bytes(b"x")
+            _backdate(media / name)
+        preserve = media / ".preserve-abc123"
+        preserve.mkdir()
+        (preserve / "0").write_bytes(b"snap")
+        _backdate(preserve)
+        # The live manifest and real media files must survive.
+        (media / _VERSIONS_FILE).write_text("{}")
+        (media / "img.png").write_bytes(b"real")
+
+        sweep_stale_media_temps(media)
+
+        assert sorted(p.name for p in media.iterdir()) == [_VERSIONS_FILE, "img.png"]
+
+    def test_manifest_resolved_legacy_name_spared(self, tmp_path):
+        # A LEGACY (pre-sanitizer) attachment can carry a temp-pattern name on
+        # disk — _resolve_manifest_entry still honors it — so a manifest-keyed
+        # match is a real attachment, never litter.
+        from confluence_export.media import sweep_stale_media_temps
+
+        media = tmp_path / ".media"
+        media.mkdir()
+        legacy = media / ".drawio-arch.png"
+        legacy.write_bytes(b"\x89PNG real attachment")
+        _backdate(legacy)
+        (media / _VERSIONS_FILE).write_text('{".drawio-arch.png": {}}')
+
+        sweep_stale_media_temps(media)
+
+        assert legacy.exists()
+
+    def test_preserve_pattern_regular_file_spared(self, tmp_path):
+        # .preserve-* is the one suffix-less pattern; conex's snapshots there
+        # are always directories, so a REGULAR FILE with that name can only be
+        # a legacy-named real attachment (even without a manifest entry).
+        from confluence_export.media import sweep_stale_media_temps
+
+        media = tmp_path / ".media"
+        media.mkdir()
+        legacy = media / ".preserve-notes.txt"
+        legacy.write_bytes(b"real bytes")
+        _backdate(legacy)
+
+        sweep_stale_media_temps(media)
+
+        assert legacy.exists()
+
+    def test_young_artifact_spared_as_possibly_live(self, tmp_path):
+        # A matching artifact younger than the min-age gate may belong to a
+        # CONCURRENT run's in-flight transaction; sweeping it would corrupt
+        # that run's rollback/download. It must be spared.
+        from confluence_export.media import sweep_stale_media_temps
+
+        media = tmp_path / ".media"
+        media.mkdir()
+        live = media / ".rollback-live.tmp"
+        live.write_bytes(b"peer transaction")
+
+        sweep_stale_media_temps(media)
+
+        assert live.exists()
+
+    def test_unremovable_entry_is_skipped_not_fatal(self, tmp_path):
+        from pathlib import Path as _P
+
+        from confluence_export.media import sweep_stale_media_temps
+
+        media = tmp_path / ".media"
+        media.mkdir()
+        (media / ".download-a.tmp").write_bytes(b"x")
+        _backdate(media / ".download-a.tmp")
+        with patch.object(_P, "unlink", side_effect=OSError("busy")):
+            sweep_stale_media_temps(media)  # best-effort: no raise
+        assert (media / ".download-a.tmp").exists()
+
+    def test_symlinked_preserve_entry_unlinked_without_following(self, tmp_path):
+        from confluence_export.media import sweep_stale_media_temps
+
+        media = tmp_path / ".media"
+        media.mkdir()
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "keep.txt").write_text("keep")
+        (media / ".preserve-link").symlink_to(target, target_is_directory=True)
+        _backdate(media / ".preserve-link")
+
+        sweep_stale_media_temps(media)
+
+        assert not (media / ".preserve-link").is_symlink()
+        assert (target / "keep.txt").exists()  # never rmtree'd through the link
+
+    def test_mid_snapshot_failure_cleans_up_preserve_dir(self, tmp_path):
+        # #48: a copy2 raise happens before the caller binds tmp_dir to its
+        # try/finally, so without the internal cleanup the .preserve- dir
+        # lingered until GC.
+        from confluence_export.media import _manifest_entry, _snapshot_previous_owned_files
+
+        media = tmp_path / ".media"
+        media.mkdir()
+        att = _att(title="new.png")
+        versions = {"old.png": _manifest_entry(att)}
+        (media / "old.png").write_bytes(b"bytes")
+        name_plan = plan_attachment_names([att])
+
+        with patch("confluence_export.media.shutil.copy2", side_effect=OSError("disk full")):
+            with pytest.raises(OSError, match="disk full"):
+                _snapshot_previous_owned_files(versions, media, [att], name_plan, set())
+
+        assert list(media.glob(".preserve-*")) == []

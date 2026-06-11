@@ -211,42 +211,10 @@ def _preprocess_html(
     for tag_name in ("ac:adf-fallback", "ac:adf-attribute", "ac:adf-mark"):
         for tag in list(soup.find_all(tag_name)):
             tag.decompose()
-    # Decision lists (ADF) must be rendered BEFORE the generic adf-node unwrap
-    # below, which would otherwise flatten them to plain text and drop both the
-    # list structure and the decided/undecided state (issue #40). A decisionItem's
-    # state lives in a ``state`` node attribute ("DECIDED"); its text is in child
-    # nodes. Render each list as a bullet list; mark decided items with a ✓.
-    for dlist in list(soup.find_all(
-        lambda t: t.name == "ac:adf-node"
-        and t.get("type") in ("decisionList", "decision-list")
-    )):
-        ul = soup.new_tag("ul")
-        for item in dlist.find_all(
-            lambda t: t.name == "ac:adf-node"
-            and t.get("type") in ("decisionItem", "decision-item")
-        ):
-            text = item.get_text().strip()
-            if not text:
-                continue
-            decided = (item.get("state", "") or "").strip().upper() == "DECIDED"
-            li = soup.new_tag("li")
-            li.string = ("✓ " if decided else "") + text
-            ul.append(li)
-        if ul.find("li"):
-            dlist.replace_with(ul)
-        else:
-            dlist.decompose()
-    # Unwrap adf-content, adf-extension, adf-node so their inner HTML is preserved
-    for tag_name in ("ac:adf-content", "ac:adf-extension", "ac:adf-node"):
-        for tag in list(soup.find_all(tag_name)):
-            tag.unwrap()
-
-    # --- Layout tags ---
-    for tag_name in ("ac:layout", "ac:layout-section", "ac:layout-cell"):
-        for tag in list(soup.find_all(tag_name)):
-            tag.unwrap()
 
     # --- Emoticons ---
+    # BEFORE the list pass below: decision items and task bodies render via
+    # get_text(), so an unreplaced <ac:emoticon> inside one would vanish.
     for tag in list(soup.find_all("ac:emoticon")):
         name = tag.get("ac:name", "")
         # Prefer our Unicode map; the ac:emoji-fallback is usually a shortcode
@@ -261,7 +229,7 @@ def _preprocess_html(
         else:
             tag.decompose()
 
-    # --- Time/date tags ---
+    # --- Time/date tags --- (before the list pass, same reason as emoticons)
     for tag in list(soup.find_all("time")):
         dt = tag.get("datetime", "")
         if dt:
@@ -269,20 +237,111 @@ def _preprocess_html(
         else:
             tag.decompose()
 
-    # --- Task lists ---
-    for task_list in list(soup.find_all("ac:task-list")):
-        ul = soup.new_tag("ul")
-        for task in list(task_list.find_all("ac:task")):
-            status = task.find("ac:task-status")
-            body = task.find("ac:task-body")
-            is_done = status and status.get_text().strip() == "complete"
-            checkbox = "[x] " if is_done else "[ ] "
-            li = soup.new_tag("li")
-            li.string = checkbox + (body.get_text().strip() if body else "")
-            ul.append(li)
-        task_list.replace_with(ul)
+    # Decision lists (ADF) must be rendered BEFORE the generic adf-node unwrap
+    # below, which would otherwise flatten them to plain text and drop both the
+    # list structure and the decided/undecided state (issue #40). A decisionItem's
+    # state lives in a ``state`` node attribute ("DECIDED"); its text is in child
+    # nodes. Render each list as a bullet list; mark decided items with a ✓.
+    def _is_decision_list(t: Tag) -> bool:
+        return t.name == "ac:adf-node" and t.get("type") in ("decisionList", "decision-list")
 
-    # (Decision lists are handled above, before the adf-node unwrap.)
+    def _is_decision_item(t: Tag) -> bool:
+        return t.name == "ac:adf-node" and t.get("type") in ("decisionItem", "decision-item")
+
+    # Render decision lists AND task lists in ONE pass, INNERMOST-FIRST. The
+    # two node types nest into each other (a Tab-indented ac:task-list inside
+    # a decisionItem, a decisionList inside an ac:task-body), so separate
+    # passes flatten whichever type renders second — the status word fused
+    # into the outer item's prose ("OutercompleteInner") was the symptom.
+    # Innermost-first also fixes the single-type case (#43): a nested list is
+    # already a <ul> by the time its enclosing list is built, so its items
+    # can neither duplicate into the outer item's text nor be lost when the
+    # outer node is replaced while the inner one is still pending.
+    def _is_nestable_list(t: Tag) -> bool:
+        return t.name == "ac:task-list" or _is_decision_list(t)
+
+    def _top_level_uls(scope: Tag) -> list[Tag]:
+        """The rendered ``<ul>``s ``scope`` owns DIRECTLY. find_all is
+        recursive, so on a 3+-level list it also returns the grandchild
+        ``<ul>``s — extracting those too would yank them OUT of the mid-level
+        ``<ul>`` and re-attach them one level too high (items survive, the
+        hierarchy flattens). Keep only ``<ul>``s whose nearest enclosing
+        ``<ul>`` is not also inside ``scope``. Identity, not ``==``: bs4 Tag
+        equality is structural and two rendered sublists can be identical."""
+        found = scope.find_all("ul")
+        ids = {id(u) for u in found}
+        return [u for u in found if id(u.find_parent("ul")) not in ids]
+
+    list_nodes = list(soup.find_all(_is_nestable_list))
+    for node in sorted(list_nodes, key=lambda n: len(list(n.parents)), reverse=True):
+        ul = soup.new_tag("ul")
+        if _is_decision_list(node):
+            for item in node.find_all(_is_decision_item):
+                # Defensive: with innermost-first rendering no deeper list
+                # survives here, but an item routed to the wrong list must
+                # never be emitted twice (#43).
+                if item.find_parent(_is_decision_list) is not node:
+                    continue  # pragma: no cover - defensive
+                # Rendered nested lists inside this item are <ul>s by now;
+                # lift them out so their text isn't flattened into this item's
+                # text, then re-attach them under the item's <li> as a sublist.
+                # Top-level only: deeper <ul>s ride along inside their parent.
+                nested_uls = [u.extract() for u in _top_level_uls(item)]
+                text = item.get_text().strip()
+                if text:
+                    decided = (item.get("state", "") or "").strip().upper() == "DECIDED"
+                    li = soup.new_tag("li")
+                    li.string = ("✓ " if decided else "") + text
+                    for u in nested_uls:
+                        li.append(u)
+                    ul.append(li)
+                else:
+                    # No own text: keep any nested items rather than dropping them.
+                    for u in nested_uls:
+                        for li_child in list(u.children):
+                            ul.append(li_child)
+        else:  # ac:task-list
+            for task in list(node.find_all("ac:task")):
+                # Defensive: innermost-first rendering already consumed any
+                # deeper list's tasks.
+                if task.find_parent("ac:task-list") is not node:
+                    continue  # pragma: no cover - defensive
+                status = task.find("ac:task-status")
+                body = task.find("ac:task-body")
+                nested_uls = [u.extract() for u in _top_level_uls(task)]
+                is_done = status and status.get_text().strip() == "complete"
+                checkbox = "[x] " if is_done else "[ ] "
+                li = soup.new_tag("li")
+                li.string = checkbox + (body.get_text().strip() if body else "")
+                for u in nested_uls:
+                    li.append(u)
+                ul.append(li)
+        # A rendered nested list that was NOT inside any of this list's items
+        # (e.g. a list as a direct child of a list) would be discarded by
+        # replace_with below; splice its items in instead. Top-level only —
+        # a deeper <ul> already lives inside a spliced <li>.
+        for stray in _top_level_uls(node):
+            stray.extract()
+            for li_child in list(stray.children):
+                ul.append(li_child)
+        # Task lists always render (an all-unchecked empty list is meaningful);
+        # an empty decision list is dropped (#40).
+        if node.name == "ac:task-list" or ul.find("li"):
+            node.replace_with(ul)
+        else:
+            node.decompose()
+    # Unwrap adf-content, adf-extension, adf-node so their inner HTML is preserved
+    for tag_name in ("ac:adf-content", "ac:adf-extension", "ac:adf-node"):
+        for tag in list(soup.find_all(tag_name)):
+            tag.unwrap()
+
+    # --- Layout tags ---
+    for tag_name in ("ac:layout", "ac:layout-section", "ac:layout-cell"):
+        for tag in list(soup.find_all(tag_name)):
+            tag.unwrap()
+
+    # (Emoticons, time tags, decision lists, and task lists are handled
+    # together above, before the adf-node unwrap.)
 
     # --- User mentions (ri:user inside ac:link or standalone) ---
     for user_tag in list(soup.find_all("ri:user")):
@@ -379,9 +438,10 @@ def _preprocess_html(
         elif macro_name == "view-file":
             _convert_view_file(soup, macro, name_plan, available_media)
         elif macro_name in ("excerpt", "section", "column"):
-            # Pure layout/wrapper — keep body, drop wrapper, no placeholder
-            body = macro.find("ac:rich-text-body")
-            if body:
+            # Pure layout/wrapper — keep body, drop wrapper, no placeholder.
+            # Own bodies only (#45): a recursive find would unwrap a NESTED
+            # macro's body tag here, breaking that macro's own conversion.
+            for body in _macro_own_bodies(macro):
                 body.unwrap()
             macro.unwrap()
         else:
@@ -390,9 +450,18 @@ def _preprocess_html(
             # include, future Confluence additions) — emit a visible
             # placeholder so the reader knows something was there instead
             # of silently dropping it.
-            body = macro.find("ac:rich-text-body")
-            if body and body.get_text(strip=True):
-                macro.replace_with(*list(body.children))
+            bodies = _macro_own_bodies(macro)
+            if bodies and any(b.get_text(strip=True) for b in bodies):
+                macro.replace_with(*[el for b in bodies for el in list(b.children)])
+            elif macro.find("ac:structured-macro") is not None:
+                # No own body, but the macro WRAPS real macros (the #45 steal
+                # shape): keep the children live so the dispatch still
+                # converts them, instead of replacing the whole subtree with
+                # a placeholder. Drop own parameters so they can't leak as
+                # plain text.
+                for p in macro.find_all("ac:parameter", recursive=False):
+                    p.decompose()
+                macro.unwrap()
             else:
                 _convert_dynamic_macro_placeholder(soup, macro, macro_name)
 
@@ -508,12 +577,52 @@ def _replace_ac_link(
     tag.decompose()
 
 
+def _macro_own_bodies(macro: Tag) -> list[Tag]:
+    """ALL ``ac:rich-text-body`` nodes OWNED by this macro: direct children in
+    well-formed storage. On malformed storage (e.g. an unclosed
+    ``ac:parameter`` that swallowed the body) fall back to deeper descendants —
+    but only those whose nearest enclosing macro is THIS macro, so a nested
+    macro's body is never stolen (#45) while the mis-nested bodies' content is
+    still preserved instead of being silently discarded by replace_with."""
+    bodies = macro.find_all("ac:rich-text-body", recursive=False)
+    if bodies:
+        return bodies
+    return [
+        b
+        for b in macro.find_all("ac:rich-text-body")
+        if b.find_parent("ac:structured-macro") is macro
+    ]
+
+
+def _own_title_and_body_children(macro: Tag, default_title: str) -> tuple[str, list]:
+    """Resolve a bodied macro's own title and DETACH its body content as live
+    nodes, for _convert_panel/_convert_expand.
+
+    Title: a DIRECT-child ``ac:parameter`` only (#45 — an untitled macro must
+    never steal a nested macro's title). Body: every body ``_macro_own_bodies``
+    owns. A macro with NO own body at all treats its remaining non-parameter
+    children as the body, so a nested macro is moved LIVE — staying in the
+    structured-macro dispatch snapshot and converted in place — instead of
+    being destroyed by the caller's replace_with. Children are detached BEFORE
+    the title text is read so a body swallowed by an unclosed title parameter
+    cannot duplicate into the title."""
+    title_param = macro.find("ac:parameter", attrs={"ac:name": "title"}, recursive=False)
+    bodies = _macro_own_bodies(macro)
+    if bodies:
+        children = [el.extract() for b in bodies for el in list(b.children)]
+    else:
+        children = [
+            el.extract()
+            for el in list(macro.children)
+            if not (isinstance(el, Tag) and el.name == "ac:parameter")
+        ]
+    title = title_param.get_text().strip() if title_param else ""
+    return (title or default_title), children
+
+
 def _convert_panel(soup: BeautifulSoup, macro: Tag, macro_name: str) -> None:
     """Convert info/tip/note/warning/panel to blockquotes."""
-    title_param = macro.find("ac:parameter", attrs={"ac:name": "title"})
-    title = title_param.get_text().strip() if title_param else macro_name.capitalize()
-
-    body = macro.find("ac:rich-text-body")
+    title, body_children = _own_title_and_body_children(macro, macro_name.capitalize())
 
     blockquote = soup.new_tag("blockquote")
     strong = soup.new_tag("strong")
@@ -528,9 +637,8 @@ def _convert_panel(soup: BeautifulSoup, macro: Tag, macro_name: str) -> None:
     # diagram inside a panel was silently dropped (never converted). Moving the
     # live nodes keeps them attached and still in the snapshot, so the dispatch
     # converts them in place.
-    if body:
-        for element in list(body.children):
-            blockquote.append(element)
+    for element in body_children:
+        blockquote.append(element)
 
     macro.replace_with(blockquote)
 
@@ -573,10 +681,7 @@ def _convert_status(soup: BeautifulSoup, macro: Tag) -> None:
 
 def _convert_expand(soup: BeautifulSoup, macro: Tag) -> None:
     """Convert expand macro to a details/summary block (rendered as heading + content)."""
-    title_param = macro.find("ac:parameter", attrs={"ac:name": "title"})
-    title = title_param.get_text().strip() if title_param else "Details"
-
-    body = macro.find("ac:rich-text-body")
+    title, body_children = _own_title_and_body_children(macro, "Details")
 
     # Heading + content. Move the LIVE body children (not a re-parsed copy) so a
     # macro nested in the expand body — e.g. a drawio diagram — stays attached and
@@ -588,9 +693,8 @@ def _convert_expand(soup: BeautifulSoup, macro: Tag) -> None:
     h4.string = title
     container.append(h4)
 
-    if body:
-        for element in list(body.children):
-            container.append(element)
+    for element in body_children:
+        container.append(element)
 
     macro.replace_with(*list(container.children))
 
