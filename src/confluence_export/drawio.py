@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from confluence_export.diagnostics import WarningCollector
+from confluence_export.media import DRAWIO_TMP_PREFIX
 from confluence_export.filemode import default_file_mode, replacement_mode
 from confluence_export.types import Attachment
 
@@ -135,7 +136,7 @@ def render_drawio_to_png(
     )
     fd, tmp_name = tempfile.mkstemp(
         dir=output_path.parent,
-        prefix=".drawio-",
+        prefix=DRAWIO_TMP_PREFIX,
         suffix=".png",
     )
     os.close(fd)

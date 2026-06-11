@@ -1556,6 +1556,15 @@ class TestRecordDownloadWarning:
         assert "failed to download x.png" in capsys.readouterr().err
 
 
+def _backdate(p: Path) -> None:
+    """Age a temp artifact past the sweep's min-age gate (a young match is
+    treated as another live run's transaction file and spared)."""
+    import time
+
+    old = time.time() - 7200
+    os.utime(p, (old, old), follow_symlinks=False)
+
+
 class TestSweepStaleMediaTemps:
     """#48: leftover atomic-write/rollback temp artifacts from a hard-killed run
     are swept at the start of the next run's media phase."""
@@ -1565,13 +1574,15 @@ class TestSweepStaleMediaTemps:
 
         media = tmp_path / ".media"
         media.mkdir()
-        (media / ".download-abc123.tmp").write_bytes(b"x")
-        (media / ".copy-abc123.tmp").write_bytes(b"x")
-        (media / ".versions-abc123.tmp").write_bytes(b"x")
-        (media / ".rollback-abc123.tmp").write_bytes(b"x")
+        for name in (".download-abc123.tmp", ".copy-abc123.tmp",
+                     ".versions-abc123.tmp", ".rollback-abc123.tmp",
+                     ".drawio-abc123.png"):
+            (media / name).write_bytes(b"x")
+            _backdate(media / name)
         preserve = media / ".preserve-abc123"
         preserve.mkdir()
         (preserve / "0").write_bytes(b"snap")
+        _backdate(preserve)
         # The live manifest and real media files must survive.
         (media / _VERSIONS_FILE).write_text("{}")
         (media / "img.png").write_bytes(b"real")
@@ -1579,6 +1590,21 @@ class TestSweepStaleMediaTemps:
         sweep_stale_media_temps(media)
 
         assert sorted(p.name for p in media.iterdir()) == [_VERSIONS_FILE, "img.png"]
+
+    def test_young_artifact_spared_as_possibly_live(self, tmp_path):
+        # A matching artifact younger than the min-age gate may belong to a
+        # CONCURRENT run's in-flight transaction; sweeping it would corrupt
+        # that run's rollback/download. It must be spared.
+        from confluence_export.media import sweep_stale_media_temps
+
+        media = tmp_path / ".media"
+        media.mkdir()
+        live = media / ".rollback-live.tmp"
+        live.write_bytes(b"peer transaction")
+
+        sweep_stale_media_temps(media)
+
+        assert live.exists()
 
     def test_unremovable_entry_is_skipped_not_fatal(self, tmp_path):
         from pathlib import Path as _P
@@ -1588,6 +1614,7 @@ class TestSweepStaleMediaTemps:
         media = tmp_path / ".media"
         media.mkdir()
         (media / ".download-a.tmp").write_bytes(b"x")
+        _backdate(media / ".download-a.tmp")
         with patch.object(_P, "unlink", side_effect=OSError("busy")):
             sweep_stale_media_temps(media)  # best-effort: no raise
         assert (media / ".download-a.tmp").exists()
@@ -1601,6 +1628,7 @@ class TestSweepStaleMediaTemps:
         target.mkdir()
         (target / "keep.txt").write_text("keep")
         (media / ".preserve-link").symlink_to(target, target_is_directory=True)
+        _backdate(media / ".preserve-link")
 
         sweep_stale_media_temps(media)
 

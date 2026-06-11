@@ -37,6 +37,7 @@ from confluence_export.media import (
     _VERSIONS_FILE,
     _load_versions,
     _resolve_manifest_entry,
+    ROLLBACK_TMP_PREFIX,
     available_attachment_names,
     download_attachments,
     ensure_media_dir,
@@ -578,7 +579,7 @@ class Exporter:
                 return
             fd, tmp_name = tempfile.mkstemp(
                 dir=path.parent,
-                prefix=".rollback-",
+                prefix=ROLLBACK_TMP_PREFIX,
                 suffix=".tmp",
             )
             os.close(fd)
@@ -637,12 +638,17 @@ class Exporter:
         available_media: set[str] = set()
         current_attachment_names = {name_plan.for_attachment(att) for att in attachments}
         reserved_media_names = set(current_attachment_names)
+        existing_media_dir = page_dir / MEDIA_DIR_NAME
         try:
+            # Sweep BEFORE the first snapshot_file (this run's own .rollback-
+            # snapshots live in media_dir too) and regardless of whether the
+            # page still HAS attachments — a hard-killed run's temps must not
+            # survive forever just because the attachments were since deleted
+            # upstream (#48). A fresh dir created below has nothing to sweep.
+            if existing_media_dir.is_dir() and not existing_media_dir.is_symlink():
+                sweep_stale_media_temps(existing_media_dir)
             if self.download_media and attachments:
                 media_dir = ensure_media_dir(page_dir)
-                # Sweep BEFORE the first snapshot_file: this run's own
-                # .rollback- snapshots live in media_dir too (#48).
-                sweep_stale_media_temps(media_dir)
                 snapshot_file(media_dir / _VERSIONS_FILE)
                 for name in current_attachment_names:
                     snapshot_file(resolve_within(media_dir, name))
@@ -652,21 +658,18 @@ class Exporter:
                     )
                 )
             elif not self.download_media and attachments:
-                existing_media_dir = page_dir / MEDIA_DIR_NAME
                 if existing_media_dir.is_dir():
                     if existing_media_dir.is_symlink():
                         raise ValueError(
                             f"refusing to use symlinked media directory: {existing_media_dir}"
                         )
                     media_dir = existing_media_dir
-                    sweep_stale_media_temps(media_dir)
                     snapshot_file(media_dir / _VERSIONS_FILE)
                     snapshot_manifest_owned_files(media_dir)
                     for name in current_attachment_names:
                         snapshot_file(resolve_within(media_dir, name))
                     written.extend(materialize_existing_attachments(attachments, media_dir))
             elif not self.download_media and not attachments:
-                existing_media_dir = page_dir / MEDIA_DIR_NAME
                 if existing_media_dir.is_dir():
                     if existing_media_dir.is_symlink():
                         raise ValueError(
