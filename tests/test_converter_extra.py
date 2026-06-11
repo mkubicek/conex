@@ -1089,6 +1089,77 @@ def test_panel_keeps_all_mis_nested_bodies():
     assert "Second body" in result
 
 
+def test_three_level_task_list_preserves_middle_nesting():
+    # find_all("ul") is recursive: extracting both the mid and inner rendered
+    # lists pulled Inner OUT of Mid's just-extracted subtree and re-attached
+    # it one level too high — "Outer > Mid" + "Outer > Inner", losing
+    # "Mid > Inner". Three-level Tab-indented action items are producible in
+    # the real editor.
+    html = (
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>incomplete</ac:task-status>"
+        "<ac:task-body>Outer"
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>incomplete</ac:task-status>"
+        "<ac:task-body>Mid"
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>complete</ac:task-status>"
+        "<ac:task-body>Inner</ac:task-body>"
+        "</ac:task></ac:task-list>"
+        "</ac:task-body>"
+        "</ac:task></ac:task-list>"
+        "</ac:task-body>"
+        "</ac:task></ac:task-list>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("Inner") == 1
+    # Inner's sublist lives INSIDE Mid's <li>, not as its sibling.
+    assert "<li>[ ] Mid<ul><li>[x] Inner</li></ul></li>" in result
+
+
+def test_three_level_decision_list_preserves_middle_nesting():
+    # Decision twin of the three-level task case (same extraction sites).
+    html = (
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem"><p>Outer</p>'
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem"><p>Mid</p>'
+        '<ac:adf-node type="decisionList">'
+        '<ac:adf-node type="decisionItem" state="DECIDED"><p>Inner</p></ac:adf-node>'
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+        "</ac:adf-node>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("Inner") == 1
+    assert "<li>Mid<ul><li>✓ Inner</li></ul></li>" in result
+
+
+def test_stray_splice_keeps_deep_nesting():
+    # The stray-splice loop had the same recursive find_all("ul") shape: an
+    # outer list whose DIRECT CHILD is a list whose task carries its own
+    # sublist — the deep sublist was yanked back out of Mid's already-spliced
+    # <li> and its items appended flat beside it.
+    html = (
+        "<ac:task-list>"
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>incomplete</ac:task-status>"
+        "<ac:task-body>Mid"
+        "<ac:task-list><ac:task>"
+        "<ac:task-status>complete</ac:task-status>"
+        "<ac:task-body>Inner</ac:task-body>"
+        "</ac:task></ac:task-list>"
+        "</ac:task-body>"
+        "</ac:task></ac:task-list>"
+        "</ac:task-list>"
+    )
+    result = _preprocess_html(html, [])
+    assert result.count("Inner") == 1
+    assert "<li>[ ] Mid<ul><li>[x] Inner</li></ul></li>" in result
+
+
 def test_unknown_bodyless_macro_wrapping_real_macro_keeps_it():
     # Default branch: an unknown macro with no own body WRAPPING a real macro
     # must unwrap (children stay live and convert), not stamp a placeholder

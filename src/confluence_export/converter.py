@@ -260,6 +260,18 @@ def _preprocess_html(
     def _is_nestable_list(t: Tag) -> bool:
         return t.name == "ac:task-list" or _is_decision_list(t)
 
+    def _top_level_uls(scope: Tag) -> list[Tag]:
+        """The rendered ``<ul>``s ``scope`` owns DIRECTLY. find_all is
+        recursive, so on a 3+-level list it also returns the grandchild
+        ``<ul>``s — extracting those too would yank them OUT of the mid-level
+        ``<ul>`` and re-attach them one level too high (items survive, the
+        hierarchy flattens). Keep only ``<ul>``s whose nearest enclosing
+        ``<ul>`` is not also inside ``scope``. Identity, not ``==``: bs4 Tag
+        equality is structural and two rendered sublists can be identical."""
+        found = scope.find_all("ul")
+        ids = {id(u) for u in found}
+        return [u for u in found if id(u.find_parent("ul")) not in ids]
+
     list_nodes = list(soup.find_all(_is_nestable_list))
     for node in sorted(list_nodes, key=lambda n: len(list(n.parents)), reverse=True):
         ul = soup.new_tag("ul")
@@ -273,7 +285,8 @@ def _preprocess_html(
                 # Rendered nested lists inside this item are <ul>s by now;
                 # lift them out so their text isn't flattened into this item's
                 # text, then re-attach them under the item's <li> as a sublist.
-                nested_uls = [u.extract() for u in item.find_all("ul")]
+                # Top-level only: deeper <ul>s ride along inside their parent.
+                nested_uls = [u.extract() for u in _top_level_uls(item)]
                 text = item.get_text().strip()
                 if text:
                     decided = (item.get("state", "") or "").strip().upper() == "DECIDED"
@@ -295,7 +308,7 @@ def _preprocess_html(
                     continue  # pragma: no cover - defensive
                 status = task.find("ac:task-status")
                 body = task.find("ac:task-body")
-                nested_uls = [u.extract() for u in task.find_all("ul")]
+                nested_uls = [u.extract() for u in _top_level_uls(task)]
                 is_done = status and status.get_text().strip() == "complete"
                 checkbox = "[x] " if is_done else "[ ] "
                 li = soup.new_tag("li")
@@ -305,8 +318,9 @@ def _preprocess_html(
                 ul.append(li)
         # A rendered nested list that was NOT inside any of this list's items
         # (e.g. a list as a direct child of a list) would be discarded by
-        # replace_with below; splice its items in instead.
-        for stray in list(node.find_all("ul")):
+        # replace_with below; splice its items in instead. Top-level only —
+        # a deeper <ul> already lives inside a spliced <li>.
+        for stray in _top_level_uls(node):
             stray.extract()
             for li_child in list(stray.children):
                 ul.append(li_child)
