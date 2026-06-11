@@ -199,6 +199,16 @@ class TestPaginate:
             assert results[0]["id"] == "1"
             assert results[1]["id"] == "2"
 
+    def test_null_envelope_fields_coalesced(self):
+        # #47 class: an explicit-null envelope ("results"/"_links": null) must
+        # not raise a TypeError/AttributeError — neither is a
+        # RequestException, so it would escape the CLI's network-error
+        # handler as a raw traceback aborting the whole refresh.
+        client = _make_client()
+        with patch.object(client, "_get") as mock:
+            mock.return_value = {"results": None, "_links": None}
+            assert client._paginate("/test") == []
+
 
 class TestApiMethods:
     def test_get_spaces(self):
@@ -526,6 +536,67 @@ class TestCookieV1Mode:
         assert atts[0].webui == ""
 
 
+class TestV1BuilderNullShapes:
+    """#47 parity for the remaining v1 builders: like _attachment_from_v1 they
+    build their records directly (not via from_api), and `x.get(k) or ""` is a
+    single line — so line coverage alone cannot catch a regression back to the
+    dict-key-default idiom. These pin the null shape per builder."""
+
+    def test_page_from_v1_explicit_nulls_coalesced(self):
+        client = _make_client()
+        p = client._page_from_v1({
+            "id": None, "title": None, "status": None,
+            "space": {"id": None}, "history": None,
+            "ancestors": [None], "extensions": {"position": None},
+            "body": {"storage": {"value": None}},
+            "_links": None,
+        })
+        assert p.id == ""            # not the truthy string "None"
+        assert p.title == ""
+        assert p.space_id == ""
+        assert p.parent_id == ""
+        assert p.parent_type == ""
+        assert p.position == 0
+        assert p.body_storage == ""
+        assert p.webui == ""
+
+    def test_space_from_v1_explicit_nulls_coalesced(self):
+        client = _make_client()
+        s = client._space_from_v1({
+            "id": None, "key": None, "name": None, "type": None,
+            "status": None, "homepageId": None, "homepage": None,
+            "_links": None,
+        })
+        assert s.id == ""
+        assert s.key == ""
+        assert s.name == ""
+        assert s.homepage_id == ""
+        assert s.webui == ""
+
+    def test_version_from_v1_explicit_nulls_coalesced(self):
+        client = _make_client()
+        v = client._version_from_v1({
+            "createdAt": None, "when": None, "message": None,
+            "number": None, "minorEdit": None, "by": None,
+        })
+        assert v.created_at == ""
+        assert v.message == ""
+        assert v.number == 0
+        assert v.minor_edit is False
+
+    def test_folder_from_v1_explicit_nulls_coalesced(self):
+        client = _make_client()
+        f = client._folder_from_v1({
+            "id": None, "title": None, "space": {"id": None},
+            "ancestors": [None], "extensions": {"position": None},
+        })
+        assert f["id"] == ""
+        assert f["title"] == ""
+        assert f["spaceId"] == ""
+        assert f["parentId"] == ""
+        assert f["position"] == 0
+
+
 class TestVerboseLogging:
     def test_log_when_verbose(self, capsys):
         client = _make_client()
@@ -671,6 +742,13 @@ class TestPaginateOffset:
         second_path, second_params = mock.call_args_list[1].args
         assert second_path == "/wiki/rest/api/space"
         assert second_params == {"start": "25", "limit": "25"}
+
+    def test_null_envelope_fields_coalesced(self):
+        # #47 class: v1 twin of TestPaginate's null-envelope test.
+        client = _make_client()
+        with patch.object(client, "_get") as mock:
+            mock.return_value = {"results": None, "_links": None}
+            assert client._paginate_offset("/wiki/rest/api/space") == []
 
 
 class TestSpaceKeyForV1:

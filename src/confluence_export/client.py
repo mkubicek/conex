@@ -26,6 +26,10 @@ from confluence_export.types import Attachment, Page, Space, Version
 # or buggy header that would otherwise stall a CLI export for hours.
 _RETRY_AFTER_CAP_S = 300.0
 
+# Wait used when the header is absent or junk (unparseable, non-finite,
+# negative). One constant for all three fallback sites so they cannot drift.
+_RETRY_AFTER_DEFAULT_S = 60.0
+
 
 class AuthenticationError(Exception):
     """Raised when the server returns 401 or 403."""
@@ -223,15 +227,17 @@ class ConfluenceClient:
                 # that would escape the (HTTPError, ConnectionError)-only except
                 # and crash a retryable 429; fall back to 60s.
                 try:
-                    retry_after = float(exc.response.headers.get("Retry-After", 60))
+                    retry_after = float(
+                        exc.response.headers.get("Retry-After", _RETRY_AFTER_DEFAULT_S)
+                    )
                 except (TypeError, ValueError):
-                    retry_after = 60.0
+                    retry_after = _RETRY_AFTER_DEFAULT_S
                 # Trust the header only within reason: float() accepts "inf"
                 # (time.sleep(inf) raises OverflowError OUTSIDE the requests-
                 # only except — a raw traceback), and a huge finite value
                 # would stall every worker via the shared window for days.
                 if not math.isfinite(retry_after) or retry_after < 0:
-                    retry_after = 60.0
+                    retry_after = _RETRY_AFTER_DEFAULT_S
                 retry_after = min(retry_after, _RETRY_AFTER_CAP_S)
                 # Extend the shared cross-thread backoff window on EVERY 429,
                 # including the exhausted last attempt: concurrent download/
@@ -317,9 +323,13 @@ class ConfluenceClient:
 
         while True:
             data = self._get(current_path, current_params)
-            all_results.extend(data.get("results", []))
+            # `or` coalescing (#47 class): an explicit-null envelope field
+            # would raise TypeError/AttributeError here — not a
+            # RequestException, so it would escape the CLI's network-error
+            # handler as a raw traceback.
+            all_results.extend(data.get("results") or [])
 
-            next_link = data.get("_links", {}).get("next")
+            next_link = (data.get("_links") or {}).get("next")
             if not next_link:
                 break
 
@@ -338,9 +348,13 @@ class ConfluenceClient:
 
         while True:
             data = self._get(current_path, current_params)
-            all_results.extend(data.get("results", []))
+            # `or` coalescing (#47 class): an explicit-null envelope field
+            # would raise TypeError/AttributeError here — not a
+            # RequestException, so it would escape the CLI's network-error
+            # handler as a raw traceback.
+            all_results.extend(data.get("results") or [])
 
-            next_link = data.get("_links", {}).get("next")
+            next_link = (data.get("_links") or {}).get("next")
             if not next_link:
                 break
 
@@ -430,7 +444,7 @@ class ConfluenceClient:
             author_id=self._account_id(history.get("createdBy")),
             created_at=history.get("createdDate") or "",
             version=self._version_from_v1(data.get("version")),
-            body_storage=storage.get("value", "") if storage else "",
+            body_storage=(storage.get("value") or "") if storage else "",
             webui=links.get("webui") or "",
             editui=links.get("editui") or "",
             tinyui=links.get("tinyui") or "",

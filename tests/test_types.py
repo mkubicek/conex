@@ -99,6 +99,14 @@ class TestPage:
         p2 = Page.from_dict(d)
         assert p2.title == ""        # the cache round-trip stays clean
 
+    def test_from_api_null_body_storage_value_coalesced(self):
+        # #47 class: the one field the first coalescing pass missed. A None
+        # here reaches BeautifulSoup in convert_page (TypeError), so the page
+        # is warned and skipped on EVERY run instead of exporting empty.
+        p = Page.from_api({"id": "42", "title": "T",
+                           "body": {"storage": {"value": None}}})
+        assert p.body_storage == ""
+
     def test_round_trip(self):
         p = Page(id="1", title="Test", space_id="s1", parent_id="p1",
                  parent_type="page", position=2, status="current",

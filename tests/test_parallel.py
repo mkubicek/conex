@@ -144,6 +144,27 @@ class TestResolveFoldersMultilevel:
         client.get_folder_by_id.assert_not_called()
         assert len(result) == 2
 
+    def test_folder_with_explicit_nulls_coalesced(self):
+        """#47 class: the v2 dialect returns the RAW folder dict (no builder),
+        so explicit nulls reach this Page(...) construction directly — a None
+        title/position used to crash the layout planner / tree sort OUTSIDE
+        every per-page guard, aborting the whole export."""
+        pages = [_make_page("1", parent_id="f1")]
+
+        client = MagicMock()
+        client.get_folder_by_id.return_value = {
+            "id": "f1", "title": None, "spaceId": None, "parentId": None,
+            "parentType": None, "position": None,
+        }
+        result = CacheStore._resolve_folders(client, pages)
+
+        folder = next(p for p in result if p.id == "f1")
+        assert folder.title == ""
+        assert folder.space_id == ""   # not the truthy string "None"
+        assert folder.parent_id == ""
+        assert folder.parent_type == ""
+        assert folder.position == 0
+
 
 # ---------------------------------------------------------------------------
 # download_attachments – parallel error isolation

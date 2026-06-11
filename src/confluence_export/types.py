@@ -95,7 +95,7 @@ class Page:
             author_id=data.get("authorId") or "",
             created_at=data.get("createdAt") or "",
             version=Version.from_api(data.get("version")),
-            body_storage=storage.get("value", "") if storage else "",
+            body_storage=(storage.get("value") or "") if storage else "",
             webui=links.get("webui") or "",
             editui=links.get("editui") or "",
             tinyui=links.get("tinyui") or "",
