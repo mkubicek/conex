@@ -1,0 +1,357 @@
+"""Filesystem-safety helpers for untrusted API-controlled names.
+
+Confluence attachment titles and page titles are untrusted input: a title like
+``../../../etc/cron.d/evil`` or an absolute path must never be used verbatim as
+a filesystem path.  This module owns:
+
+- :func:`sanitize_filename` — page title -> directory/file segment (word chars,
+  spaces, hyphens; 100-char cap).  Used ONLY for page dirs and markdown stems.
+- :func:`safe_attachment_name` / :func:`safe_component` — neutralize path
+  separators, control characters, leading dots, traversal tokens.  Used ONLY for
+  attachment files.
+- :func:`plan_attachment_names` — per-page collision-safe :class:`AttachmentNamePlan`.
+- :func:`resolve_within` — defence-in-depth containment assert (S1 posture).
+- :func:`nfc` / :func:`nfc_casefold` — canonical Unicode folds.
+- :func:`truncate_with_suffix` — append a suffix without exceeding MAX_FILENAME_LEN.
+
+Invariant: page dirs and .md file stems ALWAYS go through :func:`sanitize_filename`;
+attachment files ALWAYS go through :func:`safe_attachment_name` /
+:func:`plan_attachment_names`.  The two sanitizers are NOT interchangeable.
+"""
+
+from __future__ import annotations
+
+import re
+import unicodedata
+from dataclasses import dataclass
+from pathlib import Path
+
+MAX_FILENAME_LEN = 100
+
+
+# ---------------------------------------------------------------------------
+# Unicode normalization helpers
+# ---------------------------------------------------------------------------
+
+def nfc(s: str) -> str:
+    """Normalize to Unicode NFC — the form git stores on macOS with
+    core.precomposeunicode, and the canonical form a normalizing filesystem
+    (APFS) folds equivalent byte strings to."""
+    return unicodedata.normalize("NFC", s)
+
+
+def nfc_casefold(s: str) -> str:
+    """NFC + casefold: the identity a case-insensitive, normalizing filesystem
+    and git fold together.  The shared collision key for layout segments and
+    stale-file comparisons."""
+    return nfc(s).casefold()
+
+
+# ---------------------------------------------------------------------------
+# sanitize_filename — page dirs / .md stems only
+# ---------------------------------------------------------------------------
+
+def sanitize_filename(title: str) -> str:
+    """Convert a page title to a safe directory / file stem.
+
+    Keeps word characters (\\w), spaces, and hyphens; collapses runs of
+    separators to a single hyphen; strips leading/trailing hyphens; caps at
+    MAX_FILENAME_LEN.  Returns ``"untitled"`` for titles that reduce to empty.
+
+    This is the ONLY sanitizer for page-directory segments and markdown stems;
+    never use it for attachment filenames.
+    """
+    name = re.sub(r"[^\w\s-]", "", title)
+    name = re.sub(r"[-\s]+", "-", name)
+    name = name.strip("-")
+    if len(name) > MAX_FILENAME_LEN:
+        name = name[:MAX_FILENAME_LEN].rstrip("-")
+    return name or "untitled"
+
+
+# ---------------------------------------------------------------------------
+# truncate_with_suffix — layout collision suffixes
+# ---------------------------------------------------------------------------
+
+def truncate_with_suffix(segment: str, suffix: str) -> str:
+    """Append ``suffix`` to ``segment`` without exceeding MAX_FILENAME_LEN.
+
+    The base is truncated to ``MAX_FILENAME_LEN - len(suffix)`` chars first;
+    trailing hyphens are stripped from the truncated base so the result is a
+    valid sanitize_filename output.  Falls back to ``"untitled"`` if the
+    truncated base is empty.
+    """
+    avail = MAX_FILENAME_LEN - len(suffix)
+    truncated = segment[:avail].rstrip("-")
+    if not truncated:
+        truncated = "untitled"
+    return f"{truncated}{suffix}"
+
+
+# ---------------------------------------------------------------------------
+# safe_component / safe_attachment_name — attachment files only
+# ---------------------------------------------------------------------------
+
+def safe_component(
+    value: object,
+    *,
+    fallback: str = "attachment",
+    max_len: int = MAX_FILENAME_LEN,
+) -> str:
+    """Return one filesystem-safe path component for untrusted text.
+
+    Path separators and control characters are stripped, traversal/absolute
+    tokens are neutralized, and a leading ``.``/``-`` is prefixed with ``_`` so
+    the result can never be a dotfile or look like a command-line option.
+    Filesystem-legal punctuation common in attachment names (spaces, parens,
+    dots, hyphens) is preserved so benign names round-trip unchanged.
+
+    Use this for attachment filenames only; page dirs use :func:`sanitize_filename`.
+    """
+    text = unicodedata.normalize("NFC", str(value or ""))
+    text = re.sub(r"[\x00-\x1f\x7f]", "", text)
+    text = text.replace("/", "-").replace("\\", "-")
+    text = re.sub(r"[^\w\s().-]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"-{2,}", "-", text).strip(" -")
+    if not text or text in {".", ".."}:
+        return fallback
+    if text.startswith((".", "-")):
+        text = f"_{text.lstrip('.')}"
+    if len(text) > max_len:
+        text = _truncate_component(text, max_len)
+    return text or fallback
+
+
+def _truncate_component(name: str, max_len: int) -> str:
+    """Truncate ``name`` to ``max_len`` while preserving its extension."""
+    suffix = "".join(Path(name).suffixes)
+    if suffix and len(suffix) < max_len // 2:
+        stem_len = max_len - len(suffix)
+        return (name[: -len(suffix)][:stem_len].rstrip("-._") + suffix) or name[:max_len]
+    return name[:max_len].rstrip("-._") or name[:max_len]
+
+
+def _with_suffix_token(
+    name: str,
+    token: str,
+    max_len: int = MAX_FILENAME_LEN,
+    retry: int = 0,
+) -> str:
+    """Append a collision token before the extension without exceeding max_len."""
+    suffix = "".join(Path(name).suffixes)
+    stem = name[: -len(suffix)] if suffix else name
+    suffix_extra = f"-{retry}" if retry else ""
+    token_len = max(1, 16 - len(suffix_extra))
+    token_part = safe_component(token, fallback="2", max_len=token_len)
+    marker = f"-{token_part}{suffix_extra}"
+    stem_len = max_len - len(suffix) - len(marker)
+    if stem_len <= 0:
+        stem_len = max_len - len(marker)
+        suffix = ""
+    stem = stem[:stem_len].rstrip("-._") or "attachment"
+    return f"{stem}{marker}{suffix}"
+
+
+def is_safe_component(name: str) -> bool:
+    """True iff ``name`` is a single, in-place path component with no traversal.
+
+    A safe component has no path separators, is not ``.`` or ``..``, does not
+    start with ``.`` or ``-``, contains no ASCII control characters, and
+    round-trips through :class:`Path`.
+    """
+    name = str(name)
+    return bool(name) and (
+        name not in {".", ".."}
+        and not name.startswith((".", "-"))
+        and "/" not in name
+        and "\\" not in name
+        and not any(ord(c) < 0x20 or ord(c) == 0x7F for c in name)
+        and Path(name).name == name
+    )
+
+
+def safe_attachment_name(title: object) -> str:
+    """The on-disk filename for an attachment titled ``title``.
+
+    Keeps the raw title when it is already a safe single component so existing
+    markdown links keep resolving.  Only titles that would escape ``.media/``
+    (path separators, ``..``, absolute paths, control characters) are
+    sanitized via :func:`safe_component`.
+
+    Use ONLY for attachment files; page dirs use :func:`sanitize_filename`.
+    """
+    name = str(title or "")
+    if is_safe_component(name):
+        return name
+    return safe_component(name)
+
+
+# ---------------------------------------------------------------------------
+# resolve_within — defence-in-depth containment assert (S1)
+# ---------------------------------------------------------------------------
+
+def resolve_within(base: Path, component: str) -> Path:
+    """Resolve ``base / component`` and assert it remains inside ``base``.
+
+    Rejects any component carrying a path separator, a ``.``/``..`` token, or a
+    name that does not round-trip through :class:`Path` — then asserts the
+    resolved path is still inside ``base``.  Refuses to follow a symlinked
+    component.  The single write-site choke point (I7).
+    """
+    component = str(component)
+    if not is_safe_component(component):
+        raise ValueError(f"unsafe path component: {component!r}")
+    root = base.resolve()
+    leaf = base / component
+    if leaf.is_symlink():
+        raise ValueError(f"refusing to use symlinked path component: {component!r}")
+    candidate = leaf.resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:  # pragma: no cover
+        raise ValueError(f"path component escapes base directory: {component!r}") from exc
+    return candidate
+
+
+# ---------------------------------------------------------------------------
+# AttachmentNamePlan — per-page collision-safe name allocation
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class AttachmentNamePlan:
+    """Stable per-page mapping from Confluence attachment ids/titles to local filenames.
+
+    All four lookup dicts are populated once at construction time by
+    :func:`plan_attachment_names` and are never mutated.  The ``for_reference``
+    method implements the resolver used by the converter: id lookup first,
+    then exact title, then NFC-casefold title, then a fresh sanitization of the
+    raw title (safe even for titles not in the plan).
+    """
+
+    by_id: dict[str, str]
+    by_title: dict[str, str]
+    by_folded_title: dict[str, str]
+
+    def for_reference(self, title: str, attachment_id: str | None = None) -> str:
+        """Resolve ``title`` (and optional ``attachment_id``) to a local filename.
+
+        Resolution order: attachment id → exact title → NFC-casefold title →
+        fresh sanitization of the raw title.  The last fallback is safe even for
+        titles not present in the plan (unknown/late attachments in storage XML).
+        """
+        if attachment_id and attachment_id in self.by_id:
+            return self.by_id[attachment_id]
+        if title in self.by_title:
+            return self.by_title[title]
+        folded = nfc_casefold(title)
+        if folded in self.by_folded_title:
+            return self.by_folded_title[folded]
+        return safe_attachment_name(title)
+
+
+def plan_attachment_names(attachments: list[object]) -> AttachmentNamePlan:
+    """Allocate unique safe local filenames for one page's attachments.
+
+    Deduplicates by attachment id (first-seen wins).  For each unique
+    NFC-casefold base name, the earliest attachment (sorted by
+    ``(created_at, nfc_casefold(title), att_id, index)``) keeps the bare
+    sanitized name; later colliders get ``_with_suffix_token`` names that
+    incorporate the attachment id (or title) so the result is stable across
+    re-runs regardless of API listing order.
+
+    ``by_folded_title`` is only populated for folded keys that map to exactly
+    one title (unambiguous casefold); ambiguous folds are left out so the
+    caller can fall back to exact-title or fresh sanitization.
+    """
+    by_id: dict[str, str] = {}
+    by_title: dict[str, str] = {}
+    by_folded_title: dict[str, str] = {}
+
+    # --- Phase 1: collect entries, deduplicating by id ---
+    seen_ids: set[str] = set()
+    # groups: base_key -> list of (sort_key, owner, att_id, title, base)
+    groups: dict[str, list[tuple[tuple, str, str, str, str]]] = {}
+
+    for index, att in enumerate(attachments):
+        att_id = str(getattr(att, "id", "") or "")
+        if att_id and att_id in seen_ids:
+            continue
+        if att_id:
+            seen_ids.add(att_id)
+        title = str(getattr(att, "title", "") or "")
+        created_at = str(getattr(att, "created_at", "") or "")
+        # version attribute may be a PageVersion model (v2) or SimpleNamespace (tests)
+        version_obj = getattr(att, "version", None)
+        if version_obj is None:
+            version_number = 0
+            version_created = created_at
+        elif isinstance(version_obj, str):
+            version_number = 0
+            version_created = version_obj
+        else:
+            version_number = int(getattr(version_obj, "number", 0) or 0)
+            version_created = str(getattr(version_obj, "created_at", "") or created_at)
+
+        base = safe_attachment_name(title)
+        # Stable owner key: attachment id if present, else title+index
+        owner = att_id if att_id else f"{title}\0{index}"
+        sort_key = (version_created or created_at, nfc_casefold(title), att_id, str(index))
+        groups.setdefault(nfc_casefold(base), []).append(
+            (sort_key, owner, att_id, title, base)
+        )
+
+    # --- Phase 2: assign names ---
+    # taken: casefold(name) -> owner
+    taken: dict[str, str] = {}
+    # assignments: owner -> (att_id, title, final_name)
+    assignments: dict[str, tuple[str, str, str]] = {}
+
+    for base_key, entries in groups.items():
+        ordered = sorted(entries, key=lambda e: e[0])
+        # First (earliest) entry gets the bare base name
+        _, owner, att_id, title, base = ordered[0]
+        taken[base_key] = owner
+        assignments[owner] = (att_id, title, base)
+
+    reserved_base_keys = set(groups)
+
+    # Remaining entries (colliders) in stable sort order
+    remaining = [
+        (base_key, entry)
+        for base_key, entries in groups.items()
+        for entry in sorted(entries, key=lambda item: item[0])[1:]
+    ]
+
+    for _base_key, entry in sorted(remaining, key=lambda item: (item[0], item[1][0])):
+        _sort_key, owner, att_id, title, base = entry
+        token = att_id or title or "attachment"
+        retry = 0
+        while True:
+            candidate = _with_suffix_token(base, token, retry=retry)
+            collision_key = nfc_casefold(candidate)
+            if collision_key not in taken and collision_key not in reserved_base_keys:
+                break
+            retry += 1
+        taken[nfc_casefold(candidate)] = owner
+        assignments[owner] = (att_id, title, candidate)
+
+    # --- Phase 3: populate lookup dicts ---
+    for att_id, title, final_name in assignments.values():
+        if att_id:
+            by_id[att_id] = final_name
+        by_title.setdefault(title, final_name)
+
+    # by_folded_title: only for unambiguous (1-to-1) title→folded mappings
+    folded_titles: dict[str, list[str]] = {}
+    for _att_id, title, _final_name in assignments.values():
+        folded_titles.setdefault(nfc_casefold(title), []).append(title)
+    for folded, titles in folded_titles.items():
+        if len(titles) == 1:
+            by_folded_title[folded] = by_title[titles[0]]
+
+    return AttachmentNamePlan(
+        by_id=by_id,
+        by_title=by_title,
+        by_folded_title=by_folded_title,
+    )
