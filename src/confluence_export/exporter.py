@@ -592,6 +592,13 @@ class Exporter:
                 except OSError:  # pragma: no cover
                     pass
                 raise
+            # copy2 stamps the SOURCE file's (arbitrarily old) mtime onto the
+            # snapshot, which the #48 sweep's age gate would misread as a
+            # crashed run's litter — a concurrent run could sweep this LIVE
+            # snapshot mid-transaction. Reset to now; nothing consumes the
+            # snapshot's own mtime (worst case a rollback-restored .drawio
+            # source triggers one spurious re-render).
+            os.utime(tmp)
             media_file_snapshots[tracked] = tmp
 
         def cleanup_media_snapshots() -> None:

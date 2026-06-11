@@ -1561,7 +1561,9 @@ def _backdate(p: Path) -> None:
     treated as another live run's transaction file and spared)."""
     import time
 
-    old = time.time() - 7200
+    from confluence_export.media import _TEMP_ARTIFACT_MIN_AGE_S
+
+    old = time.time() - 2 * _TEMP_ARTIFACT_MIN_AGE_S
     os.utime(p, (old, old), follow_symlinks=False)
 
 
@@ -1590,6 +1592,39 @@ class TestSweepStaleMediaTemps:
         sweep_stale_media_temps(media)
 
         assert sorted(p.name for p in media.iterdir()) == [_VERSIONS_FILE, "img.png"]
+
+    def test_manifest_resolved_legacy_name_spared(self, tmp_path):
+        # A LEGACY (pre-sanitizer) attachment can carry a temp-pattern name on
+        # disk — _resolve_manifest_entry still honors it — so a manifest-keyed
+        # match is a real attachment, never litter.
+        from confluence_export.media import sweep_stale_media_temps
+
+        media = tmp_path / ".media"
+        media.mkdir()
+        legacy = media / ".drawio-arch.png"
+        legacy.write_bytes(b"\x89PNG real attachment")
+        _backdate(legacy)
+        (media / _VERSIONS_FILE).write_text('{".drawio-arch.png": {}}')
+
+        sweep_stale_media_temps(media)
+
+        assert legacy.exists()
+
+    def test_preserve_pattern_regular_file_spared(self, tmp_path):
+        # .preserve-* is the one suffix-less pattern; conex's snapshots there
+        # are always directories, so a REGULAR FILE with that name can only be
+        # a legacy-named real attachment (even without a manifest entry).
+        from confluence_export.media import sweep_stale_media_temps
+
+        media = tmp_path / ".media"
+        media.mkdir()
+        legacy = media / ".preserve-notes.txt"
+        legacy.write_bytes(b"real bytes")
+        _backdate(legacy)
+
+        sweep_stale_media_temps(media)
+
+        assert legacy.exists()
 
     def test_young_artifact_spared_as_possibly_live(self, tmp_path):
         # A matching artifact younger than the min-age gate may belong to a

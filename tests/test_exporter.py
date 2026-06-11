@@ -743,7 +743,9 @@ class TestMediaDownload:
         # possibly-concurrent run's live transaction files).
         import time
 
-        old = time.time() - 7200
+        from confluence_export.media import _TEMP_ARTIFACT_MIN_AGE_S
+
+        old = time.time() - 2 * _TEMP_ARTIFACT_MIN_AGE_S
         os.utime(p, (old, old), follow_symlinks=False)
 
     def test_sweeps_stale_temp_artifacts_before_download(self, tmp_path):
@@ -768,6 +770,39 @@ class TestMediaDownload:
 
         assert not (media_dir / ".download-stale.tmp").exists()
         assert not (media_dir / ".rollback-stale.tmp").exists()
+
+    def test_rollback_snapshot_mtime_is_fresh_not_inherited(self, tmp_path):
+        # copy2 stamps the SOURCE file's old mtime onto the snapshot; the #48
+        # sweep's age gate would misread that LIVE snapshot as crashed-run
+        # litter and a concurrent run could sweep it mid-transaction.
+        # snapshot_file resets the snapshot's mtime to now.
+        import time
+
+        exporter, _, _ = _make_exporter(download_media=True)
+        att = Attachment(id="a1", title="img.png", file_size=100,
+                         download_link="/wiki/download/a1", page_id="p1")
+        page = _make_page()
+        cs = _make_cached_space(attachments={"p1": [att]})
+        media_dir = tmp_path / ".media"
+        media_dir.mkdir()
+        (media_dir / _VERSIONS_FILE).write_text("{}")
+        self._backdate(media_dir / _VERSIONS_FILE)
+
+        ages = []
+
+        def capture(*args, **kwargs):
+            ages.extend(
+                time.time() - p.lstat().st_mtime
+                for p in media_dir.glob(".rollback-*.tmp")
+            )
+            return []
+
+        with patch("confluence_export.exporter.download_attachments",
+                   side_effect=capture):
+            exporter._export_single_page(page, tmp_path, cs, "TEST")
+
+        assert ages  # the .versions.json snapshot existed during the download
+        assert all(age < 600 for age in ages)  # fresh, not the source's mtime
 
     def test_no_media_sweeps_stale_temp_artifacts(self, tmp_path):
         # #48: the materialize (no-download) branch sweeps too.

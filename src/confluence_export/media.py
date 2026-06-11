@@ -93,8 +93,11 @@ DRAWIO_TMP_PREFIX = ".drawio-"  # drawio.py render temps land in the media dir
 # behind; they are never staged or pruned (commit_export stages explicit paths,
 # the stale-prune walks tracked files only), so the worst case is untracked
 # litter the user notices. safe_attachment_name rejects leading-dot titles, so
-# no real attachment can ever carry one of these names — and the live
-# ".versions.json" matches none of the patterns.
+# no NEW attachment can be allocated one of these names — and the live
+# ".versions.json" matches none of the patterns. But LEGACY (pre-sanitizer)
+# exports wrote raw titles to disk and _resolve_manifest_entry deliberately
+# keeps honoring those names, so the sweep must spare anything the manifest
+# still resolves (see sweep_stale_media_temps).
 _TEMP_ARTIFACT_PATTERNS = (
     f"{DOWNLOAD_TMP_PREFIX}*.tmp",
     f"{COPY_TMP_PREFIX}*.tmp",
@@ -119,15 +122,34 @@ def sweep_stale_media_temps(media_dir: Path) -> None:
     ``media_dir`` (#48). MUST run before the current run creates its own temps
     and rollback snapshots there. Only entries older than
     ``_TEMP_ARTIFACT_MIN_AGE_S`` are removed — a younger match may belong to a
-    concurrently running export (see the constant's comment)."""
+    concurrently running export (see the constant's comment) — and never a
+    name the version manifest still resolves (a legacy-named REAL attachment,
+    see the patterns' comment)."""
     now = time.time()
+    manifest_names = {nfc_casefold(n) for n in _load_versions(media_dir)}
     for pattern in _TEMP_ARTIFACT_PATTERNS:
         for stale in media_dir.glob(pattern):
             try:
+                # Folded compare: a legacy manifest key's case/Unicode form
+                # can differ from the on-disk name. Sparing too much keeps
+                # litter; deleting too much destroys a committed attachment.
+                if nfc_casefold(stale.name) in manifest_names:
+                    continue
                 if now - stale.lstat().st_mtime < _TEMP_ARTIFACT_MIN_AGE_S:
                     continue
                 if stale.is_dir() and not stale.is_symlink():
                     shutil.rmtree(stale, ignore_errors=True)
+                elif (
+                    stale.name.startswith(PRESERVE_TMP_PREFIX)
+                    and not stale.is_symlink()
+                ):
+                    # .preserve-* snapshots are always DIRECTORIES
+                    # (TemporaryDirectory); a regular file matching the one
+                    # suffix-less pattern can only be a legacy-named real
+                    # attachment — never ours to delete. (A symlink is still
+                    # unlinked: conex never creates those here either, and
+                    # unlinking cannot destroy the target's content.)
+                    continue
                 else:
                     stale.unlink()
             except OSError:
