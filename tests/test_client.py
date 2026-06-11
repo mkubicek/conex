@@ -499,6 +499,32 @@ class TestCookieV1Mode:
             {"expand": "version,metadata,extensions,history", "limit": "250"},
         )
 
+    def test_get_attachments_v1_null_fields_coalesced(self):
+        # #47 parity for the v1 dialect: _attachment_from_v1 builds Attachment
+        # directly (not via from_api), so explicit nulls must coalesce here too
+        # or the same .casefold() crash class comes back on the cookie path.
+        client = _make_client()
+        client.set_cookies("session=abc")
+
+        with patch.object(client, "_paginate_offset") as mock:
+            mock.return_value = [
+                {
+                    "id": "att1",
+                    "title": None,
+                    "mediaType": None,
+                    "mediaTypeDescription": None,
+                    "extensions": {"mediaType": None},
+                    "_links": None,
+                }
+            ]
+            atts = client.get_attachments("42")
+
+        assert atts[0].title == ""
+        assert atts[0].media_type == ""
+        assert atts[0].media_type_description == ""
+        assert atts[0].download_link == ""
+        assert atts[0].webui == ""
+
 
 class TestVerboseLogging:
     def test_log_when_verbose(self, capsys):
@@ -833,6 +859,42 @@ class TestGetRawRetryAndRateLimit:
             with pytest.raises(requests.exceptions.HTTPError) as excinfo:
                 client._get_raw("/d", max_retries=2)
             assert excinfo.value.response.status_code == 429
+
+    def test_429_exhausted_still_extends_shared_rate_limit_window(self):
+        # The FINAL 429's Retry-After must still extend the cross-thread
+        # backoff window before the typed HTTPError surfaces (#46): the pool
+        # swallows the per-item failure and moves on, so without the window
+        # the peer workers fire straight into the throttling server.
+        import time as _time
+
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            mock_get.return_value = self._http_error(429, retry_after=120)
+            before = _time.monotonic()
+            with pytest.raises(requests.exceptions.HTTPError):
+                client._get_raw("/d", max_retries=1)
+        assert client._rate_limit_until >= before + 119
+        assert client.stats["retries"] == 1
+
+    @pytest.mark.parametrize("header", ["inf", "nan", "-5", "864000"])
+    def test_retry_after_clamped_to_sane_window(self, header):
+        # float() accepts 'inf'/'nan' — an unclamped value reaches
+        # time.sleep via the shared window (OverflowError as a raw
+        # traceback); a huge finite value would stall every worker for
+        # days. The header is server/proxy-controlled: trust it only
+        # within the cap.
+        import time as _time
+
+        client = _make_client()
+        with patch.object(client.session, "get") as mock_get, \
+             patch("confluence_export.client.time.sleep"):
+            mock_get.return_value = self._http_error(429, retry_after=header)
+            before = _time.monotonic()
+            with pytest.raises(requests.exceptions.HTTPError):
+                client._get_raw("/d", max_retries=1)
+        window = client._rate_limit_until - before
+        assert 0 <= window <= 301  # finite, never past the cap
 
     def test_get_raw_connection_error_exhausted_raises(self):
         client = _make_client()
