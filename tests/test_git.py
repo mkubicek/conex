@@ -574,6 +574,34 @@ class TestCommitExport:
         assert "Foo/.media/img.png" in ls  # committed media kept under case drift
         assert media.exists()
 
+    def test_case_only_recased_written_page_keeps_committed_media(self, tmp_path):
+        """#44 (keep-by-WRITE direction): committed media owned by a page that was
+        re-cased and re-written this run must be kept via the FOLDED written sets —
+        without the fold the owner dir misses its own written entry, no protection
+        applies, and the media is pruned. (_fs_is_case_insensitive forced so Linux
+        CI, where 'Foo' and 'FOO' are distinct dirs, exercises it deterministically.)"""
+        self._init_repo(tmp_path)
+        media = tmp_path / "Foo" / ".media" / "img.png"
+        media.parent.mkdir(parents=True)
+        media.write_bytes(b"\x89PNG")
+        (tmp_path / "Foo" / "Foo.md").write_text("# Foo")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first export"], cwd=tmp_path, capture_output=True)
+
+        # This run writes the page at the NEW case; no protection configured, so
+        # only the folded written_page_dirs can keep the committed media.
+        recased = tmp_path / "FOO"
+        recased.mkdir(exist_ok=True)  # same dir as Foo on a case-insensitive FS
+        (recased / "FOO.md").write_text("# recased")
+        with patch("confluence_export.git._fs_is_case_insensitive", return_value=True):
+            commit_export(
+                tmp_path, [recased / "FOO.md"], "TEST",
+                is_full=True, preserve_media=True, protection=_prot(),
+            )
+
+        ls = subprocess.run(["git", "ls-files"], cwd=tmp_path, capture_output=True, text=True).stdout
+        assert "Foo/.media/img.png" in ls  # kept via the folded written sets
+
     def test_page_exact_protection_not_child(self, tmp_path):
         """PageExactProtection is page-EXACT (e.g. an archived page whose precise
         target is known, M1-exact): it preserves the page's own files but NOT a
