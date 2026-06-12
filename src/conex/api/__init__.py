@@ -89,6 +89,17 @@ class ConfluenceAPI(Protocol):
         """
         ...
 
+    def attachment_download_url(self, att: Attachment) -> str:
+        """Return an absolute download URL for att.
+
+        Prefer the REST attachment-download endpoint (works on site AND
+        gateway — PORT v1 media._download_one's strategy); fall back to
+        att.download_url resolved against api_base_url.  Returns "" when
+        no viable URL can be constructed; pull skips the download and warns.
+        Used by pull.py — pull never builds URLs itself.
+        """
+        ...
+
 
 def make_api(cfg: ResolvedConfig) -> ConfluenceAPI:
     """Construct the appropriate dialect adapter for cfg.
