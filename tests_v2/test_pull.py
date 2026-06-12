@@ -1175,3 +1175,90 @@ class TestAttachmentDownloadUrl:
         assert "a1@1" not in snap.attachment_blobs
         captured = capsys.readouterr()
         assert "warning" in captured.err.lower()
+
+
+# ---------------------------------------------------------------------------
+# Content-Encoding decode (BLOCKER fix verification)
+# ---------------------------------------------------------------------------
+
+
+class TestContentEncodingDecode:
+    def test_gzip_encoded_response_stored_as_decompressed_bytes(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """Regression (BLOCKER): when the download response has a raw stream
+        with decode_content=False and returns gzip-compressed bytes, pull must
+        decompress them before storing in the blob store.  The stored blob must
+        equal the original (decoded) bytes, not the raw gzip stream.
+
+        This replicates the exact failure mode: urllib3's HTTPResponse is
+        constructed with decode_content=False (requests' HTTPAdapter default),
+        so reading resp.raw directly yields compressed bytes.  pull() must set
+        decode_content=True before calling blobs.add_stream(resp.raw).
+        """
+        import gzip
+
+        original_bytes = b"SVG diagram content \xc3\xa9\xc3\xa0"  # UTF-8, non-ASCII
+        compressed_bytes = gzip.compress(original_bytes)
+
+        # Build a raw stream that mimics urllib3's behaviour with
+        # decode_content=False: the stream returns the COMPRESSED bytes by
+        # default, but honours decode_content when set to True.
+        class MockRawStream(io.RawIOBase):
+            """Mimics urllib3 HTTPResponse.raw with decode_content toggle."""
+
+            def __init__(self, raw_data: bytes) -> None:
+                self._raw = raw_data
+                self._decoded = original_bytes
+                self.decode_content: bool = False
+                self._pos = 0
+
+            def read(self, n: int = -1) -> bytes:
+                data = self._decoded if self.decode_content else self._raw
+                if n == -1:
+                    chunk = data[self._pos:]
+                    self._pos = len(data)
+                else:
+                    chunk = data[self._pos: self._pos + n]
+                    self._pos += len(chunk)
+                return chunk
+
+            def readable(self) -> bool:
+                return True
+
+        raw_stream = MockRawStream(compressed_bytes)
+
+        class GzipFakeAPI(FakeAPI):
+            def download(self, url: str) -> requests.Response:
+                self.download_calls.append(url)
+                resp = requests.Response()
+                resp.status_code = 200
+                resp.raw = raw_stream
+                return resp
+
+        att = Attachment(
+            id="svg1",
+            title="diagram.svg",
+            media_type="image/svg+xml",
+            page_id="p1",
+            download_url="http://fake/diagram.svg",
+            version=PageVersion(number=1),
+        )
+        api = GzipFakeAPI(
+            pages=[Page(id="p1", title="P1", space_id="S1", body_storage="x")],
+            attachments={"p1": [att]},
+        )
+
+        snap = pull(api, "TEST", tmp_root, blobs, None, _default_opts(fetch_media=True))
+
+        assert "svg1@1" in snap.attachment_blobs, (
+            "attachment must be recorded in attachment_blobs"
+        )
+        stored = blobs.read_bytes(snap.attachment_blobs["svg1@1"])
+        assert stored == original_bytes, (
+            "stored blob must contain the DECOMPRESSED bytes, not the raw gzip stream; "
+            f"got first 4 bytes {stored[:4]!r} (gzip magic is b'\\x1f\\x8b')"
+        )
+        assert stored[:2] != b"\x1f\x8b", (
+            "stored blob must NOT start with gzip magic bytes — it was stored compressed"
+        )

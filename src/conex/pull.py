@@ -189,6 +189,13 @@ def pull(
             try:
                 resp = api.download(url)
                 try:
+                    # Ensure the urllib3 stream decodes Content-Encoding
+                    # (gzip/deflate) so blobs store the decompressed bytes.
+                    # requests constructs HTTPResponse with decode_content=False
+                    # by default; setting it True here matches v1's
+                    # resp.iter_content() behaviour (PORT v1 media._download_one).
+                    if hasattr(resp.raw, "decode_content"):
+                        resp.raw.decode_content = True
                     digest, _size = blobs.add_stream(resp.raw)
                 finally:
                     resp.close()

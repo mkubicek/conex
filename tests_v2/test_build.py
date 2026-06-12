@@ -566,6 +566,104 @@ class TestBuildMove:
         assert (tmp_root / "My-Space" / "After" / "After.md").exists()
         assert state2.pages["p1"].dir == "My-Space/After"
 
+    def test_title_swap_does_not_lose_page(self, tmp_root, blobs):
+        """Regression (BLOCKER): two pages swap titles in the same run.
+
+        Page 1 (p1) 'Alpha' -> 'Beta'; page 2 (p2) 'Beta' -> 'Alpha'.
+        Both pages must exist on disk after the second build; neither may be
+        deleted.  Old .md files must be cleaned up without destroying the
+        freshly-written content of the other page.
+        """
+        d_alpha = seed_blob(blobs, b"<p>alpha body</p>")
+        d_beta = seed_blob(blobs, b"<p>beta body</p>")
+
+        p1_v1 = make_page(pid="p1", title="Alpha")
+        p2_v1 = make_page(pid="p2", title="Beta")
+        snap1 = make_snapshot(
+            pages=[p1_v1, p2_v1],
+            body_blobs={"p1": d_alpha, "p2": d_beta},
+        )
+        opts = default_opts()
+        _, state1 = build(tmp_root, snap1, blobs, None, opts)
+
+        # Confirm initial state.
+        assert (tmp_root / "My-Space" / "Alpha" / "Alpha.md").exists()
+        assert (tmp_root / "My-Space" / "Beta" / "Beta.md").exists()
+
+        # Swap: p1 is now "Beta", p2 is now "Alpha".
+        p1_v2 = make_page(pid="p1", title="Beta",
+                          version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"))
+        p2_v2 = make_page(pid="p2", title="Alpha",
+                          version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"))
+        snap2 = make_snapshot(
+            pages=[p1_v2, p2_v2],
+            body_blobs={"p1": d_alpha, "p2": d_beta},
+        )
+        result2, state2 = build(tmp_root, snap2, blobs, state1, opts)
+
+        # Both pages must exist on disk.
+        md_beta = tmp_root / "My-Space" / "Beta" / "Beta.md"
+        md_alpha = tmp_root / "My-Space" / "Alpha" / "Alpha.md"
+        assert md_beta.exists(), "p1 (now titled Beta) must exist on disk after swap"
+        assert md_alpha.exists(), "p2 (now titled Alpha) must exist on disk after swap"
+
+        # State must record both pages correctly.
+        assert state2.pages["p1"].file == "My-Space/Beta/Beta.md"
+        assert state2.pages["p2"].file == "My-Space/Alpha/Alpha.md"
+
+        # Neither freshly-written file may appear in result.deleted.
+        deleted_strs = {str(p) for p in result2.deleted}
+        assert str(md_beta) not in deleted_strs, (
+            "p1's new Beta.md was written this run and must NOT be in result.deleted"
+        )
+        assert str(md_alpha) not in deleted_strs, (
+            "p2's new Alpha.md was written this run and must NOT be in result.deleted"
+        )
+
+    def test_case_only_retitle_preserves_md(self, tmp_root, blobs):
+        """Regression (BLOCKER): a case-only title change must not wipe the page.
+
+        On a case-insensitive filesystem (APFS / macOS), 'Hello' and 'hello'
+        resolve to the same inode.  The old path Demo/Hello/Hello.md and the
+        new path Demo/hello/hello.md are the same file.  After the build the
+        .md must still exist; it must not appear in result.deleted.
+        """
+        body_digest = seed_blob(blobs, b"<p>hello content</p>")
+        p_v1 = make_page(title="Hello")
+        snap1 = make_snapshot(pages=[p_v1], body_blobs={"p1": body_digest})
+        opts = default_opts()
+        _, state1 = build(tmp_root, snap1, blobs, None, opts)
+
+        assert (tmp_root / "My-Space" / "Hello" / "Hello.md").exists()
+
+        # Case-only rename.
+        p_v2 = make_page(
+            title="hello",
+            version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"),
+        )
+        snap2 = make_snapshot(pages=[p_v2], body_blobs={"p1": body_digest})
+        result2, state2 = build(tmp_root, snap2, blobs, state1, opts)
+
+        # The state must record the new (lower-case) path.
+        assert state2.pages["p1"].dir == "My-Space/hello"
+
+        # The .md must still be on disk (under whichever case the OS kept).
+        new_md_abs = tmp_root / state2.pages["p1"].file
+        # On a case-insensitive FS both paths resolve to the same file.
+        exists_on_disk = new_md_abs.exists() or (tmp_root / "My-Space" / "Hello" / "Hello.md").exists()
+        assert exists_on_disk, "page .md must still exist after a case-only retitle"
+
+        # The freshly-written file must NOT appear in result.deleted.
+        deleted_strs = {str(p) for p in result2.deleted}
+        assert str(new_md_abs) not in deleted_strs, (
+            "new .md path must not be in result.deleted after a case-only retitle"
+        )
+        # Also check the old-case path.
+        old_md = tmp_root / "My-Space" / "Hello" / "Hello.md"
+        assert str(old_md) not in deleted_strs, (
+            "case-variant of the .md must not be in result.deleted after a case-only retitle"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Prune
@@ -1349,6 +1447,223 @@ class TestBuildResultFields:
         assert isinstance(result.moved, list)
         assert isinstance(result.warnings, list)
 
+
+# ---------------------------------------------------------------------------
+# Media-safety regressions (BLOCKER fixes)
+# ---------------------------------------------------------------------------
+
+
+class TestMediaSafetyRegressions:
+    """Regression tests for BLOCKER data-loss bugs in the deferred-cleanup path.
+
+    Both bugs shared the same root cause: materialized .media files were not
+    appended to result.written, so the guard set (_written_casefolded) built
+    from result.written was blind to them.  The deferred _delete_dir_tree call
+    therefore destroyed freshly-written media in two scenarios:
+
+      1. Title swap: p1 Alpha->Beta, p2 Beta->Alpha, each with an attachment.
+         p1 writes to Demo/Beta/.media/one.png; p2's deferred cleanup checked
+         Demo/Beta/.media/ against _written_casefolded, found nothing, and
+         deleted the whole tree including the file p1 just wrote.
+
+      2. Case-only retitle on APFS: Hello->hello.  Demo/Hello/.media and
+         Demo/hello/.media are the same inode on a case-insensitive FS.  The
+         new media file was written to Demo/hello/.media/diagram.png but that
+         path was not in _written_casefolded, so the deferred cleanup deleted
+         the directory (i.e. the same physical directory that was just written).
+
+    Fix: append every successfully materialized media file path to result.written
+    immediately after blobs.materialize(), so the guard set covers media files
+    in the same way it covers .md and .html files.
+    """
+
+    def test_title_swap_with_attachments_both_media_survive(self, tmp_root, blobs):
+        """BLOCKER regression: title swap with attachments must not lose media.
+
+        p1: Alpha -> Beta, attachment one.png
+        p2: Beta -> Alpha, attachment two.png
+
+        After the swap both media files must exist at their new locations and
+        neither may appear in result.deleted.
+        """
+        d_alpha = seed_blob(blobs, b"<p>alpha body</p>")
+        d_beta = seed_blob(blobs, b"<p>beta body</p>")
+        d_one = seed_blob(blobs, b"one_png_data")
+        d_two = seed_blob(blobs, b"two_png_data")
+
+        att_one = make_attachment(aid="a1", title="one.png", page_id="p1")
+        att_two = make_attachment(aid="a2", title="two.png", page_id="p2")
+
+        p1_v1 = make_page(pid="p1", title="Alpha")
+        p2_v1 = make_page(pid="p2", title="Beta")
+        snap1 = make_snapshot(
+            pages=[p1_v1, p2_v1],
+            body_blobs={"p1": d_alpha, "p2": d_beta},
+            attachments={"p1": [att_one], "p2": [att_two]},
+            attachment_blobs={"a1@1": d_one, "a2@1": d_two},
+        )
+        opts = BuildOptions(media=True, render_drawio=False)
+        _, state1 = build(tmp_root, snap1, blobs, None, opts)
+
+        # Verify initial state.
+        assert (tmp_root / "My-Space" / "Alpha" / ".media" / "one.png").exists()
+        assert (tmp_root / "My-Space" / "Beta" / ".media" / "two.png").exists()
+
+        # Swap: p1 becomes Beta, p2 becomes Alpha.
+        p1_v2 = make_page(
+            pid="p1", title="Beta",
+            version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"),
+        )
+        p2_v2 = make_page(
+            pid="p2", title="Alpha",
+            version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"),
+        )
+        snap2 = make_snapshot(
+            pages=[p1_v2, p2_v2],
+            body_blobs={"p1": d_alpha, "p2": d_beta},
+            attachments={"p1": [att_one], "p2": [att_two]},
+            attachment_blobs={"a1@1": d_one, "a2@1": d_two},
+        )
+        result2, state2 = build(tmp_root, snap2, blobs, state1, opts)
+
+        # p1 (now Beta) must have its media at My-Space/Beta/.media/one.png.
+        p1_new_media = tmp_root / "My-Space" / "Beta" / ".media" / "one.png"
+        # p2 (now Alpha) must have its media at My-Space/Alpha/.media/two.png.
+        p2_new_media = tmp_root / "My-Space" / "Alpha" / ".media" / "two.png"
+
+        assert p1_new_media.exists(), (
+            "p1's media (one.png) must survive at new Beta location after title swap"
+        )
+        assert p2_new_media.exists(), (
+            "p2's media (two.png) must survive at new Alpha location after title swap"
+        )
+
+        deleted_strs = {str(p) for p in result2.deleted}
+        assert str(p1_new_media) not in deleted_strs, (
+            "p1's freshly-materialized one.png must NOT be in result.deleted"
+        )
+        assert str(p2_new_media) not in deleted_strs, (
+            "p2's freshly-materialized two.png must NOT be in result.deleted"
+        )
+
+        # State must reflect the new locations.
+        assert state2.pages["p1"].dir == "My-Space/Beta"
+        assert state2.pages["p2"].dir == "My-Space/Alpha"
+
+    def test_case_only_retitle_with_attachment_media_survives(self, tmp_root, blobs):
+        """BLOCKER regression: case-only retitle must not wipe .media on APFS.
+
+        'Hello' -> 'hello': on a case-insensitive FS (macOS APFS) the old and
+        new .media/ dirs are the same inode.  The deferred cleanup must not
+        delete the freshly-written media file.  This test runs natively on
+        macOS (no skip) since the machine is APFS.
+        """
+        d_body = seed_blob(blobs, b"<p>hello content</p>")
+        d_diagram = seed_blob(blobs, b"diagram_png_data")
+
+        att = make_attachment(aid="a1", title="diagram.png", page_id="p1")
+        p_v1 = make_page(title="Hello")
+        snap1 = make_snapshot(
+            pages=[p_v1],
+            body_blobs={"p1": d_body},
+            attachments={"p1": [att]},
+            attachment_blobs={"a1@1": d_diagram},
+        )
+        opts = BuildOptions(media=True, render_drawio=False)
+        _, state1 = build(tmp_root, snap1, blobs, None, opts)
+
+        hello_media = tmp_root / "My-Space" / "Hello" / ".media" / "diagram.png"
+        assert hello_media.exists(), "diagram.png must exist after initial build"
+
+        # Case-only rename.
+        p_v2 = make_page(
+            title="hello",
+            version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"),
+        )
+        snap2 = make_snapshot(
+            pages=[p_v2],
+            body_blobs={"p1": d_body},
+            attachments={"p1": [att]},
+            attachment_blobs={"a1@1": d_diagram},
+        )
+        result2, state2 = build(tmp_root, snap2, blobs, state1, opts)
+
+        # On APFS both paths are the same inode; either casing resolves to the
+        # same file.  The media MUST still exist on disk.
+        new_media = tmp_root / "My-Space" / "hello" / ".media" / "diagram.png"
+        exists_on_disk = new_media.exists() or hello_media.exists()
+        assert exists_on_disk, (
+            "diagram.png must survive a case-only retitle (Hello -> hello) on APFS"
+        )
+
+        # The file must not appear in result.deleted.
+        deleted_strs = {str(p) for p in result2.deleted}
+        assert str(new_media) not in deleted_strs, (
+            "new-case media path must not be in result.deleted after case-only retitle"
+        )
+        assert str(hello_media) not in deleted_strs, (
+            "old-case media path must not be in result.deleted after case-only retitle"
+        )
+
+    def test_stale_old_media_is_still_deleted_after_move(self, tmp_root, blobs):
+        """Control: a move where the attachment was REMOVED upstream must still
+        clean up the stale old media file.
+
+        This verifies that the fix does not over-protect: media that was in the
+        old state but is NOT re-materialized in the new state must still be
+        deleted after a page move so that orphaned blobs do not accumulate on
+        disk.
+
+        Scenario: p1 has 'old.png' at Title-A.  In the new snapshot it moves
+        to Title-B AND the attachment is dropped (complete listing).  After
+        build 2, My-Space/Title-A/.media/old.png must be gone and must appear
+        in result.deleted.
+        """
+        d_body = seed_blob(blobs, b"<p>body</p>")
+        d_old = seed_blob(blobs, b"old_png_data")
+
+        att_old = make_attachment(aid="a1", title="old.png", page_id="p1")
+        p_v1 = make_page(pid="p1", title="Title A")
+        snap1 = make_snapshot(
+            pages=[p_v1],
+            body_blobs={"p1": d_body},
+            attachments={"p1": [att_old]},
+            attachment_blobs={"a1@1": d_old},
+        )
+        opts = BuildOptions(media=True, render_drawio=False)
+        _, state1 = build(tmp_root, snap1, blobs, None, opts)
+
+        old_media = tmp_root / "My-Space" / "Title-A" / ".media" / "old.png"
+        assert old_media.exists(), "old.png must exist after build 1"
+
+        # Move to Title-B AND drop the attachment (complete listing).
+        p_v2 = make_page(
+            pid="p1", title="Title B",
+            version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"),
+        )
+        snap2 = make_snapshot(
+            pages=[p_v2],
+            body_blobs={"p1": d_body},
+            attachments={"p1": []},          # No attachments now.
+            attachment_blobs={},
+            attachments_complete=True,
+        )
+        result2, state2 = build(tmp_root, snap2, blobs, state1, opts)
+
+        # The stale old media must be gone.
+        assert not old_media.exists(), (
+            "stale old.png must be deleted when attachment is removed during a move"
+        )
+        deleted_strs = {str(p) for p in result2.deleted}
+        assert str(old_media) in deleted_strs, (
+            "stale old.png must appear in result.deleted"
+        )
+        # The new location should have no .media dir (no attachments).
+        new_media_dir = tmp_root / "My-Space" / "Title-B" / ".media"
+        assert not new_media_dir.exists(), (
+            "no .media dir should exist at new location when page has no attachments"
+        )
+
     def test_written_paths_are_absolute(self, tmp_root, blobs):
         body_d = seed_blob(blobs, b"<p>x</p>")
         snap = make_snapshot(pages=[make_page()], body_blobs={"p1": body_d})
@@ -1403,3 +1718,561 @@ class TestEdgeCases:
         result, state = build(tmp_root, snap, blobs, None, default_opts())
         assert "p1" in state.pages
         assert result.skipped == 0
+
+
+# ---------------------------------------------------------------------------
+# Deferred-cleanup set-difference design — DEFECT A + DEFECT B regression suite
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredCleanupSetDifference:
+    """Regression tests for the redesigned deferred old-media cleanup.
+
+    The old dir-prefix guard had two defects:
+
+    DEFECT A (orphan leak): on a title-swap or N-page rotation with media, the
+    guard saw another page's freshly-written file inside the reused .media dir
+    and skipped the WHOLE deletion.  Stale old media files lingered forever.
+
+    DEFECT B (move + partial listing data loss): when a page MOVED while
+    snapshot.attachments_complete=False, the unconditional _delete_dir_tree(old)
+    removed old media files absent from the partial listing; they were never
+    re-materialized at the new dir, causing state/disk divergence.
+
+    The fix replaces the dir-prefix guard with:
+    - DEFECT A: per-file CANDIDATES − KEEP set-difference (file-by-file deletes,
+      no whole-dir deletes).
+    - DEFECT B: strategy (b) — os.rename old media files into the new .media/
+      dir before the deferred cleanup runs, so they appear in KEEP and state
+      matches disk.
+    """
+
+    def test_title_swap_with_media_stale_files_deleted_exactly(self, tmp_root, blobs):
+        """DEFECT A regression: title swap with media.
+
+        p1 Alpha->Beta (keeps one.png), p2 Beta->Alpha (keeps two.png).
+        After swap:
+        - Beta/.media/one.png (p1's new) must exist.
+        - Alpha/.media/two.png (p2's new) must exist.
+        - Beta/.media/two.png (stale p2's old) must be DELETED.
+        - Alpha/.media/one.png (stale p1's old) must be DELETED.
+        - result.deleted must contain exactly those two stale files.
+        """
+        d_alpha = seed_blob(blobs, b"<p>alpha</p>")
+        d_beta = seed_blob(blobs, b"<p>beta</p>")
+        d_one = seed_blob(blobs, b"one_data")
+        d_two = seed_blob(blobs, b"two_data")
+
+        att_one = make_attachment(aid="a1", title="one.png", page_id="p1")
+        att_two = make_attachment(aid="a2", title="two.png", page_id="p2")
+
+        p1_v1 = make_page(pid="p1", title="Alpha")
+        p2_v1 = make_page(pid="p2", title="Beta")
+        snap1 = make_snapshot(
+            pages=[p1_v1, p2_v1],
+            body_blobs={"p1": d_alpha, "p2": d_beta},
+            attachments={"p1": [att_one], "p2": [att_two]},
+            attachment_blobs={"a1@1": d_one, "a2@1": d_two},
+        )
+        opts = BuildOptions(media=True, render_drawio=False)
+        _, state1 = build(tmp_root, snap1, blobs, None, opts)
+
+        assert (tmp_root / "My-Space" / "Alpha" / ".media" / "one.png").exists()
+        assert (tmp_root / "My-Space" / "Beta" / ".media" / "two.png").exists()
+
+        p1_v2 = make_page(pid="p1", title="Beta",
+                          version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"))
+        p2_v2 = make_page(pid="p2", title="Alpha",
+                          version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"))
+        snap2 = make_snapshot(
+            pages=[p1_v2, p2_v2],
+            body_blobs={"p1": d_alpha, "p2": d_beta},
+            attachments={"p1": [att_one], "p2": [att_two]},
+            attachment_blobs={"a1@1": d_one, "a2@1": d_two},
+        )
+        result2, state2 = build(tmp_root, snap2, blobs, state1, opts)
+
+        # New files at correct locations.
+        beta_one = tmp_root / "My-Space" / "Beta" / ".media" / "one.png"
+        alpha_two = tmp_root / "My-Space" / "Alpha" / ".media" / "two.png"
+        assert beta_one.exists(), "p1's one.png must be at new Beta location"
+        assert alpha_two.exists(), "p2's two.png must be at new Alpha location"
+
+        # Stale files must be gone.
+        stale_beta_two = tmp_root / "My-Space" / "Beta" / ".media" / "two.png"
+        stale_alpha_one = tmp_root / "My-Space" / "Alpha" / ".media" / "one.png"
+        assert not stale_beta_two.exists(), "stale two.png in Beta must be deleted (DEFECT A)"
+        assert not stale_alpha_one.exists(), "stale one.png in Alpha must be deleted (DEFECT A)"
+
+        # result.deleted must list the stale files exactly (not the fresh ones).
+        deleted_strs = {str(p) for p in result2.deleted}
+        assert str(stale_beta_two) in deleted_strs, "stale two.png must be in result.deleted"
+        assert str(stale_alpha_one) in deleted_strs, "stale one.png must be in result.deleted"
+        assert str(beta_one) not in deleted_strs, "fresh one.png must NOT be in result.deleted"
+        assert str(alpha_two) not in deleted_strs, "fresh two.png must NOT be in result.deleted"
+
+    def test_three_page_rotation_with_media_stale_files_deleted(self, tmp_root, blobs):
+        """DEFECT A regression: 3-page rotation with media.
+
+        p1 A->B, p2 B->C, p3 C->A (each keeps its own attachment).
+        All 3 stale old files must be deleted; all 3 new files must survive.
+        result.deleted must match disk exactly.
+        """
+        d = {f"p{i}": seed_blob(blobs, f"<p>p{i}</p>".encode()) for i in range(1, 4)}
+        d_att = {f"p{i}": seed_blob(blobs, f"att_{i}".encode()) for i in range(1, 4)}
+
+        att = {
+            "p1": make_attachment(aid="a1", title="att1.png", page_id="p1"),
+            "p2": make_attachment(aid="a2", title="att2.png", page_id="p2"),
+            "p3": make_attachment(aid="a3", title="att3.png", page_id="p3"),
+        }
+
+        pages_v1 = [
+            make_page(pid="p1", title="A"),
+            make_page(pid="p2", title="B"),
+            make_page(pid="p3", title="C"),
+        ]
+        snap1 = make_snapshot(
+            pages=pages_v1,
+            body_blobs={f"p{i}": d[f"p{i}"] for i in range(1, 4)},
+            attachments={pid: [att[pid]] for pid in ["p1", "p2", "p3"]},
+            attachment_blobs={
+                "a1@1": d_att["p1"],
+                "a2@1": d_att["p2"],
+                "a3@1": d_att["p3"],
+            },
+        )
+        opts = BuildOptions(media=True, render_drawio=False)
+        _, state1 = build(tmp_root, snap1, blobs, None, opts)
+
+        # Rotation: p1->B, p2->C, p3->A
+        pages_v2 = [
+            make_page(pid="p1", title="B",
+                      version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z")),
+            make_page(pid="p2", title="C",
+                      version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z")),
+            make_page(pid="p3", title="A",
+                      version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z")),
+        ]
+        snap2 = make_snapshot(
+            pages=pages_v2,
+            body_blobs={f"p{i}": d[f"p{i}"] for i in range(1, 4)},
+            attachments={"p1": [att["p1"]], "p2": [att["p2"]], "p3": [att["p3"]]},
+            attachment_blobs={
+                "a1@1": d_att["p1"],
+                "a2@1": d_att["p2"],
+                "a3@1": d_att["p3"],
+            },
+        )
+        result2, state2 = build(tmp_root, snap2, blobs, state1, opts)
+
+        base = tmp_root / "My-Space"
+        # New: p1 at B, p2 at C, p3 at A — each has its own attachment.
+        new_b_att1 = base / "B" / ".media" / "att1.png"
+        new_c_att2 = base / "C" / ".media" / "att2.png"
+        new_a_att3 = base / "A" / ".media" / "att3.png"
+        assert new_b_att1.exists(), "att1.png must be at new B location"
+        assert new_c_att2.exists(), "att2.png must be at new C location"
+        assert new_a_att3.exists(), "att3.png must be at new A location"
+
+        # Stale: the OLD attachments at the OLD locations.
+        stale_a_att1 = base / "A" / ".media" / "att1.png"
+        stale_b_att2 = base / "B" / ".media" / "att2.png"
+        stale_c_att3 = base / "C" / ".media" / "att3.png"
+        assert not stale_a_att1.exists(), "stale att1.png in old A must be deleted"
+        assert not stale_b_att2.exists(), "stale att2.png in old B must be deleted"
+        assert not stale_c_att3.exists(), "stale att3.png in old C must be deleted"
+
+        deleted_strs = {str(p) for p in result2.deleted}
+        assert str(stale_a_att1) in deleted_strs
+        assert str(stale_b_att2) in deleted_strs
+        assert str(stale_c_att3) in deleted_strs
+        # Fresh files not in deleted.
+        assert str(new_b_att1) not in deleted_strs
+        assert str(new_c_att2) not in deleted_strs
+        assert str(new_a_att3) not in deleted_strs
+
+    def test_swap_where_one_page_drops_attachment(self, tmp_root, blobs):
+        """DEFECT A regression: swap where one page also drops an attachment.
+
+        p1 Alpha->Beta (one.png retained), p2 Beta->Alpha (two.png DROPPED).
+        - Beta/.media/one.png (p1's new kept att) must survive.
+        - Alpha/.media/ should NOT exist (p2 has no attachment now).
+        - Alpha/.media/two.png (stale p2's old) must be DELETED.
+        - Beta/.media/two.png (stale p2's old) must be DELETED.
+        result.deleted must contain exactly those two stale files.
+        """
+        d_alpha = seed_blob(blobs, b"<p>alpha</p>")
+        d_beta = seed_blob(blobs, b"<p>beta</p>")
+        d_one = seed_blob(blobs, b"one_data")
+        d_two = seed_blob(blobs, b"two_data")
+
+        att_one = make_attachment(aid="a1", title="one.png", page_id="p1")
+        att_two = make_attachment(aid="a2", title="two.png", page_id="p2")
+
+        p1_v1 = make_page(pid="p1", title="Alpha")
+        p2_v1 = make_page(pid="p2", title="Beta")
+        snap1 = make_snapshot(
+            pages=[p1_v1, p2_v1],
+            body_blobs={"p1": d_alpha, "p2": d_beta},
+            attachments={"p1": [att_one], "p2": [att_two]},
+            attachment_blobs={"a1@1": d_one, "a2@1": d_two},
+        )
+        opts = BuildOptions(media=True, render_drawio=False)
+        _, state1 = build(tmp_root, snap1, blobs, None, opts)
+
+        # Swap + drop: p1->Beta (keeps one.png), p2->Alpha (drops two.png).
+        p1_v2 = make_page(pid="p1", title="Beta",
+                          version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"))
+        p2_v2 = make_page(pid="p2", title="Alpha",
+                          version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"))
+        snap2 = make_snapshot(
+            pages=[p1_v2, p2_v2],
+            body_blobs={"p1": d_alpha, "p2": d_beta},
+            attachments={"p1": [att_one], "p2": []},  # p2 drops its attachment.
+            attachment_blobs={"a1@1": d_one},
+            attachments_complete=True,
+        )
+        result2, state2 = build(tmp_root, snap2, blobs, state1, opts)
+
+        base = tmp_root / "My-Space"
+        # p1's one.png at new Beta location must survive.
+        beta_one = base / "Beta" / ".media" / "one.png"
+        assert beta_one.exists(), "p1's one.png must survive at new Beta location"
+
+        # Stale files must be gone: old Alpha/.media/one.png, old Beta/.media/two.png.
+        stale_alpha_one = base / "Alpha" / ".media" / "one.png"
+        stale_beta_two = base / "Beta" / ".media" / "two.png"
+        assert not stale_alpha_one.exists(), "stale one.png in old Alpha must be deleted"
+        assert not stale_beta_two.exists(), "stale two.png in old Beta must be deleted"
+
+        deleted_strs = {str(p) for p in result2.deleted}
+        assert str(stale_alpha_one) in deleted_strs, "stale one.png must be in result.deleted"
+        assert str(stale_beta_two) in deleted_strs, "stale two.png must be in result.deleted"
+        assert str(beta_one) not in deleted_strs, "fresh one.png must NOT be in result.deleted"
+
+    def test_move_with_attachments_complete_false_no_file_vanishes(self, tmp_root, blobs):
+        """DEFECT B regression: move + attachments_complete=False.
+
+        Strategy (b): os.rename old media files into the new .media/ dir.
+        - No media file must vanish from disk.
+        - State must match disk (state records the file at the new location,
+          and the file actually exists there).
+        - result.deleted must NOT contain the carried media file.
+        """
+        d_body = seed_blob(blobs, b"<p>body</p>")
+        d_att = seed_blob(blobs, b"attachment_data")
+
+        att = make_attachment(aid="a1", title="important.png", page_id="p1")
+        p_v1 = make_page(pid="p1", title="Old Title")
+
+        snap1 = make_snapshot(
+            pages=[p_v1],
+            body_blobs={"p1": d_body},
+            attachments={"p1": [att]},
+            attachment_blobs={"a1@1": d_att},
+            attachments_complete=True,
+        )
+        opts = BuildOptions(media=True, render_drawio=False)
+        _, state1 = build(tmp_root, snap1, blobs, None, opts)
+
+        old_media = tmp_root / "My-Space" / "Old-Title" / ".media" / "important.png"
+        assert old_media.exists(), "important.png must exist after build 1"
+
+        # Move with partial listing (attachments_complete=False).
+        p_v2 = make_page(pid="p1", title="New Title",
+                         version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"))
+        snap2 = make_snapshot(
+            pages=[p_v2],
+            body_blobs={"p1": d_body},
+            attachments={"p1": []},          # Partial: attachment not in this snapshot.
+            attachment_blobs={},
+            attachments_complete=False,       # KEY: incomplete listing.
+        )
+        result2, state2 = build(tmp_root, snap2, blobs, state1, opts)
+
+        new_media = tmp_root / "My-Space" / "New-Title" / ".media" / "important.png"
+
+        # File must be at the new location (renamed there by strategy (b)).
+        assert new_media.exists(), (
+            "important.png must be at new location after move+partial (DEFECT B): "
+            "strategy (b) renames it rather than deleting it"
+        )
+        # Old location must not have the file anymore.
+        assert not old_media.exists(), (
+            "important.png must not remain at old location after rename"
+        )
+
+        # State must record the file at the new location and match disk.
+        assert "a1" in state2.pages["p1"].attachments, "a1 must be in new state"
+        recorded_file = state2.pages["p1"].attachments["a1"].file
+        state_path = tmp_root / "My-Space" / "New-Title" / ".media" / recorded_file
+        assert state_path.exists(), (
+            f"state records file at {state_path} but it does not exist (state/disk divergence)"
+        )
+
+        # The media file must NOT appear in result.deleted.
+        deleted_strs = {str(p) for p in result2.deleted}
+        assert str(new_media) not in deleted_strs, "carried media must NOT be in result.deleted"
+        assert str(old_media) not in deleted_strs, "old media path must NOT be in result.deleted"
+
+
+# ---------------------------------------------------------------------------
+# DEFECT C + DEFECT D regression suite (prune safety + move+media=False)
+# ---------------------------------------------------------------------------
+
+
+class TestPruneSafetyAndMediaFalseMove:
+    """Regression tests for DEFECTS C and D.
+
+    DEFECT C (CATASTROPHIC): the prune step deleted .md/.html/.media and called
+    _rmdir_empty_parents UNCONDITIONALLY — no check against a global KEEP set.
+    When a newly-moved page reused the dir freed by a pruned page, prune deleted
+    the freshly-written content.  Two variants:
+      - Any FS: run2 drops p1='Doc' while p9='Doc' reuses the freed dir.
+      - APFS casefold: p9='doc' collides with pruned p1='Doc'.
+
+    DEFECT D (spec violation): move + opts.media=False.  The media=False branch
+    carries prev AttachmentStates (state records files at the NEW dir) but
+    materialises nothing, so nothing entered KEEP.  The move cleanup then deleted
+    the old media files → bytes gone, state diverged.
+
+    Fix: ONE global _keep set (built from result.written after all writes) used
+    by EVERY deletion site; DEFECT-D rescue unifies with DEFECT-B (rename on move
+    whenever att is still tracked + file not re-materialised).
+    """
+
+    def test_prune_and_same_title_dir_reuse_any_fs(self, tmp_root, blobs):
+        """DEFECT C (any FS): prune p1='Doc' while p9 moves to reuse 'My-Space/Doc'.
+
+        Run 1: p1='Doc' and p9='Other Doc'.
+        Run 2: p1 is dropped; p9 renames to 'Doc' (reuses the freed dir).
+        The prune step must NOT delete p9's freshly-written Doc.md.
+        """
+        body = seed_blob(blobs, b"<p>hello</p>")
+        p1 = make_page(pid="p1", title="Doc")
+        p9 = make_page(pid="p9", title="Other Doc")
+        snap1 = make_snapshot(pages=[p1, p9], body_blobs={"p1": body, "p9": body})
+        opts = default_opts()
+        _, state1 = build(tmp_root, snap1, blobs, None, opts)
+
+        assert (tmp_root / "My-Space" / "Doc" / "Doc.md").exists()
+
+        # Run 2: p1 dropped; p9 renames to "Doc".
+        p9_v2 = make_page(pid="p9", title="Doc",
+                          version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"))
+        snap2 = make_snapshot(pages=[p9_v2], body_blobs={"p9": body})
+        result2, state2 = build(tmp_root, snap2, blobs, state1, opts)
+
+        # p9 must be on disk at My-Space/Doc/Doc.md — prune must NOT delete it.
+        p9_md = tmp_root / "My-Space" / "Doc" / "Doc.md"
+        assert p9_md.exists(), (
+            "DEFECT C (any FS): prune must not delete p9's freshly-written Doc.md "
+            "when p9 reuses the dir freed by the pruned p1"
+        )
+        assert "p9" in state2.pages
+        assert "p1" not in state2.pages
+        assert str(p9_md) not in {str(p) for p in result2.deleted}, (
+            "p9's Doc.md must not appear in result.deleted"
+        )
+
+    def test_prune_and_casefold_collision_apfs(self, tmp_root, blobs):
+        """DEFECT C (APFS casefold): p9='doc' casefold-collides with pruned p1='Doc'.
+
+        On a case-insensitive filesystem 'My-Space/Doc' and 'My-Space/doc' resolve
+        to the same inode.  Prune for p1='Doc' must NOT delete p9's 'doc.md'.
+        """
+        body = seed_blob(blobs, b"<p>hello</p>")
+        p1 = make_page(pid="p1", title="Doc")
+        p9 = make_page(pid="p9", title="Other")
+        snap1 = make_snapshot(pages=[p1, p9], body_blobs={"p1": body, "p9": body})
+        opts = default_opts()
+        _, state1 = build(tmp_root, snap1, blobs, None, opts)
+
+        # p9 renames to lowercase 'doc' — casefold-collides with pruned p1='Doc'.
+        p9_v2 = make_page(pid="p9", title="doc",
+                          version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"))
+        snap2 = make_snapshot(pages=[p9_v2], body_blobs={"p9": body})
+        result2, state2 = build(tmp_root, snap2, blobs, state1, opts)
+
+        # On a case-insensitive FS both paths resolve to the same inode.
+        md_lower = tmp_root / "My-Space" / "doc" / "doc.md"
+        md_upper = tmp_root / "My-Space" / "Doc" / "Doc.md"
+        exists = md_lower.exists() or md_upper.exists()
+        assert exists, (
+            "DEFECT C (casefold): p9's doc.md must survive even when its path "
+            "casefold-collides with the pruned p1='Doc' dir"
+        )
+        assert "p9" in state2.pages
+        assert "p1" not in state2.pages
+
+    def test_prune_while_moved_page_occupies_freed_dir(self, tmp_root, blobs):
+        """DEFECT C: moved page lands in the same dir that is being pruned.
+
+        p1 ('Alpha') is pruned.  p2 was previously 'Beta' and now moves to 'Alpha'.
+        Prune must not delete p2's freshly-written Alpha.md or its media.
+        """
+        d_body = seed_blob(blobs, b"<p>body</p>")
+        d_att = seed_blob(blobs, b"att_data")
+
+        att = make_attachment(aid="a1", title="img.png", page_id="p2")
+        p1 = make_page(pid="p1", title="Alpha")
+        p2 = make_page(pid="p2", title="Beta")
+        snap1 = make_snapshot(
+            pages=[p1, p2],
+            body_blobs={"p1": d_body, "p2": d_body},
+            attachments={"p2": [att]},
+            attachment_blobs={"a1@1": d_att},
+        )
+        opts = BuildOptions(media=True, render_drawio=False)
+        _, state1 = build(tmp_root, snap1, blobs, None, opts)
+
+        # Run 2: p1 dropped; p2 moves from 'Beta' to 'Alpha'.
+        p2_v2 = make_page(pid="p2", title="Alpha",
+                          version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"))
+        snap2 = make_snapshot(
+            pages=[p2_v2],
+            body_blobs={"p2": d_body},
+            attachments={"p2": [att]},
+            attachment_blobs={"a1@1": d_att},
+        )
+        result2, state2 = build(tmp_root, snap2, blobs, state1, opts)
+
+        p2_md = tmp_root / "My-Space" / "Alpha" / "Alpha.md"
+        p2_media = tmp_root / "My-Space" / "Alpha" / ".media" / "img.png"
+        assert p2_md.exists(), "p2's Alpha.md must survive (prune of p1 must not delete it)"
+        assert p2_media.exists(), "p2's img.png must survive (prune of p1 must not delete it)"
+        assert "p2" in state2.pages
+        assert "p1" not in state2.pages
+
+        deleted_strs = {str(p) for p in result2.deleted}
+        assert str(p2_md) not in deleted_strs
+        assert str(p2_media) not in deleted_strs
+
+    def test_move_with_media_false_keeps_media_state_agrees(self, tmp_root, blobs):
+        """DEFECT D: move + opts.media=False must not delete old media files.
+
+        Spec Step 5: 'With opts.media=False: do not materialise, do not delete
+        existing media, carry prev attachment states.'
+
+        After the move:
+        - The media file must exist at the NEW location (renamed there).
+        - State must record it at the new location.
+        - result.deleted must NOT contain the media file.
+        """
+        body = seed_blob(blobs, b"<p>hello</p>")
+        att_data = seed_blob(blobs, b"attachment_bytes")
+
+        att = make_attachment(aid="a1", title="keep.png", page_id="p1")
+        p_v1 = make_page(pid="p1", title="Before")
+        snap1 = make_snapshot(
+            pages=[p_v1],
+            body_blobs={"p1": body},
+            attachments={"p1": [att]},
+            attachment_blobs={"a1@1": att_data},
+            attachments_complete=True,
+        )
+        # First build with media=True so the file lands on disk.
+        opts_media = BuildOptions(media=True, render_drawio=False)
+        _, state1 = build(tmp_root, snap1, blobs, None, opts_media)
+
+        old_media = tmp_root / "My-Space" / "Before" / ".media" / "keep.png"
+        assert old_media.exists(), "keep.png must exist after build 1"
+
+        # Move with media=False.
+        p_v2 = make_page(pid="p1", title="After",
+                         version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"))
+        snap2 = make_snapshot(
+            pages=[p_v2],
+            body_blobs={"p1": body},
+            attachments={"p1": [att]},
+            attachment_blobs={"a1@1": att_data},
+            attachments_complete=True,
+        )
+        opts_no_media = BuildOptions(media=False, render_drawio=False)
+        result2, state2 = build(tmp_root, snap2, blobs, state1, opts_no_media)
+
+        new_media = tmp_root / "My-Space" / "After" / ".media" / "keep.png"
+        assert new_media.exists(), (
+            "DEFECT D: keep.png must be at new 'After' location after move+media=False"
+        )
+        assert not old_media.exists(), (
+            "keep.png must not remain at the old 'Before' location"
+        )
+
+        # State must agree with disk.
+        assert "a1" in state2.pages["p1"].attachments
+        recorded = state2.pages["p1"].attachments["a1"].file
+        state_path = tmp_root / "My-Space" / "After" / ".media" / recorded
+        assert state_path.exists(), (
+            f"state records file at {state_path} but it is absent (state/disk divergence)"
+        )
+
+        deleted_strs = {str(p) for p in result2.deleted}
+        assert str(new_media) not in deleted_strs, "keep.png at new dir must NOT be in result.deleted"
+        assert str(old_media) not in deleted_strs, "keep.png at old dir must NOT be in result.deleted"
+
+    def test_move_with_media_false_dropped_attachment_spec_conformance(self, tmp_root, blobs):
+        """DEFECT D / spec conformance: media=False + move + dropped attachment.
+
+        Spec Step 5: 'With opts.media=False: do not materialise, do not delete
+        existing media, carry prev attachment states.'
+
+        When opts.media=False, the build must never delete existing media files —
+        even when the new snapshot shows the attachment was removed.  The old media
+        file must survive at the new location (carried over), consistent with the
+        spec's 'do not delete existing media' contract.
+
+        This test differs from test_move_with_media_false_keeps_media_state_agrees
+        in that the new snapshot has no attachment blob, simulating a scenario
+        where the attachment listing is present but the blob is not fetched.
+        The gate must carry the file rather than leaving it for deletion.
+        """
+        body = seed_blob(blobs, b"<p>body</p>")
+        att_data = seed_blob(blobs, b"att_bytes")
+
+        att = make_attachment(aid="a1", title="carried.png", page_id="p1")
+        p_v1 = make_page(pid="p1", title="SrcTitle")
+        snap1 = make_snapshot(
+            pages=[p_v1],
+            body_blobs={"p1": body},
+            attachments={"p1": [att]},
+            attachment_blobs={"a1@1": att_data},
+            attachments_complete=True,
+        )
+        # Build 1: land the media file.
+        opts_media = BuildOptions(media=True, render_drawio=False)
+        _, state1 = build(tmp_root, snap1, blobs, None, opts_media)
+
+        old_media = tmp_root / "My-Space" / "SrcTitle" / ".media" / "carried.png"
+        assert old_media.exists(), "carried.png must exist after build 1"
+
+        # Build 2: move with media=False (prev att states are carried regardless
+        # of what the new snapshot says, per spec).
+        p_v2 = make_page(pid="p1", title="DstTitle",
+                         version=PageVersion(number=2, created_at="2024-01-02T00:00:00Z"))
+        snap2 = make_snapshot(
+            pages=[p_v2],
+            body_blobs={"p1": body},
+            attachments={"p1": [att]},
+            attachment_blobs={"a1@1": att_data},
+            attachments_complete=True,
+        )
+        opts_no_media = BuildOptions(media=False, render_drawio=False)
+        result2, state2 = build(tmp_root, snap2, blobs, state1, opts_no_media)
+
+        # With media=False, the spec says 'carry prev attachment states' and
+        # 'do not delete existing media'.  The file must appear at the new location.
+        new_media = tmp_root / "My-Space" / "DstTitle" / ".media" / "carried.png"
+        assert new_media.exists(), (
+            "DEFECT D spec: carried.png must be at new 'DstTitle' location after "
+            "move+media=False (spec: do not delete existing media)"
+        )
+
+        deleted_strs = {str(p) for p in result2.deleted}
+        assert str(old_media) not in deleted_strs, (
+            "old media path must NOT be in result.deleted with media=False"
+        )
+        assert str(new_media) not in deleted_strs, (
+            "new media path must NOT be in result.deleted with media=False"
+        )

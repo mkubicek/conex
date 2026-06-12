@@ -1156,3 +1156,77 @@ class TestRegister:
         )
         result = _preprocess(html)
         assert "handled:value" in result
+
+
+# ---------------------------------------------------------------------------
+# ac:adf-extension unwrap regression (BLOCKER fix verification)
+# ---------------------------------------------------------------------------
+
+
+class TestAdfExtensionUnwrap:
+    """ac:adf-extension must be unwrapped (content preserved), never replaced
+    with a placeholder comment.  v1 treated it as a generic wrapper, not a
+    structured macro.  Finding: default_handler branch 2 was gated only on
+    finding a nested ac:structured-macro, so bare-content adf-extensions fell
+    through to branch 3 (placeholder), silently destroying user content.
+    """
+
+    def test_adf_extension_wrapping_plain_paragraph(self) -> None:
+        """ac:adf-extension around a <p> must preserve the paragraph text."""
+        html = "<ac:adf-extension><p>important text</p></ac:adf-extension>"
+        result = _preprocess(html)
+        assert "important text" in result, (
+            "plain content inside ac:adf-extension must survive into markdown"
+        )
+        assert "<!-- macro:" not in result, (
+            "ac:adf-extension must not emit a placeholder comment"
+        )
+
+    def test_adf_extension_wrapping_adf_node_panel(self) -> None:
+        """ac:adf-extension around an ac:adf-node panel must preserve the panel
+        content, not replace the whole subtree with a placeholder."""
+        html = (
+            "<ac:adf-extension>"
+            '<ac:adf-node type="panel">'
+            "<p>panel content</p>"
+            "</ac:adf-node>"
+            "</ac:adf-extension>"
+        )
+        result = _preprocess(html)
+        assert "panel content" in result, (
+            "content inside ac:adf-node inside ac:adf-extension must be preserved"
+        )
+        assert "<!-- macro:" not in result, (
+            "ac:adf-extension must not emit a placeholder comment"
+        )
+
+    def test_adf_extension_wrapping_list(self) -> None:
+        """ac:adf-extension around a <ul> list must preserve the list items."""
+        html = (
+            "<ac:adf-extension>"
+            "<ul><li>item one</li><li>item two</li></ul>"
+            "</ac:adf-extension>"
+        )
+        result = _preprocess(html)
+        assert "item one" in result, (
+            "list items inside ac:adf-extension must be preserved"
+        )
+        assert "item two" in result
+        assert "<!-- macro:" not in result
+
+    def test_adf_extension_no_content_becomes_empty(self) -> None:
+        """An empty ac:adf-extension produces no placeholder comment."""
+        html = "<ac:adf-extension></ac:adf-extension>"
+        result = _preprocess(html)
+        assert "<!-- macro:" not in result
+
+    def test_convert_page_adf_extension_plain_paragraph_preserved(self) -> None:
+        """End-to-end: convert_page with ac:adf-extension body preserves content."""
+        ctx = _make_ctx(page=_make_page(title="ADF Page"))
+        body = "<ac:adf-extension><p>ADF wrapped content</p></ac:adf-extension>"
+        md = convert_page(body, ctx)
+        assert "ADF wrapped content" in md, (
+            "convert_page must preserve content inside ac:adf-extension"
+        )
+        assert "macro: unnamed" not in md
+        assert "macro: " not in md

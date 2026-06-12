@@ -38,7 +38,10 @@ Step 4 — Move
          .workspace-from-<old-dir-leaf> instead (warn).  On EXDEV,
          copytree+rmtree.  Idempotent: old .workspace absent or already
          at the target = move done silently.
-      3. Delete old recorded artifacts (.md, .html, .media/).
+      3. Delete old recorded artifacts (.md, .html, old .media/ files).
+         Old-media cleanup uses per-file set-difference (CANDIDATES − KEEP):
+         CANDIDATES = prev PageState.attachments file paths; KEEP = all paths
+         written this run (casefolded).  No whole-dir deletes.
       4. rmdir emptied parent dirs bottom-up (never remove non-empty).
       5. Record (old_dir, new_dir) in moved.
     Crash-mid-move: next build re-derives the same target; idempotent.
@@ -55,8 +58,16 @@ Step 5 — Write
     v1 copy2 preserved source mtime; v2 stamps the attachment's version time.)
     opts.media == False: do not materialise, do not delete existing media,
     carry prev attachment states.
-    snapshot.attachments_complete is False: never delete an existing .media/
-    file; only add newly fetched attachments.
+    snapshot.attachments_complete is False (in-place): never delete an existing
+    .media/ file; only add newly fetched attachments.
+    snapshot.attachments_complete is False + page MOVES (strategy b): any
+    prev-recorded media file absent from the partial listing is os.renamed from
+    the old .media/ dir into the new .media/ dir before the deferred cleanup
+    runs.  This preserves bytes and ensures state/disk consistency (the state
+    records the file at the new location, and it exists there).  On EXDEV,
+    falls back to shutil.copy2 + unlink.  On a case-insensitive FS where old
+    and new .media/ dirs are the same inode (case-only rename), the rename is
+    skipped (files are already in place).
     drawio preview-first: use the .png sibling when its version.created_at
     TIMESTAMP >= xml attachment's; else batch-render misses ONCE per build
     via drawio.find_drawio_pairs + drawio.render_batch (mocked in tests).
@@ -254,21 +265,52 @@ def _rmdir_empty_parents(path: Path, stop_at: Path) -> None:
         current = current.parent
 
 
-def _delete_artifact(p: Path, result: BuildResult) -> None:
-    """Unlink a regular file if it exists; record in result.deleted."""
+def _guarded_delete_file(
+    p: Path, keep: set[str], result: BuildResult
+) -> None:
+    """Unlink *p* only when its casefold is not in *keep*; record in result.deleted.
+
+    The *keep* set contains the casefolded absolute paths of every file written,
+    materialised, renamed-in, or carried during this build run.  Any path in
+    *keep* must never be deleted, regardless of which deletion call site triggers.
+    """
+    if str(p).casefold() in keep:
+        return
     if p.exists() and p.is_file():
         p.unlink()
         result.deleted.append(p)
 
 
-def _delete_dir_tree(d: Path, result: BuildResult) -> None:
-    """Remove an entire directory tree; record all deleted paths."""
+def _guarded_delete_dir_tree(
+    d: Path, keep: set[str], result: BuildResult
+) -> None:
+    """Remove files under *d* that are not in *keep*; rmdir iff the tree becomes empty.
+
+    Iterates per-file through the KEEP guard before deleting anything.  The
+    directory itself (and all ancestor dirs) are removed only when completely
+    empty after the file deletions.  This replaces the old ``_delete_dir_tree``
+    which called ``shutil.rmtree`` unconditionally (DEFECT C root cause).
+    """
     if not d.exists():
         return
     for child in sorted(d.rglob("*")):
         if child.is_file():
-            result.deleted.append(child)
-    shutil.rmtree(d, ignore_errors=True)
+            _guarded_delete_file(child, keep, result)
+    # Remove the now-possibly-empty directory and any empty ancestors.
+    # _rmdir_empty_parents stops at the first non-empty dir.
+
+
+def _delete_artifact(p: Path, result: BuildResult) -> None:
+    """Unlink a regular file if it exists; record in result.deleted.
+
+    INTERNAL USE ONLY — call this only from the stale-media inline cleanup
+    path (inside the write loop, before the global KEEP set is built) where
+    the caller has already verified the file is safe to delete.  All other
+    deletion sites must use _guarded_delete_file.
+    """
+    if p.exists() and p.is_file():
+        p.unlink()
+        result.deleted.append(p)
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +588,22 @@ def build(
         if page.id in skip_ids and prev is not None:
             new_page_states[page.id] = prev.pages[page.id]
 
+    # Deferred move cleanups: accumulated during the write loop and applied
+    # AFTER all pages are written.  Each entry is a tuple:
+    #   (old_md, old_html_or_None, old_media_dir, old_dir_abs, old_dir_rel,
+    #    new_dir_rel, prev_att_states)
+    # Deferral is REQUIRED to handle title-swap and case-only rename scenarios:
+    # page A's old path may be exactly the new path of page B written earlier
+    # this run, and deleting it inline would destroy page B's freshly-written
+    # content (data-safety finding).
+    #
+    # prev_att_states: copy of the PREVIOUS PageState.attachments for this page,
+    # used by the deferred old-media cleanup to compute CANDIDATES (per-file
+    # set-difference) rather than a whole-dir delete.
+    _deferred_cleanups: list[
+        tuple[Path, Path | None, Path, Path, str, str, dict]
+    ] = []
+
     for page in plan_pages:
         pid = page.id
         if pid not in write_ids:
@@ -639,6 +697,7 @@ def build(
                     try:
                         blobs.materialize(att_digest, dest, mtime=mtime)
                         media_available.add(planned_name)
+                        result.written.append(dest)
                     except Exception as exc:
                         msg = f"failed to materialise attachment {att.title!r}: {exc}"
                         result.warnings.append(msg)
@@ -676,6 +735,7 @@ def build(
                 try:
                     blobs.materialize(rendered_digest, dest)
                     media_available.add(png_filename)
+                    result.written.append(dest)
                 except Exception as exc:
                     msg = f"failed to materialise rendered drawio PNG {png_filename!r}: {exc}"
                     result.warnings.append(msg)
@@ -756,23 +816,101 @@ def build(
             old_dir_rel = prev.pages[pid].dir
             old_dir_abs = root / old_dir_rel
 
-            # Carry .workspace.
+            # Carry .workspace immediately (safe: .workspace is never in
+            # result.written, so no collision with deferred deletion).
             if old_dir_abs.exists():
                 _carry_workspace(old_dir_abs, planned_dir_abs, result)
 
-            # Delete old recorded artifacts.
+            # Media carry-on-move rescue (DEFECT B + DEFECT D unified gate):
+            # When a page MOVES and a prev-recorded media file was NOT
+            # re-materialized at the new dir this run — regardless of WHY it
+            # was not re-materialized (attachments_complete=False OR media=False
+            # OR blob missing) — rename the file from the old .media/ dir into
+            # the new .media/ dir, PROVIDED the attachment is still tracked in
+            # att_states (i.e. it was not explicitly dropped this run).
+            #
+            # Gate: rescue only attachment IDs that appear in att_states after the
+            # write phase.  Attachments that were explicitly removed from a
+            # complete listing are absent from att_states and must NOT be rescued
+            # — they are left as CANDIDATES for the deferred cleanup to delete.
+            #
+            # This ensures:
+            #   (a) bytes are preserved at the new location (spec: do not delete
+            #       existing media when the page moves with media=False);
+            #   (b) att_states and result.written are updated so state/disk agree
+            #       and the file enters the KEEP set before deferred cleanup runs;
+            #   (c) explicitly-dropped attachments remain deletable (no over-rescue).
+            # Mind:
+            # - Same inode (case-only rename on APFS): old and new .media/ dirs
+            #   casefold-equal → files are already there; skip the rename.
+            # - EXDEV (cross-device): fall back to shutil.copy2 + unlink.
+            # - Only carry files not already present at the new location.
+            if prev is not None and pid in prev.pages:
+                old_media_for_move = old_dir_abs / ".media"
+                new_media_for_move = planned_dir_abs / ".media"
+                same_dir = (
+                    str(old_media_for_move).casefold()
+                    == str(new_media_for_move).casefold()
+                )
+                if not same_dir and old_media_for_move.exists():
+                    written_cf = {str(p).casefold() for p in result.written}
+                    for prev_att_id, prev_att_state in prev.pages[pid].attachments.items():
+                        # Only rescue attachments that are still tracked this run.
+                        # Attachments absent from att_states were explicitly dropped;
+                        # leave them as candidates for deferred cleanup.
+                        if prev_att_id not in att_states:
+                            continue
+                        fname = prev_att_state.file
+                        if not fname:
+                            continue
+                        new_file = new_media_for_move / fname
+                        # Skip if the file was already materialized at the new
+                        # location this run (by the blob-materialize write step).
+                        # Use casefold for case-insensitive FS safety.
+                        if str(new_file).casefold() in written_cf:
+                            continue
+                        # If the file is already present at the new location
+                        # (e.g. already renamed by a prior iteration or crash
+                        # recovery), skip.
+                        if new_file.exists():
+                            continue
+                        old_file = old_media_for_move / fname
+                        if not old_file.exists() or not old_file.is_file():
+                            continue
+                        # Rename old file to new location.
+                        # Same inode guard is handled by the same_dir check above.
+                        new_media_for_move.mkdir(parents=True, exist_ok=True)
+                        try:
+                            os.rename(old_file, new_file)
+                        except OSError as exc:
+                            if exc.errno == errno.EXDEV:
+                                shutil.copy2(old_file, new_file)
+                                old_file.unlink(missing_ok=True)
+                            else:
+                                raise
+                        # Record in result.written so the file enters KEEP and
+                        # state matches disk.  att_states already has the entry
+                        # (it was carried via media=False or attachments_complete=False).
+                        result.written.append(new_file)
+                        media_available.add(fname)
+                        written_cf.add(str(new_file).casefold())
+
+            # Defer deletion of old recorded artifacts until after ALL pages
+            # have been written.  This prevents a title-swap (page A's new
+            # path == page B's old path) or a case-only rename on a
+            # case-insensitive filesystem from deleting freshly-written
+            # content (data-safety: title-swap and case-only-retitle fixes).
             old_md = root / prev.pages[pid].file
-            _delete_artifact(old_md, result)
+            old_html: Path | None = None
             if prev.pages[pid].html:
                 old_html = root / prev.pages[pid].html
-                _delete_artifact(old_html, result)
-            old_media = old_dir_abs / ".media"
-            if old_media.exists():
-                _delete_dir_tree(old_media, result)
-
-            # rmdir emptied parents bottom-up.
-            if old_dir_abs.exists() and old_dir_abs != planned_dir_abs:
-                _rmdir_empty_parents(old_dir_abs, root)
+            old_media_dir = old_dir_abs / ".media"
+            # Pass the prev att states so deferred cleanup knows CANDIDATES.
+            prev_att_states_for_cleanup = dict(prev.pages[pid].attachments)
+            _deferred_cleanups.append(
+                (old_md, old_html, old_media_dir, old_dir_abs, old_dir_rel,
+                 str(planned_dir_rel), prev_att_states_for_cleanup)
+            )
 
             result.moved.append((old_dir_rel, str(planned_dir_rel)))
 
@@ -787,6 +925,62 @@ def build(
             fingerprint=fingerprints[pid],
             attachments=att_states,
         )
+
+    # -----------------------------------------------------------------------
+    # Step 4 (deferred) — Apply move cleanups after all pages are written
+    # -----------------------------------------------------------------------
+    # Build the global KEEP set: casefolded absolute paths of EVERY file written,
+    # materialised, renamed-in, or carried this run.  This is the single source
+    # of truth used by ALL deletion sites in this build — both the deferred
+    # move cleanup (below) and the prune step (Step 6).
+    #
+    # Building KEEP here (after all writes) ensures that:
+    # 1. Title-swap: page A's new path == page B's old path → KEEP guards it.
+    # 2. Case-only rename on APFS: old and new paths casefold-equal → KEEP guards it.
+    # 3. Prune re-uses freed dir: new page written to pruned page's old dir → KEEP guards it.
+    # 4. DEFECT D (move+media=False): carried media files enter KEEP via the
+    #    media carry-on-move rescue above (they are appended to result.written there).
+    _keep: set[str] = {str(p).casefold() for p in result.written}
+
+    for (
+        old_md, old_html, old_media_dir, old_dir_abs,
+        old_dir_rel, new_dir_rel_str, prev_att_states
+    ) in _deferred_cleanups:
+        # Delete old .md unless it was just written (swap or case-rename).
+        _guarded_delete_file(old_md, _keep, result)
+
+        # Delete old .html unless it was just written.
+        if old_html is not None:
+            _guarded_delete_file(old_html, _keep, result)
+
+        # Old-media cleanup — per-file set-difference design.
+        #
+        # CANDIDATES: the moved page's PREV-recorded media file paths
+        # (from prev AttachmentState entries), resolved to absolute paths.
+        # KEEP: every path written or carried this run (_keep).
+        # Delete CANDIDATES − KEEP file-by-file through the guarded helper.
+        #
+        # On a case-insensitive FS (APFS), the old and new .media/ dirs may
+        # be the same inode when only the parent dir case changed.  The casefold
+        # comparison in _guarded_delete_file handles this correctly.
+        if old_media_dir.exists():
+            for prev_att_state in prev_att_states.values():
+                fname = prev_att_state.file
+                if not fname:
+                    continue
+                candidate = old_media_dir / fname
+                _guarded_delete_file(candidate, _keep, result)
+
+            # rmdir the .media/ dir (and its parent) if now empty.
+            # Never remove non-empty dirs (user files or surviving attachments).
+            _rmdir_empty_parents(old_media_dir, root)
+
+        # rmdir emptied parents bottom-up.  Skip when old and new dirs are
+        # the same path on disk (case-insensitive FS: old_dir = Demo/Hello,
+        # new_dir = Demo/hello — same inode on APFS).
+        new_dir_abs = root / new_dir_rel_str
+        if old_dir_abs.exists() and str(old_dir_abs).casefold() != str(new_dir_abs).casefold():
+            _rmdir_empty_parents(old_dir_abs, root)
 
     # -----------------------------------------------------------------------
     # Step 6 — Prune
@@ -829,11 +1023,13 @@ def build(
                     new_page_states[pid] = ps
                     continue
 
-            # Delete recorded artifacts.
+            # Delete recorded artifacts — guarded against _keep so that a newly
+            # moved page occupying the same dir cannot have its content deleted
+            # by the prune step (DEFECT C).
             if ps.file:
-                _delete_artifact(root / ps.file, result)
+                _guarded_delete_file(root / ps.file, _keep, result)
             if ps.html:
-                _delete_artifact(root / ps.html, result)
+                _guarded_delete_file(root / ps.html, _keep, result)
 
             page_dir_abs = root / ps.dir
             media_dir_abs = page_dir_abs / ".media"
@@ -842,7 +1038,10 @@ def build(
                 workspace_dir = page_dir_abs / ".workspace"
                 if workspace_dir.exists():
                     ws_left = True
-                _delete_dir_tree(media_dir_abs, result)
+                # Guarded per-file tree delete: KEEP prevents deleting files that
+                # belong to a newly-written or moved page (DEFECT C fix).
+                _guarded_delete_dir_tree(media_dir_abs, _keep, result)
+                _rmdir_empty_parents(media_dir_abs, root)
                 if ws_left:
                     msg = (
                         f"prune: non-empty .workspace left at {workspace_dir} "
@@ -860,6 +1059,8 @@ def build(
                     result.warnings.append(msg)
                     warnings.warn(msg, stacklevel=2)
 
+            # rmdir the page dir bottom-up (guarded: won't remove a dir that
+            # still has KEEP-protected files inside).
             _rmdir_empty_parents(page_dir_abs, root)
 
         # Prune folder dirs.

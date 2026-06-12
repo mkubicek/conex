@@ -138,8 +138,17 @@ def default_handler(macro: Macro, ctx: "ConvertContext") -> Replacement:
     if macro.plain_body is not None and macro.plain_body.strip():
         return macro.plain_body
 
-    # Branch 2: bodyless wrapper around other macros
-    if macro.element.find("ac:structured-macro") is not None:
+    # Branch 2: bodyless wrapper around other macros, OR ac:adf-extension.
+    # ac:adf-extension is a native Cloud ADF wrapper that v1 unwrapped
+    # generically (it was never treated as a structured-macro by v1's
+    # converter).  Its children — plain content, ac:adf-node panels, lists —
+    # must survive into the markdown.  Without this guard they fall through to
+    # Branch 3 and are replaced by the empty placeholder comment, silently
+    # destroying user content on Cloud pages.
+    if (
+        macro.element.find("ac:structured-macro") is not None
+        or macro.element.name == "ac:adf-extension"
+    ):
         # Drop own parameters to prevent raw param values leaking as text
         for p in macro.element.find_all("ac:parameter", recursive=False):
             p.decompose()

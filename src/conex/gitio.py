@@ -212,15 +212,39 @@ def commit_export(root: Path, result: Any, message: str) -> bool:
     written: list[Path] = result.written
     deleted: list[Path] = result.deleted
 
-    # Stage written paths (additions and updates).
-    written_strs = [str(p) for p in written if not _is_conex_relpath(str(p))]
-    for batch in _chunked_paths(written_strs):
+    # Stage written paths (additions and updates).  Filter to paths that still
+    # exist on disk: a written path that vanished (e.g. due to a mid-build
+    # crash or a title-swap race) was effectively a deletion — git add --
+    # exits 128 ("pathspec did not match any files") for absent untracked
+    # paths, which would abort the commit and desync state.json from git HEAD.
+    # Route such paths through the deleted batch instead (git add -- on a
+    # tracked-then-deleted path records the deletion; on an untracked absent
+    # path it is a no-op and does not fail).
+    written_existing: list[str] = []
+    written_vanished: list[str] = []
+    for p in written:
+        s = str(p)
+        if _is_conex_relpath(s):
+            continue
+        if p.exists():
+            written_existing.append(s)
+        else:
+            written_vanished.append(s)
+
+    for batch in _chunked_paths(written_existing):
         _run_git(root, "add", "--", *batch)
 
-    # Stage deleted paths (git add -- on a missing file records the deletion).
+    # Stage deleted paths.  Use `git rm --cached --ignore-unmatch` rather
+    # than `git add --` for paths that are absent from disk:
+    # - `git add -- <absent-untracked>` fails with exit 128 ("pathspec did
+    #   not match any files") — unusable for vanished written paths.
+    # - `git rm --cached --ignore-unmatch` silently skips paths that are not
+    #   in the index and stages the removal for tracked ones.
+    # Also include written-but-vanished paths here (same treatment).
     deleted_strs = [str(p) for p in deleted if not _is_conex_relpath(str(p))]
-    for batch in _chunked_paths(deleted_strs):
-        _run_git(root, "add", "--", *batch)
+    all_deleted_strs = deleted_strs + written_vanished
+    for batch in _chunked_paths(all_deleted_strs):
+        _run_git(root, "rm", "--cached", "--ignore-unmatch", "--", *batch)
 
     _unstage_conex_paths(root)
 

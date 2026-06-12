@@ -430,6 +430,59 @@ class TestCommitExport:
             with pytest.raises(GitError):
                 gitio.commit_export(root, result, "Export")
 
+    def test_written_path_that_vanished_does_not_abort_commit(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression (MAJOR): a path in result.written that no longer exists
+        on disk must not cause 'git add --' to exit 128 and abort the commit.
+
+        The vanished path should be treated as a deletion so the remaining
+        written paths are still committed successfully.
+        """
+        root = tmp_path / "export"
+        root.mkdir()
+        _init_repo(root)
+        # A page that actually exists and should be committed.
+        present = root / "Present.md"
+        present.write_text("# Present", encoding="utf-8")
+        # A path listed in written that has already vanished from disk
+        # (simulates the title-swap scenario where a freshly-written file was
+        # subsequently deleted by the deferred cleanup of a swap partner before
+        # the commit step — should NOT happen with the deferred-cleanup fix,
+        # but commit_export must be robust regardless).
+        vanished = root / "Vanished.md"
+        # Do NOT create vanished — it is absent from disk.
+        result = _BuildResult(written=[present, vanished])
+        # Must not raise GitError; must commit the present file.
+        committed = gitio.commit_export(root, result, "Export resilience test")
+        assert committed is True
+        show = subprocess.run(
+            ["git", "show", "--name-only", "--format="],
+            cwd=root, capture_output=True, text=True, check=True,
+        )
+        committed_files = [f for f in show.stdout.splitlines() if f.strip()]
+        assert any("Present.md" in f for f in committed_files), (
+            "Present.md must be in the commit even when a sibling written path vanished"
+        )
+
+    def test_all_written_vanished_still_does_not_abort_commit(
+        self, tmp_path: Path
+    ) -> None:
+        """When every written path has vanished, commit_export must not raise;
+        it returns False (empty delta) or commits the deletions if tracked."""
+        root = tmp_path / "export"
+        root.mkdir()
+        _init_repo(root)
+        _make_commit(root)  # give repo a HEAD
+        vanished = root / "Vanished.md"
+        # Do NOT create vanished.
+        result = _BuildResult(written=[vanished])
+        # Must not raise; returns True/False but never GitError.
+        try:
+            gitio.commit_export(root, result, "All vanished")
+        except GitError as exc:
+            pytest.fail(f"commit_export raised GitError for all-vanished written list: {exc}")
+
 
 # ---------------------------------------------------------------------------
 # _chunked_paths unit tests
