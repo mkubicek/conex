@@ -58,8 +58,26 @@ def _chunked_paths(paths: list[str], max_bytes: int | None = None) -> Iterator[l
 
 
 def _is_conex_relpath(path: str) -> bool:
-    """True for any file inside a .conex directory (any case-match)."""
+    """True for any file inside a .conex directory (any case-match).
+
+    For paths already relative to the repo root (e.g. git index entries).
+    """
     return any(part.lower() == ".conex" for part in Path(path).parts)
+
+
+def _is_conex_path(root: Path, p: Path) -> bool:
+    """True iff *p* is inside the export's OWN ``.conex/`` dir, relative to root.
+
+    BuildResult paths are absolute, so the segments must be taken RELATIVE to
+    the export root before the ``.conex`` check — otherwise an export rooted
+    under an unrelated ancestor literally named ``.conex`` (e.g.
+    ``~/.conex/myspace``) would match every path and stage nothing.
+    """
+    try:
+        rel = p.resolve().relative_to(root.resolve())
+    except ValueError:
+        rel = p
+    return _is_conex_relpath(str(rel))
 
 
 def _git_available() -> bool:
@@ -224,15 +242,19 @@ def commit_export(root: Path, result: Any, message: str) -> bool:
     written_vanished: list[str] = []
     for p in written:
         s = str(p)
-        if _is_conex_relpath(s):
+        if _is_conex_path(root, p):
             continue
         if p.exists():
             written_existing.append(s)
         else:
             written_vanished.append(s)
 
+    # Force-add: the export tree is authoritative conex output, so a user
+    # .gitignore pattern that happens to match an exported file must not abort
+    # the export commit (`git add` without -f errors on ignored paths).  .conex/
+    # is excluded from this list above and re-unstaged below, so -f cannot leak it.
     for batch in _chunked_paths(written_existing):
-        _run_git(root, "add", "--", *batch)
+        _run_git(root, "add", "-f", "--", *batch)
 
     # Stage deleted paths.  Use `git rm --cached --ignore-unmatch` rather
     # than `git add --` for paths that are absent from disk:
@@ -241,7 +263,7 @@ def commit_export(root: Path, result: Any, message: str) -> bool:
     # - `git rm --cached --ignore-unmatch` silently skips paths that are not
     #   in the index and stages the removal for tracked ones.
     # Also include written-but-vanished paths here (same treatment).
-    deleted_strs = [str(p) for p in deleted if not _is_conex_relpath(str(p))]
+    deleted_strs = [str(p) for p in deleted if not _is_conex_path(root, p)]
     all_deleted_strs = deleted_strs + written_vanished
     for batch in _chunked_paths(all_deleted_strs):
         _run_git(root, "rm", "--cached", "--ignore-unmatch", "--", *batch)

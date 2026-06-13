@@ -285,6 +285,34 @@ class TestCommitExport:
         msgs = _log_messages(root)
         assert msgs[0] == "Export space TEST"
 
+    def test_force_adds_past_user_gitignore(self, tmp_path: Path) -> None:
+        """A user .gitignore pattern that matches an exported file must not abort
+        the export commit — conex output is authoritative and force-added."""
+        root = tmp_path / "export"
+        root.mkdir()
+        _init_repo(root)
+        (root / ".gitignore").write_text("*.md\n", encoding="utf-8")
+        page = root / "Page.md"
+        page.write_text("# Page", encoding="utf-8")
+        result = _BuildResult(written=[page])
+        committed = gitio.commit_export(root, result, "Export with gitignore")
+        assert committed is True
+        assert "Page.md" in _git(root, "ls-files").stdout
+
+    def test_export_root_under_dotconex_ancestor_still_stages(self, tmp_path: Path) -> None:
+        """Regression: an export rooted under an ancestor dir named .conex (e.g.
+        ~/.conex/myspace) must still stage its files — the .conex exclusion is
+        relative to the export root, not the absolute path."""
+        root = tmp_path / ".conex" / "myspace"
+        root.mkdir(parents=True)
+        _init_repo(root)
+        page = root / "Page.md"
+        page.write_text("# Page", encoding="utf-8")
+        result = _BuildResult(written=[page])
+        committed = gitio.commit_export(root, result, "Export under .conex ancestor")
+        assert committed is True  # was False (nothing staged) before the fix
+        assert "Page.md" in _git(root, "ls-files").stdout
+
     def test_commits_deleted_files(self, tmp_path: Path) -> None:
         root = tmp_path / "export"
         root.mkdir()

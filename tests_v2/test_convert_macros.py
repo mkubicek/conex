@@ -9,10 +9,10 @@ Coverage strategy:
   matches on the agreed sub-set.  Deliberate divergences are documented inline.
 
 DELIBERATE DIVERGENCES from v1 documented in this file:
-  D1: toc emits ``<!-- macro: toc -->`` comment (v2 spec); v1 emits italic
-      ``[Confluence dynamic content: toc]``.
-  D2: children/pagetree emit ``<!-- macro: … -->`` comments; v1 emits italic
-      ``[Confluence dynamic content: …]``.
+  (D1/D2 were retired: toc/children/pagetree now emit the v1-style visible
+   ``[Confluence dynamic content: NAME (params)]`` placeholder — matching the
+   oracle and preserving parameter context — instead of an invisible comment
+   that lost the referenced page/params.)
   D3: anchor emits nothing (None → decompose); v1 emits italic
       ``[Confluence dynamic content: anchor (anchor=…)]``.
   D4: profile output is name-only (v2 resolve_user returns str, not a dict
@@ -403,17 +403,12 @@ class TestJiraMacro:
 
 
 class TestTocMacro:
-    def test_emits_comment_placeholder(self) -> None:
-        """D1: toc emits a comment, not italic text (deliberate divergence from v1)."""
+    def test_emits_visible_placeholder(self) -> None:
+        """toc emits the v1-style visible dynamic-content placeholder (parity)."""
         xml = '<ac:structured-macro ac:name="toc"/>'
         out = _run(xml)
-        assert "<!-- macro: toc -->" in out
-
-    def test_no_italic_placeholder(self) -> None:
-        """D1: v2 must NOT emit the v1-style italic dynamic-content placeholder."""
-        xml = '<ac:structured-macro ac:name="toc"/>'
-        out = _run(xml)
-        assert "Confluence dynamic content" not in out
+        assert "[Confluence dynamic content: toc]" in out
+        assert "<!-- macro:" not in out  # no leaked raw comment
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +496,25 @@ class TestDrawioMacro:
         out = _run(xml, ctx)
         assert "mydiagram.png" in out
         assert "![" in out or "img" in out.lower() or ".media/mydiagram.png" in out
+
+    def test_rendered_png_matched_by_attachment_title_case_insensitive(self) -> None:
+        """diagramName differs in case/whitespace from the .drawio attachment
+        title; build keys rendered_drawio by the title, so the lookup must match
+        the attachment title tolerantly and emit the <img>, not the note."""
+        att = _make_att(title="My Diagram.drawio", media_type="application/x-drawio")
+        ctx = _make_ctx(
+            attachments=[att],
+            rendered_drawio={"My Diagram.drawio": "My_Diagram.png"},
+            media_available={"My_Diagram.png"},
+        )
+        out = _run(
+            '<ac:structured-macro ac:name="drawio">'
+            '<ac:parameter ac:name="diagramName">my diagram</ac:parameter>'
+            "</ac:structured-macro>",
+            ctx,
+        )
+        assert "My_Diagram.png" in out
+        assert "not rendered" not in out.lower()
 
     def test_source_link_only_when_source_on_disk(self) -> None:
         """F5 dead-source-link rule: source link appears only when .drawio is available."""
@@ -726,24 +740,26 @@ class TestUnwrapMacros:
 
 
 class TestCommentPlaceholderMacros:
-    def test_children_comment(self) -> None:
-        """D2: children emits a comment placeholder."""
+    def test_children_visible_placeholder(self) -> None:
+        """children emits the v1-style visible placeholder (parity)."""
         xml = '<ac:structured-macro ac:name="children"/>'
         out = _run(xml)
-        assert "<!-- macro: children -->" in out
+        assert "[Confluence dynamic content: children]" in out
+        assert "<!-- macro:" not in out
 
-    def test_pagetree_comment(self) -> None:
-        """D2: pagetree emits a comment placeholder."""
+    def test_pagetree_visible_placeholder(self) -> None:
+        """pagetree emits the v1-style visible placeholder (parity)."""
         xml = '<ac:structured-macro ac:name="pagetree"/>'
         out = _run(xml)
-        assert "<!-- macro: pagetree -->" in out
+        assert "[Confluence dynamic content: pagetree]" in out
+        assert "<!-- macro:" not in out
 
-    def test_no_italic_dynamic_content(self) -> None:
-        """D2: v2 must not emit v1-style italic [Confluence dynamic content: ...]."""
+    def test_children_pagetree_emit_visible_placeholder(self) -> None:
+        """children/pagetree now match v1's visible dynamic-content placeholder."""
         for name in ("children", "pagetree"):
             xml = f'<ac:structured-macro ac:name="{name}"/>'
             out = _run(xml)
-            assert "Confluence dynamic content" not in out
+            assert f"[Confluence dynamic content: {name}]" in out
 
 
 # ---------------------------------------------------------------------------
@@ -820,10 +836,22 @@ class TestMultimediaWidget:
         out = _run(xml)
         assert "https://example.com/embed" in out
 
-    def test_widget_no_url_comment(self) -> None:
+    def test_multimedia_url_only_emits_placeholder(self) -> None:
+        """A url-only multimedia embed (YouTube/Vimeo, no attachment) must emit a
+        visible dynamic-content placeholder, not be silently dropped (v1 parity)."""
+        xml = (
+            '<ac:structured-macro ac:name="multimedia">'
+            '<ac:parameter ac:name="url">https://youtu.be/abc</ac:parameter>'
+            "</ac:structured-macro>"
+        )
+        out = _run(xml)
+        assert "[Confluence dynamic content: multimedia" in out
+
+    def test_widget_no_url_visible_placeholder(self) -> None:
         xml = '<ac:structured-macro ac:name="widget"/>'
         out = _run(xml)
-        assert "<!-- macro: widget -->" in out
+        assert "[Confluence dynamic content: widget]" in out
+        assert "<!-- macro:" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -1021,16 +1049,13 @@ class TestFidelityVsV1:
         v2 = _run(xml)
         assert v2 == v1, f"drawio-sketch mismatch:\nv1={v1!r}\nv2={v2!r}"
 
-    def test_toc_divergence(self) -> None:
-        """D1: v2 comment vs v1 italic placeholder — verify difference is intentional."""
+    def test_toc_parity(self) -> None:
+        """toc now matches v1: both emit the visible dynamic-content placeholder."""
         xml = '<ac:structured-macro ac:name="toc"/>'
         v1 = _v1_body(xml)
         v2 = _run(xml)
-        # v1 emits italic dynamic content
-        assert "Confluence dynamic content" in v1
-        # v2 emits comment
-        assert "<!-- macro: toc -->" in v2
-        assert v2 != v1  # divergence confirmed
+        assert "Confluence dynamic content: toc" in v1
+        assert "Confluence dynamic content: toc" in v2
 
     def test_anchor_divergence(self) -> None:
         """D3: v2 drops anchor entirely; v1 emits a dynamic-content placeholder."""

@@ -58,7 +58,9 @@ class CookieV1API:
 
     def __init__(self, cfg: ResolvedConfig) -> None:
         self._cfg = cfg
-        self._http = Http(auth_headers=cfg.auth_headers)
+        from urllib.parse import urlparse
+        cookie_host = urlparse(cfg.site_url).hostname or ""
+        self._http = Http(auth_headers=cfg.auth_headers, cookie_host=cookie_host)
         self._base = cfg.api_base_url.rstrip("/")
 
     # -- pagination helpers --------------------------------------------------

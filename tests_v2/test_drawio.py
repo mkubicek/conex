@@ -485,6 +485,101 @@ class TestRenderBatchPerFileFallback:
 
 
 # ---------------------------------------------------------------------------
+# render_batch — subprocess timeout (P0: draw.io/Electron hang guard)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderBatchTimeout:
+    """The draw.io CLI is Electron-based and can hang on headless cleanup.
+    render_batch must pass a subprocess ``timeout`` and treat a
+    ``TimeoutExpired`` as a skipped render, never as a hang that wedges the
+    lock-held export.
+    """
+
+    def _reset_cache(self, cli_path: str = "/usr/bin/drawio"):
+        import conex.drawio as m
+        m._DRAWIO_CLI = cli_path
+
+    def test_subprocess_run_receives_timeout_kwarg(self, tmp_path):
+        """Pin the timeout kwarg so a future refactor can't silently drop it."""
+        self._reset_cache()
+        import conex.drawio as m
+
+        blobs = BlobStore(tmp_path)
+        digest = blobs.add_bytes(b"<mxGraphModel/>")
+        seen: list[dict] = []
+        idx = 0
+
+        def fake_run(argv, **kwargs):
+            nonlocal idx
+            seen.append(kwargs)
+            if idx == 0:  # folder-mode fails → per-file fallback
+                idx += 1
+                return MagicMock(returncode=1)
+            out_path = Path(argv[argv.index("--output") + 1])
+            out_path.write_bytes(b"\x89PNG" + b"\x00" * 20)
+            idx += 1
+            return MagicMock(returncode=0)
+
+        with patch("conex.drawio.subprocess.run", side_effect=fake_run):
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                m.render_batch({"d.drawio": digest}, blobs)
+
+        assert seen, "subprocess.run was never called"
+        assert all(kw.get("timeout") == m._RENDER_TIMEOUT_S for kw in seen)
+
+    def test_per_file_timeout_skips_without_hanging(self, tmp_path):
+        self._reset_cache()
+        import conex.drawio as m
+
+        blobs = BlobStore(tmp_path)
+        digest = blobs.add_bytes(b"<mxGraphModel/>")
+        idx = 0
+
+        def fake_run(argv, **kwargs):
+            nonlocal idx
+            if idx == 0:  # folder-mode fails → per-file
+                idx += 1
+                return MagicMock(returncode=1)
+            idx += 1
+            raise m.subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
+
+        with patch("conex.drawio.subprocess.run", side_effect=fake_run):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = m.render_batch({"d.drawio": digest}, blobs)
+
+        assert result == {}  # nothing rendered, but the call RETURNED (no hang)
+        assert any("timed out" in str(w.message) for w in caught)
+
+    def test_folder_timeout_falls_through_to_per_file(self, tmp_path):
+        self._reset_cache()
+        import conex.drawio as m
+
+        blobs = BlobStore(tmp_path)
+        digest = blobs.add_bytes(b"<mxGraphModel/>")
+        idx = 0
+
+        def fake_run(argv, **kwargs):
+            nonlocal idx
+            if idx == 0:  # folder-mode hangs → timeout → per-file fallback
+                idx += 1
+                raise m.subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
+            out_path = Path(argv[argv.index("--output") + 1])
+            out_path.write_bytes(b"\x89PNG" + b"\x00" * 20)
+            idx += 1
+            return MagicMock(returncode=0)
+
+        with patch("conex.drawio.subprocess.run", side_effect=fake_run):
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                result = m.render_batch({"d.drawio": digest}, blobs)
+
+        assert "d.drawio" in result  # per-file recovered after folder-mode timeout
+
+
+# ---------------------------------------------------------------------------
 # render_batch — tmp dir invariant (I4)
 # ---------------------------------------------------------------------------
 

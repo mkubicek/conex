@@ -514,10 +514,18 @@ def test_flag_no_author_lookup_propagates(tmp_path):
 
 
 def test_flag_path_propagates_to_build(tmp_path):
-    """--path /Foo/Bar must set BuildOptions.subtree = '/Foo/Bar'."""
-    _, build_opts = _run_export_with_flags(tmp_path, ["--path", "/Foo/Bar"])
+    """--path PAGE must set BuildOptions.subtree (path must resolve to a node)."""
+    _, build_opts = _run_export_with_flags(tmp_path, ["--path", "Page 0"])
     assert build_opts is not None
-    assert build_opts.subtree == "/Foo/Bar"
+    assert build_opts.subtree == "Page 0"
+
+
+def test_unknown_path_exits_1_not_silent(tmp_path, capsys):
+    """A --path that resolves to no node must fail loudly, not export nothing."""
+    with pytest.raises(SystemExit) as exc:
+        _run_export_with_flags(tmp_path, ["--path", "Does/Not/Exist"])
+    assert exc.value.code == 1
+    assert "not found" in capsys.readouterr().err
 
 
 def test_flag_no_children_propagates(tmp_path):

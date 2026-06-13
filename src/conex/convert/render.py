@@ -288,6 +288,12 @@ def _replace_ac_link(soup: BeautifulSoup, tag: Tag, ctx: "ConvertContext") -> No
     if ri_page:
         title = str(ri_page.get("ri:content-title", "") or "Link")
         body = tag.find("ac:link-body") or tag.find("ac:plain-text-link-body")
+        # Preserve a rich body (e.g. an image already turned into <img> by the
+        # images pass) instead of collapsing the link to a title-only span,
+        # which would silently drop the image.
+        if body is not None and body.find(True) is not None:
+            tag.unwrap()
+            return
         label = body.get_text().strip() if body else title
         span = soup.new_tag("span")
         span.string = label or title
@@ -300,9 +306,11 @@ def _replace_ac_link(soup: BeautifulSoup, tag: Tag, ctx: "ConvertContext") -> No
         return
 
     # A link with no recognised ri: child but still holding content → unwrap.
-    # An inline mention span or a structured macro the macro-dispatch pass must
-    # not destroy before it runs (F1).
-    if tag.find("ac:structured-macro") or tag.get_text(strip=True):
+    # Preserve any element child (an <img> the images pass produced, or a
+    # structured macro the macro-dispatch pass must not lose) as well as text;
+    # only a genuinely empty link is decomposed.  An <img> has no text, so a
+    # get_text-only check used to drop image-bodied links (content loss).
+    if tag.find(True) is not None or tag.get_text(strip=True):
         tag.unwrap()
         return
 

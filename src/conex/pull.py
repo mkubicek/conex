@@ -127,7 +127,24 @@ def pull(
 
     if pages_needing_body:
         def _fetch_body(page: Page) -> tuple[str, str]:
-            body = api.get_page_body(page.id)
+            # Best-effort: a single page whose body cannot be fetched (404 for a
+            # page deleted mid-run, retry-exhausted 5xx) must NOT abort the whole
+            # export.  But a transient failure must NOT blank an already-exported
+            # page either: carry the prev body blob forward when we have one, so
+            # the page's fingerprint is unchanged and the last-good markdown is
+            # preserved.  Only a page with NO prior body falls back to empty.
+            try:
+                body = api.get_page_body(page.id)
+            except Exception as exc:
+                print(
+                    f"conex: warning: failed to fetch body for page "
+                    f"'{page.title}' ({page.id}): {exc}",
+                    file=sys.stderr,
+                )
+                prev_digest = prev.body_blobs.get(page.id) if prev is not None else None
+                if prev_digest and blobs.has(prev_digest):
+                    return page.id, prev_digest
+                body = ""
             digest = blobs.add_bytes(body.encode("utf-8"))
             return page.id, digest
 
@@ -149,8 +166,22 @@ def pull(
     # 5. Fetch attachment lists per page
     # ------------------------------------------------------------------
     attachments: dict[str, list[Attachment]] = {}
+    listing_complete = True
     for page in pages:
-        atts = api.get_attachments(page.id)
+        try:
+            atts = api.get_attachments(page.id)
+        except Exception as exc:
+            # Best-effort: a single page's attachment listing failing must not
+            # abort the whole export.  Warn, mark the snapshot incomplete (so the
+            # build never treats the partial listing as authoritative and prunes
+            # existing media), and continue.
+            print(
+                f"conex: warning: failed to list attachments for page "
+                f"'{page.title}' ({page.id}): {exc}",
+                file=sys.stderr,
+            )
+            listing_complete = False
+            continue
         if atts:
             attachments[page.id] = atts
 
@@ -158,7 +189,7 @@ def pull(
     # 6. Download attachment binaries
     # ------------------------------------------------------------------
     attachment_blobs: dict[str, str] = {}
-    attachments_complete = True
+    attachments_complete = listing_complete
 
     prev_att_blobs = prev.attachment_blobs if prev is not None else {}
 
@@ -216,6 +247,14 @@ def pull(
                     attachment_blobs[att_key] = digest
                 else:
                     attachments_complete = False
+    else:
+        # No media fetch this run (e.g. the diff path): carry prev's
+        # attachment_blobs forward verbatim so the saved snapshot keeps
+        # referencing the blobs already in the store.  Otherwise a diff would
+        # persist attachment_blobs={}, and a later build's GC keep-set (derived
+        # from the current snapshot) would delete those blobs out from under the
+        # exported .media/ files.  Mirrors the derived_blobs carry-forward below.
+        attachment_blobs.update(prev_att_blobs)
 
     # ------------------------------------------------------------------
     # 7. Carry forward derived_blobs from prev

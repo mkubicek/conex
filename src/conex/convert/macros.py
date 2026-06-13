@@ -17,7 +17,12 @@ from typing import TYPE_CHECKING
 
 from bs4 import BeautifulSoup, Tag
 
-from conex.convert.registry import Macro, Replacement, register
+from conex.convert.registry import (
+    Macro,
+    Replacement,
+    dynamic_macro_placeholder,
+    register,
+)
 from conex.paths import safe_attachment_name
 
 if TYPE_CHECKING:
@@ -288,8 +293,8 @@ def handle_jira(macro: Macro, ctx: "ConvertContext") -> Replacement:
 
 @register("toc")
 def handle_toc(macro: Macro, ctx: "ConvertContext") -> Replacement:
-    """Emit an HTML comment placeholder for the table-of-contents macro."""
-    return "<!-- macro: toc -->"
+    """Emit a visible ``[Confluence dynamic content: toc]`` placeholder (v1 parity)."""
+    return dynamic_macro_placeholder(macro)
 
 
 # ---------------------------------------------------------------------------
@@ -356,14 +361,11 @@ def handle_viewxls(macro: Macro, ctx: "ConvertContext") -> Replacement:
 # ---------------------------------------------------------------------------
 
 
-def _match_drawio_attachment_local_name(
-    diagram_name: str, ctx: "ConvertContext"
-) -> str | None:
-    """Return the local .media filename for the drawio attachment that best
-    matches ``diagram_name``.
+def _match_drawio_attachment(diagram_name: str, ctx: "ConvertContext"):
+    """Return the drawio :class:`Attachment` that best matches ``diagram_name``.
 
     Tolerant of the ``.drawio`` extension and case/whitespace differences.
-    PORT: v1 ``_match_drawio_attachment`` + ``_attachment_local_name`` semantics.
+    PORT: v1 ``_match_drawio_attachment``.
     """
     from conex.models import Attachment as AttModel
 
@@ -385,14 +387,27 @@ def _match_drawio_attachment_local_name(
 
     for key in (diagram_name, f"{bare}.drawio", bare):
         if key in att_map:
-            return ctx.media.filename_for_title(att_map[key].title)
+            return att_map[key]
 
     target = _norm(diagram_name)
     for att in drawio_atts:
         if _norm(att.title) == target:
-            return ctx.media.filename_for_title(att.title)
+            return att
 
     return None
+
+
+def _match_drawio_attachment_local_name(
+    diagram_name: str, ctx: "ConvertContext"
+) -> str | None:
+    """Return the local .media filename for the best-matching drawio attachment.
+
+    PORT: v1 ``_attachment_local_name`` semantics.
+    """
+    matched = _match_drawio_attachment(diagram_name, ctx)
+    if matched is None:
+        return None
+    return ctx.media.filename_for_title(matched.title)
 
 
 def _emit_drawio(macro: Macro, ctx: "ConvertContext", diagram_name: str) -> Replacement:
@@ -410,12 +425,22 @@ def _emit_drawio(macro: Macro, ctx: "ConvertContext", diagram_name: str) -> Repl
     bare = diagram_name.removesuffix(".drawio")
     source_title = f"{bare}.drawio"
 
-    source_local_name = _match_drawio_attachment_local_name(diagram_name, ctx)
-    if source_local_name is None:
+    matched = _match_drawio_attachment(diagram_name, ctx)
+    if matched is not None:
+        source_local_name = ctx.media.filename_for_title(matched.title)
+    else:
         source_local_name = safe_attachment_name(source_title)
 
     png_name: str | None = None
-    for key in (diagram_name, f"{bare}.drawio", bare):
+    # build keys rendered_drawio by the .drawio attachment's ACTUAL title, so try
+    # the matched attachment's title FIRST (handles a diagramName that differs in
+    # case/whitespace from the title — v1 tried matched.title first), then the
+    # diagram_name-derived keys.
+    png_keys: list[str] = []
+    if matched is not None:
+        png_keys.append(matched.title)
+    png_keys += [diagram_name, f"{bare}.drawio", bare]
+    for key in png_keys:
         if key in ctx.rendered_drawio:
             png_name = ctx.rendered_drawio[key]
             break
@@ -593,14 +618,14 @@ def handle_column(macro: Macro, ctx: "ConvertContext") -> Replacement:
 
 @register("children")
 def handle_children(macro: Macro, ctx: "ConvertContext") -> Replacement:
-    """Emit an HTML comment placeholder for the children macro."""
-    return "<!-- macro: children -->"
+    """Emit a visible ``[Confluence dynamic content: children]`` placeholder."""
+    return dynamic_macro_placeholder(macro)
 
 
 @register("pagetree")
 def handle_pagetree(macro: Macro, ctx: "ConvertContext") -> Replacement:
-    """Emit an HTML comment placeholder for the pagetree macro."""
-    return "<!-- macro: pagetree -->"
+    """Emit a visible ``[Confluence dynamic content: pagetree]`` placeholder."""
+    return dynamic_macro_placeholder(macro)
 
 
 # ---------------------------------------------------------------------------
@@ -644,9 +669,16 @@ def handle_attachments(macro: Macro, ctx: "ConvertContext") -> Replacement:
 def handle_multimedia(macro: Macro, ctx: "ConvertContext") -> Replacement:
     """Convert multimedia macro to an attachment link when available.
 
-    Uses the same resolution as view-file (ri:attachment or name param).
+    Uses the same resolution as view-file (ri:attachment or name param).  A
+    url-only embed (e.g. a YouTube/Vimeo link with no attachment) has no
+    filename to resolve — emit the visible dynamic-content placeholder (v1
+    parity) instead of silently dropping it.
     """
-    return _handle_view_file_like(macro, ctx)
+    has_attachment = macro.element.find("ri:attachment") is not None
+    has_name = bool(macro.params.get("name", "").strip())
+    if has_attachment or has_name:
+        return _handle_view_file_like(macro, ctx)
+    return dynamic_macro_placeholder(macro)
 
 
 @register("widget")
@@ -657,7 +689,7 @@ def handle_widget(macro: Macro, ctx: "ConvertContext") -> Replacement:
     """
     url = macro.params.get("url", "").strip()
     if not url:
-        return "<!-- macro: widget -->"
+        return dynamic_macro_placeholder(macro)
 
     soup_root = _get_soup_root(macro)
     a = soup_root.new_tag("a", href=url)

@@ -309,23 +309,34 @@ class TestDefaultHandler:
         # The parameter was decomposed: raw param value must not leak
         assert ">x<" not in str(soup)
 
-    def test_branch3_no_body_no_inner_macros_returns_comment(self) -> None:
-        """Branch 3: no body and no inner macros → comment placeholder."""
+    def test_branch3_no_body_no_inner_macros_returns_placeholder(self) -> None:
+        """Branch 3: no body and no inner macros → visible v1-style placeholder."""
         macro, _soup = self._make_macro_from_html(
             '<ac:structured-macro ac:name="toc"></ac:structured-macro>'
         )
         ctx = _make_ctx()
         result = default_handler(macro, ctx)
-        assert isinstance(result, str)
-        assert "<!-- macro: toc -->" == result
+        assert isinstance(result, Tag)
+        assert result.get_text() == "[Confluence dynamic content: toc]"
 
-    def test_branch3_unnamed_macro_returns_unnamed_comment(self) -> None:
+    def test_branch3_unnamed_macro_returns_unnamed_placeholder(self) -> None:
         macro, _soup = self._make_macro_from_html(
             '<ac:structured-macro></ac:structured-macro>'
         )
         ctx = _make_ctx()
         result = default_handler(macro, ctx)
-        assert result == "<!-- macro: unnamed -->"
+        assert result.get_text() == "[Confluence dynamic content: unnamed]"
+
+    def test_branch3_placeholder_includes_resolved_page_param(self) -> None:
+        """The placeholder preserves non-default params (ri:page by title)."""
+        macro, _soup = self._make_macro_from_html(
+            '<ac:structured-macro ac:name="include">'
+            '<ac:parameter ac:name="page"><ri:page ri:content-title="Target"/></ac:parameter>'
+            "</ac:structured-macro>"
+        )
+        ctx = _make_ctx()
+        result = default_handler(macro, ctx)
+        assert result.get_text() == "[Confluence dynamic content: include (page=Target)]"
 
     def test_branch1_empty_rich_body_falls_through_to_branch3(self) -> None:
         """A rich body that is present but has only whitespace is not branch 1."""
@@ -336,8 +347,8 @@ class TestDefaultHandler:
         )
         ctx = _make_ctx()
         result = default_handler(macro, ctx)
-        # No inner macros → branch 3
-        assert result == "<!-- macro: empty -->"
+        # No inner macros → branch 3 (visible placeholder)
+        assert result.get_text() == "[Confluence dynamic content: empty]"
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +723,32 @@ class TestLinks:
         assert ".media/doc.pdf" in result
         assert "My Doc" in result
 
+    def test_image_wrapped_in_link_is_preserved(self) -> None:
+        """Regression: an <ac:image> inside an <ac:link> body must not be dropped
+        (the images pass turns it into <img>, leaving the link text empty)."""
+        att = Attachment(id="a1", title="pic.png", media_type="image/png")
+        ctx = self._make_ctx_with_att(att)
+        html = (
+            "<ac:link><ac:link-body>"
+            '<ac:image><ri:attachment ri:filename="pic.png"/></ac:image>'
+            "</ac:link-body></ac:link>"
+        )
+        result = _preprocess(html, ctx)
+        assert ".media/pic.png" in result
+
+    def test_image_in_ri_page_link_is_preserved(self) -> None:
+        """Regression: an image in a ri:page link body must survive (not be
+        collapsed to a title-only span)."""
+        att = Attachment(id="a1", title="pic.png", media_type="image/png")
+        ctx = self._make_ctx_with_att(att)
+        html = (
+            '<ac:link><ri:page ri:content-title="Other"/><ac:link-body>'
+            '<ac:image><ri:attachment ri:filename="pic.png"/></ac:image>'
+            "</ac:link-body></ac:link>"
+        )
+        result = _preprocess(html, ctx)
+        assert ".media/pic.png" in result
+
     def test_attachment_link_missing_media_emits_note(self) -> None:
         att = Attachment(id="a1", title="doc.pdf")
         ctx = self._make_ctx_with_att(att, media_available=set())
@@ -1054,6 +1091,30 @@ class TestBuildFrontmatter:
         data = yaml.safe_load(fm.split("---")[1])
         assert data["status"] == "archived"
 
+    def test_attachments_block_emitted(self) -> None:
+        """v1 parity: a page with attachments gets an attachments: [{name,type,size}] block."""
+        from conex.models import Attachment
+
+        page = _make_page(id="1", title="P", status="current")
+        space = _make_space(key="TEST")
+        atts = [
+            Attachment(id="a1", title="report.pdf", media_type="application/pdf", file_size=2048),
+            Attachment(id="a2", title="img.png", media_type="image/png", file_size=512),
+        ]
+        fm = build_frontmatter(page, space, "/P", "https://x.atlassian.net", attachments=atts)
+        data = yaml.safe_load(fm.split("---")[1])
+        assert data["attachments"] == [
+            {"name": "report.pdf", "type": "application/pdf", "size": 2048},
+            {"name": "img.png", "type": "image/png", "size": 512},
+        ]
+
+    def test_no_attachments_block_when_none(self) -> None:
+        page = _make_page(id="1", title="P", status="current")
+        space = _make_space(key="TEST")
+        fm = build_frontmatter(page, space, "/P", "https://x.atlassian.net", attachments=[])
+        data = yaml.safe_load(fm.split("---")[1])
+        assert "attachments" not in data
+
     def test_url_field_present(self) -> None:
         page = _make_page(
             id="10",
@@ -1064,6 +1125,28 @@ class TestBuildFrontmatter:
         fm = build_frontmatter(page, space, "/P", "https://example.atlassian.net")
         data = yaml.safe_load(fm.split("---")[1])
         assert "example.atlassian.net" in data.get("url", "")
+
+    def test_url_relative_webui_gets_wiki_prefix(self) -> None:
+        """v1 parity: a relative _links.webui path is prefixed with /wiki."""
+        page = _make_page(id="10", title="P", web_url="/spaces/TEST/pages/10/P")
+        space = _make_space(key="TEST")
+        fm = build_frontmatter(page, space, "/P", "https://x.atlassian.net")
+        data = yaml.safe_load(fm.split("---")[1])
+        assert data["url"] == "https://x.atlassian.net/wiki/spaces/TEST/pages/10/P"
+
+    def test_url_absolute_web_url_used_as_is(self) -> None:
+        page = _make_page(id="10", title="P", web_url="https://x.atlassian.net/wiki/x")
+        space = _make_space(key="TEST")
+        fm = build_frontmatter(page, space, "/P", "https://x.atlassian.net")
+        data = yaml.safe_load(fm.split("---")[1])
+        assert data["url"] == "https://x.atlassian.net/wiki/x"
+
+    def test_url_empty_when_no_site_url(self) -> None:
+        page = _make_page(id="10", title="P", web_url="/spaces/TEST/pages/10/P")
+        space = _make_space(key="TEST")
+        fm = build_frontmatter(page, space, "/P", "")
+        data = yaml.safe_load(fm.split("---")[1])
+        assert data["url"] == ""
 
     def test_no_status_field_when_current(self) -> None:
         page = _make_page(status="current")

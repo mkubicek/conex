@@ -26,7 +26,7 @@ import json
 import os
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Callable
@@ -165,15 +165,17 @@ def _parse_config_file(path: Path) -> _RawConfig:
         return _RawConfig(
             site_url=_normalize_url(str(data.get("site_url", "") or "")),
             cloud_id=str(data.get("cloud_id", "") or ""),
+            api_base_url=_normalize_url(str(data.get("api_base_url", "") or "")),
             email=str(auth.get("email", "") or ""),
             token=str(auth.get("token", "") or ""),
             cookie=str(auth.get("cookie_header", "") or ""),
             auth_type=str(auth.get("type", "") or ""),
         )
-    # v1 legacy shape: base_url / email / api_token
+    # v1 legacy shape: base_url / email / api_token / api_base_url
     base_url = _normalize_url(str(data.get("base_url", "") or ""))
     return _RawConfig(
         site_url=base_url,
+        api_base_url=_normalize_url(str(data.get("api_base_url", "") or "")),
         email=str(data.get("email", "") or ""),
         token=str(data.get("api_token", "") or ""),
     )
@@ -204,13 +206,130 @@ def _config_source_label(path: Path | None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _merge(base: _RawConfig, override: _RawConfig) -> _RawConfig:
-    """Return a new _RawConfig with override fields winning over base.
+def _url_origin(url: str) -> tuple[str, str, int] | None:
+    """Return (scheme, host, port) for *url*, or None when it has no host.
 
-    Credentials merge field-wise: a higher-priority layer that provides only
-    some credential fields (e.g. env token without email) combines with
-    lower-layer fields.  Callers that need isolation must provide a complete
-    credential set.
+    The default port is canonicalized (https→443, http→80) so the bare and
+    explicit ``:443`` forms of the same site compare equal.
+    """
+    url = (url or "").strip()
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        port = parsed.port  # raises ValueError on a malformed port
+    except ValueError:
+        # Malformed URL/port → unknown origin (never crash); the site_url
+        # well-formedness check in resolve_config rejects it cleanly.
+        return None
+    if not hostname:
+        return None
+    if port is None:
+        port = {"https": 443, "http": 80}.get(parsed.scheme, 0)
+    return (parsed.scheme, hostname.lower(), port)
+
+
+def _layer_with(layers: list[_RawConfig], field: str) -> _RawConfig | None:
+    """The highest-precedence (last) layer with a non-empty *field*, or None."""
+    for lyr in reversed(layers):
+        if getattr(lyr, field):
+            return lyr
+    return None
+
+
+def _apply_credential_origin_safety(
+    merged: _RawConfig,
+    layers: list[_RawConfig],
+    local_layer: _RawConfig | None,
+) -> _RawConfig:
+    """Drop or refuse credentials a layer would redirect to a foreign origin.
+
+    Two rules, ported from v1's connection-profile origin guard.  The active
+    credential is the WINNING one for merged's effective auth type — a **cookie**
+    is transported to ``site_url`` (COOKIE_V1 ignores api_base_url); a **token**
+    to the resolved endpoint (``api_base_url`` else ``site_url``).  Default ports
+    are canonicalized so ``:443`` == bare https.
+
+    1. The winning credential's OWN layer declares an origin → it is bound there;
+       if the resolved endpoint origin differs (a higher-priority layer
+       redirected it), the credential is dropped.  The redirecting layer must
+       supply its own credentials.  (Blocks the global-creds → attacker-site
+       leak and the cross-layer cookie leak.)
+    2. The credential's own layer declares NO origin (a portable secret, e.g. a
+       token in env) → it inherits the resolved origin, UNLESS that origin comes
+       from a local ``.conex/config.json`` — an untrusted, possibly directory-
+       planted source.  We then refuse with an actionable error rather than send
+       the secret to a host a checked-in file chose.  (A site in *global* config
+       or env/CLI is trusted, so secret-in-env + site-in-global still works.)
+    """
+    if not (merged.token or merged.cookie):
+        return merged
+
+    eff = _infer_auth_type(
+        auth_type=merged.auth_type, email=merged.email,
+        token=merged.token, cookie=merged.cookie,
+    )
+
+    def _transport_origin(lyr: _RawConfig) -> tuple[str, str, int] | None:
+        """The origin a credential in ``lyr`` is transported to under the active
+        auth type: a cookie rides ``site_url`` (COOKIE_V1 ignores api_base_url);
+        a token rides ``api_base_url`` else ``site_url``.  Default ports are
+        canonicalized.  This is the unit the trust rules below reason over."""
+        if eff == "cookie":
+            return _url_origin(lyr.site_url)
+        return _url_origin(lyr.api_base_url or lyr.site_url)
+
+    cred_layer = _layer_with(layers, "cookie" if eff == "cookie" else "token")
+    home = _transport_origin(cred_layer) if cred_layer else None
+    resolved = _transport_origin(merged)
+
+    if home is not None and home != resolved:
+        return replace(merged, email="", token="", cookie="", auth_type="")
+
+    # Scoped tokens route through the cloud-id gateway, so the tenant (cloud_id)
+    # is part of the credential scope.  A cloud_id introduced by the untrusted
+    # local .conex layer that differs from the credential layer's own cloud_id
+    # redirects the scoped token to a different Atlassian tenant — drop it (v1
+    # parity).  site_url/api_base hosts may match (both the gateway) while the
+    # tenant differs, so the host check above does not catch this.
+    if eff == "scoped" and merged.cloud_id:
+        cred_cloud = cred_layer.cloud_id if cred_layer is not None else ""
+        cloud_layer = _layer_with(layers, "cloud_id")
+        if merged.cloud_id != cred_cloud and cloud_layer is local_layer:
+            return replace(merged, email="", token="", cookie="", auth_type="")
+
+    if home is not None:
+        return merged
+
+    # Portable secret (its own layer declares no origin): trusted unless the
+    # resolved endpoint origin is supplied SOLELY by the untrusted local .conex
+    # layer.  If a TRUSTED layer (global/env/CLI) also declares that same origin
+    # the secret is honored even when a local .conex redundantly pins it — only
+    # a local layer that is the sole source of the origin is refused.
+    if local_layer is not None and resolved is not None:
+        trusted_supplies_origin = any(
+            lyr is not local_layer and _transport_origin(lyr) == resolved
+            for lyr in layers
+        )
+        if not trusted_supplies_origin and _transport_origin(local_layer) == resolved:
+            raise ConfigError(
+                "credentials were supplied without a site URL, and the resolved "
+                "site comes only from a local .conex/config.json — refusing to "
+                "send credentials to a directory-supplied host.  Set "
+                "CONFLUENCE_SITE_URL or --site-url alongside the credentials."
+        )
+    return merged
+
+
+def _merge(base: _RawConfig, override: _RawConfig) -> _RawConfig:
+    """Return a new _RawConfig with override fields winning over base (field-wise).
+
+    Cross-origin credential safety is NOT enforced here — it is applied once in
+    resolve_config against the ordered layer list (see
+    :func:`_apply_credential_origin_safety`).  Doing it pairwise here is unsound:
+    it can only ever drop the *lower* layer's secret, so a higher layer's secret
+    still attaches to a lower (possibly attacker-controlled) layer's origin.
     """
     return _RawConfig(
         site_url=override.site_url or base.site_url,
@@ -409,47 +528,63 @@ def resolve_config(
     overrides = overrides or {}
     merged = _RawConfig()
     source_path: Path | None = None
+    layers: list[_RawConfig] = []  # low → high precedence, for cred binding
+    local_layer: _RawConfig | None = None  # the untrusted .conex/config.json layer
 
     # Global config (lowest priority)
     if _GLOBAL_CONFIG_PATH.exists():
         try:
-            merged = _merge(merged, _parse_config_file(_GLOBAL_CONFIG_PATH))
-            source_path = _GLOBAL_CONFIG_PATH
+            gcfg = _parse_config_file(_GLOBAL_CONFIG_PATH)
         except (json.JSONDecodeError, OSError) as exc:
             raise ConfigError(
                 f"could not read global config {_GLOBAL_CONFIG_PATH}: {exc}"
             ) from exc
+        merged = _merge(merged, gcfg)
+        layers.append(gcfg)
+        source_path = _GLOBAL_CONFIG_PATH
 
     # Local config
     out_dir = Path(output_dir).expanduser().resolve()
     local_path = _find_local_config(out_dir)
     if local_path is not None:
         try:
-            merged = _merge(merged, _parse_config_file(local_path))
-            source_path = local_path
+            lcfg = _parse_config_file(local_path)
         except (json.JSONDecodeError, OSError) as exc:
             raise ConfigError(
                 f"could not read local config {local_path}: {exc}"
             ) from exc
+        merged = _merge(merged, lcfg)
+        layers.append(lcfg)
+        local_layer = lcfg
+        source_path = local_path
 
     # Env vars
     env = _env_raw()
     merged = _merge(merged, env)
-    if any((env.site_url, env.email, env.token, env.cookie, env.auth_type)):
+    layers.append(env)
+    if any((env.site_url, env.api_base_url, env.email, env.token, env.cookie, env.auth_type)):
         source_path = None  # CLI/environment label
 
     # CLI overrides (highest priority)
     cli_raw = _RawConfig(
         site_url=_normalize_url(str(overrides.get("site_url") or "")),
         cloud_id=str(overrides.get("cloud_id") or ""),
+        api_base_url=_normalize_url(str(overrides.get("api_base_url") or "")),
         email=str(overrides.get("email") or ""),
         token=str(overrides.get("api_token") or ""),
         cookie=str(overrides.get("cookie") or ""),
         auth_type=str(overrides.get("auth_type") or ""),
     )
     merged = _merge(merged, cli_raw)
-    if any((cli_raw.site_url, cli_raw.email, cli_raw.token, cli_raw.cookie)):
+    layers.append(cli_raw)
+    if any((cli_raw.site_url, cli_raw.api_base_url, cli_raw.email, cli_raw.token, cli_raw.cookie)):
         source_path = None
+
+    # Cross-origin credential safety (trust-by-source, ported from v1): a secret
+    # is dropped when a higher layer redirects it off its own declared origin,
+    # and a portable secret is refused only when its endpoint origin comes from
+    # an untrusted local .conex/config.json.
+    merged = _apply_credential_origin_safety(merged, layers, local_layer)
 
     if not merged.site_url:
         raise ConfigError(
@@ -457,10 +592,36 @@ def resolve_config(
         )
 
     parsed = urlparse(merged.site_url)
+    try:
+        _ = parsed.port  # malformed port raises ValueError
+    except ValueError:
+        raise ConfigError(
+            f"site_url is not a valid URL (bad port): {merged.site_url!r}"
+        ) from None
     if parsed.scheme != "https":
         raise ConfigError(
             f"site_url must be an https:// URL, got: {merged.site_url!r}"
         )
+    if (parsed.hostname or "").lower() == _GATEWAY_HOST:
+        raise ConfigError(
+            f"site_url must be the Atlassian site (https://<site>.atlassian.net), "
+            f"not the OAuth gateway {merged.site_url!r} — the gateway is derived "
+            "automatically for scoped tokens; set CONFLUENCE_SITE_URL to the site"
+        )
+    # api_base_url carries Basic/Bearer credentials for token modes, so it must
+    # be https — never emit a credential to a plaintext endpoint (v1 parity).
+    if merged.api_base_url:
+        api_parsed = urlparse(merged.api_base_url)
+        try:
+            _ = api_parsed.port
+        except ValueError:
+            raise ConfigError(
+                f"api_base_url is not a valid URL (bad port): {merged.api_base_url!r}"
+            ) from None
+        if api_parsed.scheme != "https":
+            raise ConfigError(
+                f"api_base_url must be an https:// URL, got: {merged.api_base_url!r}"
+            )
 
     auth_headers, dialect, api_base_url = _build_auth_headers(
         email=merged.email,
@@ -673,7 +834,22 @@ def configure(
                 cloud_id = _prompt("Cloud ID (not found automatically): ")
     elif choice == "2":
         token = _prompt("PAT / Bearer token: ", secret=True)
-        auth_type = "bearer_pat"
+        if _is_scoped_token(token):
+            # A scoped Atlassian Cloud token (ATATT…=ADA…) is NOT a site-bearer
+            # PAT: it authenticates with Basic auth via the cloud-id gateway,
+            # which needs an email.  Persisting it as bearer_pat sends
+            # `Bearer ATATT…` to the site and 401s on every export, so route it
+            # through the scoped path instead (the menu offers this choice "for
+            # on-prem or scoped tokens").
+            print("Detected a scoped Atlassian API token — using gateway routing.")
+            email = _prompt("Email (required for scoped token): ")
+            auth_type = "scoped_api_token"
+            print("Resolving cloud ID for scoped token gateway routing…")
+            cloud_id = resolve_cloud(site_url) or ""
+            if not cloud_id:
+                cloud_id = _prompt("Cloud ID (not found automatically): ")
+        else:
+            auth_type = "bearer_pat"
     elif choice == "3":
         cookie = _prompt("Cookie header value: ", secret=True)
         auth_type = "cookie"

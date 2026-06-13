@@ -252,6 +252,7 @@ def _walk(
     files: dict[str, PurePosixPath],
     order: list[str],
     folder_dirs: dict[str, PurePosixPath],
+    node_dirs: dict[str, PurePosixPath],
 ) -> None:
     """Allocate one sibling group's segments, then recurse into each child group.
 
@@ -262,6 +263,12 @@ def _walk(
     The synthetic ``__archived__`` node is treated as a page node for path
     allocation purposes (it maps to the ``_archived/`` segment) but its entry is
     NOT added to ``files`` (no ``.md``).
+
+    ``node_dirs`` records the allocated directory for EVERY node by ``node_id``
+    — pages, folders, and the synthetic ``__archived__`` root alike.  It is the
+    authoritative "where did this node land" map used to resolve a subtree
+    root's planned dir, including the synthetic root that is deliberately
+    absent from ``dirs``/``folder_dirs``.
     """
     taken: dict[str, str] = {}
 
@@ -274,6 +281,7 @@ def _walk(
     for node in sorted(nodes, key=_alloc_key):
         segment = _allocate_segment(node.title, node.node_id, taken)
         target_dir = parent_dir / segment
+        node_dirs[node.node_id] = target_dir
 
         if node.is_folder:
             folder_dirs[node.node_id] = target_dir
@@ -282,14 +290,15 @@ def _walk(
             # The synthetic __archived__ root participates in collision
             # allocation (so its _archived/ segment is reserved) but must
             # NOT appear in dirs, files, or order — it has no body blob
-            # and is not a real page.
+            # and is not a real page.  Its allocated dir still lives in
+            # node_dirs so a subtree rooted at it resolves correctly.
             if node.page.id != "__archived__":
                 dirs[node.page.id] = target_dir
                 files[node.page.id] = target_dir / f"{segment}.md"
                 order.append(node.page.id)
 
         if node.children:
-            _walk(node.children, target_dir, dirs, files, order, folder_dirs)
+            _walk(node.children, target_dir, dirs, files, order, folder_dirs, node_dirs)
 
 
 # ---------------------------------------------------------------------------
@@ -393,8 +402,9 @@ def plan_layout(
     files: dict[str, PurePosixPath] = {}
     order: list[str] = []
     folder_dirs: dict[str, PurePosixPath] = {}
+    node_dirs: dict[str, PurePosixPath] = {}
 
-    _walk(roots, space_root, dirs, files, order, folder_dirs)
+    _walk(roots, space_root, dirs, files, order, folder_dirs, node_dirs)
 
     if subtree is None:
         return LayoutPlan(
@@ -417,13 +427,13 @@ def plan_layout(
             subtree_dir=None,
         )
 
-    # Determine the resolved planned dir for the subtree root.
-    if subtree_node.is_page and subtree_node.page is not None:
-        subtree_dir = dirs.get(subtree_node.page.id)
-    elif subtree_node.is_folder and subtree_node.folder is not None:
-        subtree_dir = folder_dirs.get(subtree_node.folder.id)
-    else:
-        subtree_dir = None
+    # Determine the resolved planned dir for the subtree root.  Use node_dirs,
+    # which records EVERY node's allocated dir — including the synthetic
+    # ``__archived__`` root, which is absent from ``dirs``/``folder_dirs``.
+    # Resolving it from ``dirs`` alone would yield None for an ``_archived``
+    # subtree, silently disabling build's prune-scope guard and deleting every
+    # out-of-subtree live page.
+    subtree_dir = node_dirs.get(subtree_node.node_id)
 
     if no_children:
         # Only include the root node itself (if it's a page).

@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
-from bs4 import NavigableString, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 if TYPE_CHECKING:
     from conex.convert import ConvertContext
@@ -121,6 +121,35 @@ def parse_macro(element: Tag) -> Macro:
 # ---------------------------------------------------------------------------
 
 
+def dynamic_macro_placeholder(macro: Macro) -> Tag:
+    """Build a VISIBLE italic placeholder Tag for a content-less dynamic macro.
+
+    Mirrors v1 ``_convert_dynamic_macro_placeholder``: the reader sees
+    ``[Confluence dynamic content: NAME (k=v, …)]`` — the macro name plus any
+    non-default direct parameters (``ri:page`` references resolved to their
+    content-title) — rather than an invisible HTML comment that markdownify
+    escapes into literal ``<!-- … -->`` text.  Returns a ``<p><em>…</em></p>``
+    Tag so it survives conversion as real markdown emphasis.
+    """
+    params: list[str] = []
+    for p in macro.element.find_all("ac:parameter", recursive=False):
+        name = p.get("ac:name", "")
+        page_ref = p.find("ri:page")
+        if page_ref is not None:
+            value = (page_ref.get("ri:content-title", "") or "").strip()
+        else:
+            value = p.get_text().strip()
+        if name and value:
+            params.append(f"{name}={value}")
+    suffix = f" ({', '.join(params)})" if params else ""
+    soup = BeautifulSoup("", "html.parser")
+    em = soup.new_tag("em")
+    em.string = f"[Confluence dynamic content: {macro.name or 'unnamed'}{suffix}]"
+    para = soup.new_tag("p")
+    para.append(em)
+    return para
+
+
 def default_handler(macro: Macro, ctx: "ConvertContext") -> Replacement:
     """Fallback for unregistered macros.
 
@@ -130,7 +159,8 @@ def default_handler(macro: Macro, ctx: "ConvertContext") -> Replacement:
     2. Bodyless but wraps other macros → unwrap (drop the shell, keep children
        live for conversion). Direct ac:parameter children are decomposed so
        their raw parameter values cannot leak as body text.
-    3. Otherwise → emit an HTML comment placeholder ``<!-- macro: name -->``.
+    3. Otherwise → emit a visible ``[Confluence dynamic content: name]``
+       placeholder (v1 parity).
     """
     # Branch 1: has own body with content
     if macro.rich_body is not None and macro.rich_body.get_text(strip=True):
@@ -155,6 +185,5 @@ def default_handler(macro: Macro, ctx: "ConvertContext") -> Replacement:
         macro.element.unwrap()
         return None  # signal: already handled in place
 
-    # Branch 3: placeholder comment
-    label = macro.name or "unnamed"
-    return f"<!-- macro: {label} -->"
+    # Branch 3: visible dynamic-content placeholder (v1 parity).
+    return dynamic_macro_placeholder(macro)

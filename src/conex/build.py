@@ -127,7 +127,7 @@ from conex.convert import (
 )
 from conex.layout import plan_layout
 from conex.models import Attachment, Page
-from conex.paths import plan_attachment_names
+from conex.paths import plan_attachment_names, safe_attachment_name
 from conex.store.blobs import BlobStore
 from conex.store.state import (
     AttachmentState,
@@ -153,6 +153,8 @@ class BuildOptions:
         author_lookup:  Allow live author lookups through the API.
         subtree:        Restrict to the named subtree (slash-separated titles).
         no_children:    When subtree is set, include only the root node.
+        site_url:       Configured site URL, used to build the frontmatter `url`
+                        and resolve attachment/page links.  "" leaves url empty.
     """
 
     include_html: bool = False
@@ -161,6 +163,7 @@ class BuildOptions:
     author_lookup: bool = True
     subtree: str | None = None
     no_children: bool = False
+    site_url: str = ""
 
 
 @dataclass
@@ -199,10 +202,12 @@ def _fingerprint(
 
     Inputs (in this exact order):
       version.number, CONVERTER_VERSION, include_html, media, render_drawio,
-      sorted((att_id, att_version, planned_media_name)),
+      site_url, sorted((att_id, att_version, planned_media_name)),
       body_blob_digest,
       sorted(derived png digests actually used)
 
+    site_url is a CONTENT input (it builds the frontmatter ``url:``), so a
+    changed site URL must invalidate the skip and rewrite the page.
     subtree and no_children are scope, not content — they must NOT appear here.
     """
     h = hashlib.sha256()
@@ -215,6 +220,7 @@ def _fingerprint(
     _add(opts.include_html)
     _add(opts.media)
     _add(opts.render_drawio)
+    _add(opts.site_url)
 
     att_tuples = []
     for att in attachments:
@@ -426,7 +432,10 @@ def _run_drawio_render(
         att_key = f"{xml_att.id}@{xml_att.version.number}"
         digest = snapshot.attachment_blobs.get(att_key)
         if digest:
-            xml_blobs[xml_att.title] = digest
+            # Key by CONTENT digest, not title: two pages can own diagrams with
+            # the same filename but different content — a title-keyed map would
+            # collapse them and embed one page's render into the other (BL-3).
+            xml_blobs[digest] = digest
 
     if not xml_blobs:
         return {}
@@ -436,6 +445,115 @@ def _run_drawio_render(
     except Exception as exc:
         warnings.warn(f"drawio render failed: {exc}", stacklevel=3)
         return {}
+
+
+def _dir_in_subtree(dir_str: str, subtree_prefix: str, no_children: bool) -> bool:
+    """True if a recorded dir falls within the in-scope subtree for pruning.
+
+    With ``no_children`` only the subtree ROOT itself is in scope; otherwise the
+    root and all its descendants are.  Path-boundary aware: a prefix-colliding
+    sibling (``Root-One-2`` vs ``Root-One``) is never wrongly matched.
+    """
+    if no_children:
+        return dir_str == subtree_prefix
+    return dir_str == subtree_prefix or dir_str.startswith(subtree_prefix + "/")
+
+
+def _page_owned_paths(root: Path, ps: "PageState") -> list[Path]:
+    """Absolute paths a single PageState records as conex-owned output."""
+    out: list[Path] = []
+    if ps.file:
+        out.append(root / ps.file)
+    if ps.html:
+        out.append(root / ps.html)
+    media = root / ps.dir / ".media"
+    for att in ps.attachments.values():
+        if att.file:
+            out.append(media / att.file)
+    for fname in ps.rendered_media:
+        if fname:
+            out.append(media / fname)
+    return out
+
+
+def _reconcile_deletions(
+    root: Path,
+    prev: "ExportState",
+    new_pages: dict[str, "PageState"],
+    new_folders: dict[str, str],
+    result: "BuildResult",
+) -> None:
+    """Delete every artifact the PREV state owned that the NEW state no longer
+    owns — deletion as the complement of ownership.
+
+    This single set difference replaces the former move-cleanup + prune passes.
+    Because EVERY desired path is materialized before this runs, the cases that
+    were special and bug-prone collapse:
+    - **Move**: the page's old paths leave the desired set (its new paths are in
+      it) → deleted; no file is shuffled.
+    - **Title-swap / N-page rotation**: a path another page now owns stays in
+      the desired set → never deleted; each page already materialized its own
+      content there from the blob store.
+    - **Prune / reparent-out / archived / subtree-scope**: a surviving page is
+      carried into ``new_pages`` (so its paths are desired); a genuinely-removed
+      page is not, so its recorded artifacts are deleted.
+
+    Invariants are structural: ``.workspace`` and any unrecorded user file are
+    never in the prev-owned set, so they cannot be deleted; dirs are removed only
+    when empty.
+    """
+    desired: set[str] = {
+        str(p).casefold()
+        for ps in new_pages.values()
+        for p in _page_owned_paths(root, ps)
+    }
+
+    dirs_to_prune: set[Path] = set()
+    for pid, ps in prev.pages.items():
+        # Delete recorded prev artifacts the new state no longer owns.
+        for p in _page_owned_paths(root, ps):
+            _guarded_delete_file(p, desired, result)
+
+        page_dir = root / ps.dir
+        if pid not in new_pages:
+            # Genuinely pruned: also clear UNRECORDED media (e.g. derived drawio
+            # PNGs) under the old .media/, guarded so a swap partner's media at
+            # the same path survives.  Leave a non-empty .workspace + warn.
+            media_dir = page_dir / ".media"
+            if media_dir.exists():
+                _guarded_delete_dir_tree(media_dir, desired, result)
+            ws = page_dir / ".workspace"
+            if ws.exists() and any(ws.iterdir()):
+                msg = (
+                    f"prune: non-empty .workspace left at {ws} "
+                    f"(page {pid!r} removed)"
+                )
+                result.warnings.append(msg)
+                warnings.warn(msg, stacklevel=2)
+
+        # The old dir of a moved page, or a pruned page's dir, may now be empty.
+        if pid not in new_pages or new_pages[pid].dir != ps.dir:
+            dirs_to_prune.add(page_dir / ".media")
+            dirs_to_prune.add(page_dir)
+
+    # rmdir emptied dirs deepest-first (never removes a non-empty dir).
+    for d in sorted(dirs_to_prune, key=lambda p: len(p.parts), reverse=True):
+        _rmdir_empty_parents(d, root)
+
+    # Folder dirs the new state no longer owns (out-of-subtree folders were
+    # carried into new_folders, so a scoped run never touches them): rmdir iff
+    # empty; a non-empty folder dir is user content → leave + warn.
+    for fid, fdir in (prev.folders or {}).items():
+        if fid in new_folders:
+            continue
+        fdir_abs = root / fdir
+        if fdir_abs.exists():
+            try:
+                fdir_abs.rmdir()
+            except OSError:
+                msg = f"prune: folder dir {fdir_abs} is non-empty; leaving"
+                result.warnings.append(msg)
+                warnings.warn(msg, stacklevel=2)
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +663,7 @@ def build(
             xml_digest = snapshot.attachment_blobs.get(att_key)
             if xml_digest:
                 derived_key = f"drawio-png:v{_get_drawio_render_version()}:{xml_digest}"
-                d = snapshot.derived_blobs.get(derived_key) or drawio_results.get(xml_att.title)
+                d = snapshot.derived_blobs.get(derived_key) or drawio_results.get(xml_digest)
                 if d:
                     used_png_digests.append(d)
 
@@ -588,22 +706,6 @@ def build(
         if page.id in skip_ids and prev is not None:
             new_page_states[page.id] = prev.pages[page.id]
 
-    # Deferred move cleanups: accumulated during the write loop and applied
-    # AFTER all pages are written.  Each entry is a tuple:
-    #   (old_md, old_html_or_None, old_media_dir, old_dir_abs, old_dir_rel,
-    #    new_dir_rel, prev_att_states)
-    # Deferral is REQUIRED to handle title-swap and case-only rename scenarios:
-    # page A's old path may be exactly the new path of page B written earlier
-    # this run, and deleting it inline would destroy page B's freshly-written
-    # content (data-safety finding).
-    #
-    # prev_att_states: copy of the PREVIOUS PageState.attachments for this page,
-    # used by the deferred old-media cleanup to compute CANDIDATES (per-file
-    # set-difference) rather than a whole-dir delete.
-    _deferred_cleanups: list[
-        tuple[Path, Path | None, Path, Path, str, str, dict]
-    ] = []
-
     for page in plan_pages:
         pid = page.id
         if pid not in write_ids:
@@ -635,6 +737,7 @@ def build(
         for pair in pairs:
             xml_att = _pair_xml(pair)
             png_att = _pair_png(pair)
+            xml_digest = snapshot.attachment_blobs.get(f"{xml_att.id}@{xml_att.version.number}")
             use_preview = False
             if png_att is not None:
                 # Use preview when png.created_at >= xml.created_at (timestamps).
@@ -647,19 +750,20 @@ def build(
                 png_digest = snapshot.attachment_blobs.get(png_key)
                 if png_digest:
                     rendered_drawio[xml_att.title] = np.by_id.get(png_att.id, png_att.title)
-            elif xml_att.title in drawio_results:
-                # Batch-rendered result: derive a collision-checked filename for the
-                # rendered PNG.  It is not an attachment, so we use the xml stem with
-                # a ".png" extension and ensure it does not collide with attachment
-                # names by appending "-rendered" when needed.
+            elif xml_digest and xml_digest in drawio_results:
+                # Batch-rendered result (keyed by content digest, BL-3): derive a
+                # collision-checked filename for the rendered PNG.  It is not an
+                # attachment, so use the SANITIZED xml stem + ".png" (BL-4: the
+                # raw title may contain path separators / '..'), appending
+                # "-rendered" to avoid colliding with a real attachment name.
                 stem = xml_att.title.rsplit(".", 1)[0]
-                rendered_png_filename = f"{stem}.png"
+                rendered_png_filename = safe_attachment_name(f"{stem}.png")
                 if any(
                     rendered_png_filename == np.by_id.get(a.id, a.title)
                     for a in atts
                     if a.id != getattr(_pair_png(pair) if pair else None, "id", None)
                 ):
-                    rendered_png_filename = f"{stem}-rendered.png"
+                    rendered_png_filename = safe_attachment_name(f"{stem}-rendered.png")
                 rendered_drawio[xml_att.title] = rendered_png_filename
 
         # Determine media availability.
@@ -668,9 +772,10 @@ def build(
         rendered_png_digests_to_materialize: dict[str, str] = {}
         for pair in pairs:
             xml_att = _pair_xml(pair)
-            if xml_att.title in drawio_results and xml_att.title in rendered_drawio:
+            xml_digest = snapshot.attachment_blobs.get(f"{xml_att.id}@{xml_att.version.number}")
+            if xml_digest and xml_digest in drawio_results and xml_att.title in rendered_drawio:
                 fname = rendered_drawio[xml_att.title]
-                rendered_png_digests_to_materialize[fname] = drawio_results[xml_att.title]
+                rendered_png_digests_to_materialize[fname] = drawio_results[xml_digest]
 
         media_available: set[str] = set()
         att_states: dict[str, AttachmentState] = {}
@@ -748,11 +853,22 @@ def build(
                         att_states[prev_att_id] = prev_att_state
                         if prev_att_state.file:
                             media_available.add(prev_att_state.file)
-            elif snapshot.attachments_complete and prev is not None and pid in prev.pages:
-                # On a complete rewrite, remove stale .media files that are no
-                # longer in the current attachment set (I1: conex only deletes
-                # what it recorded in state).  Drive deletions off prev PageState,
-                # never off a raw listdir.
+            elif (
+                snapshot.attachments_complete
+                and not is_move
+                and prev is not None
+                and pid in prev.pages
+            ):
+                # On an IN-PLACE complete rewrite, remove stale .media files that
+                # are no longer in the current attachment set (I1: conex only
+                # deletes what it recorded in state).  Drive deletions off prev
+                # PageState, never off a raw listdir.
+                #
+                # Skipped for a MOVE: here media_dir is the NEW dir but the prev
+                # records the OLD-dir files, so unlinking media_dir/<old name>
+                # would delete a swap partner's media at the new location (BL-
+                # INLINE-STALE-NEWDIR).  A move's old-dir stale media is handled
+                # by the deferred, _keep-guarded per-file cleanup instead.
                 current_files = {s.file for s in att_states.values() if s.file}
                 # Also keep rendered drawio PNG filenames.
                 current_files.update(rendered_png_digests_to_materialize.keys())
@@ -763,15 +879,14 @@ def build(
                             stale.unlink()
                             result.deleted.append(stale)
 
-        # Build conversion context.
-        # site_url is not threaded through build() (frozen spec signature), so
-        # pass "" here.  build_frontmatter skips the URL field when site_url is
-        # ""; absolute web_url values in frontmatter are unaffected.
+        # Build conversion context.  site_url comes from opts (threaded from the
+        # resolved config) so frontmatter emits a real page URL; "" leaves it
+        # empty (e.g. offline --cached with no configured site).
         media_refs = MediaRefs(np)
         ctx = ConvertContext(
             page=page,
             space=snapshot.space,
-            site_url="",
+            site_url=opts.site_url,
             attachments=atts,
             media=media_refs,
             rendered_drawio=rendered_drawio,
@@ -790,7 +905,9 @@ def build(
         # Render markdown.
         planned_dir_abs.mkdir(parents=True, exist_ok=True)
         human_path = str(planned_dir_rel)
-        frontmatter = build_frontmatter(page, snapshot.space, human_path, ctx.site_url)
+        frontmatter = build_frontmatter(
+            page, snapshot.space, human_path, ctx.site_url, attachments=atts
+        )
         md_body = convert_page(body_storage, ctx)
         md_content = frontmatter + md_body
 
@@ -821,100 +938,86 @@ def build(
             if old_dir_abs.exists():
                 _carry_workspace(old_dir_abs, planned_dir_abs, result)
 
-            # Media carry-on-move rescue (DEFECT B + DEFECT D unified gate):
+            # Media carry-on-move rescue (DEFECT B + DEFECT D unified):
             # When a page MOVES and a prev-recorded media file was NOT
-            # re-materialized at the new dir this run — regardless of WHY it
-            # was not re-materialized (attachments_complete=False OR media=False
-            # OR blob missing) — rename the file from the old .media/ dir into
-            # the new .media/ dir, PROVIDED the attachment is still tracked in
-            # att_states (i.e. it was not explicitly dropped this run).
+            # re-materialized at the new dir this run — regardless of WHY
+            # (attachments_complete=False OR media=False OR the new-version blob
+            # is missing) — carry the attachment's LAST-GOOD content to the new
+            # .media/ dir by materializing from the immutable blob store.
             #
-            # Gate: rescue only attachment IDs that appear in att_states after the
-            # write phase.  Attachments that were explicitly removed from a
-            # complete listing are absent from att_states and must NOT be rescued
-            # — they are left as CANDIDATES for the deferred cleanup to delete.
+            # Materializing from the content-addressed store (rather than moving
+            # the old on-disk file) makes this:
+            #   - independent per page: an N-page title rotation that shares an
+            #     attachment filename is safe — there is no cross-page file
+            #     shuffle, so one page overwriting another's old dir cannot lose
+            #     bytes (the source of truth is the blob, not the disk file);
+            #   - crash-safe: materialize stages via .conex/tmp + os.replace, and
+            #     the prev blob survives any crash (it is referenced by prev
+            #     state, which is saved only on success).
             #
-            # This ensures:
-            #   (a) bytes are preserved at the new location (spec: do not delete
-            #       existing media when the page moves with media=False);
-            #   (b) att_states and result.written are updated so state/disk agree
-            #       and the file enters the KEEP set before deferred cleanup runs;
-            #   (c) explicitly-dropped attachments remain deletable (no over-rescue).
-            # Mind:
-            # - Same inode (case-only rename on APFS): old and new .media/ dirs
-            #   casefold-equal → files are already there; skip the rename.
-            # - EXDEV (cross-device): fall back to shutil.copy2 + unlink.
-            # - Only carry files not already present at the new location.
+            # Gate: carry only attachment IDs still in att_states after the write
+            # phase (explicitly-dropped attachments are left as deferred-cleanup
+            # candidates), skip a renamed attachment whose current name was
+            # already materialized (BL-1), and record new_file in result.written
+            # so it enters _keep before the deferred old-media cleanup runs.
             if prev is not None and pid in prev.pages:
-                old_media_for_move = old_dir_abs / ".media"
                 new_media_for_move = planned_dir_abs / ".media"
-                same_dir = (
-                    str(old_media_for_move).casefold()
-                    == str(new_media_for_move).casefold()
-                )
-                if not same_dir and old_media_for_move.exists():
-                    written_cf = {str(p).casefold() for p in result.written}
-                    for prev_att_id, prev_att_state in prev.pages[pid].attachments.items():
-                        # Only rescue attachments that are still tracked this run.
-                        # Attachments absent from att_states were explicitly dropped;
-                        # leave them as candidates for deferred cleanup.
-                        if prev_att_id not in att_states:
-                            continue
-                        fname = prev_att_state.file
-                        if not fname:
-                            continue
-                        new_file = new_media_for_move / fname
-                        # Skip if the file was already materialized at the new
-                        # location this run (by the blob-materialize write step).
-                        # Use casefold for case-insensitive FS safety.
-                        if str(new_file).casefold() in written_cf:
-                            continue
-                        # If the file is already present at the new location
-                        # (e.g. already renamed by a prior iteration or crash
-                        # recovery), skip.
-                        if new_file.exists():
-                            continue
-                        old_file = old_media_for_move / fname
-                        if not old_file.exists() or not old_file.is_file():
-                            continue
-                        # Rename old file to new location.
-                        # Same inode guard is handled by the same_dir check above.
-                        new_media_for_move.mkdir(parents=True, exist_ok=True)
-                        try:
-                            os.rename(old_file, new_file)
-                        except OSError as exc:
-                            if exc.errno == errno.EXDEV:
-                                shutil.copy2(old_file, new_file)
-                                old_file.unlink(missing_ok=True)
-                            else:
-                                raise
-                        # Record in result.written so the file enters KEEP and
-                        # state matches disk.  att_states already has the entry
-                        # (it was carried via media=False or attachments_complete=False).
-                        result.written.append(new_file)
-                        media_available.add(fname)
-                        written_cf.add(str(new_file).casefold())
+                written_cf = {str(p).casefold() for p in result.written}
+                for prev_att_id, prev_att_state in prev.pages[pid].attachments.items():
+                    # Only carry attachments still tracked this run.  Attachments
+                    # absent from att_states were explicitly dropped — leave them
+                    # as candidates for the deferred cleanup.
+                    if prev_att_id not in att_states:
+                        continue
+                    # Skip ONLY when the attachment was renamed this run AND its
+                    # current-named file was actually materialized at the new dir
+                    # (the old name is then an orphan for deferred cleanup — BL-1).
+                    current_name = att_states[prev_att_id].file
+                    if current_name != prev_att_state.file and current_name in media_available:
+                        continue
+                    fname = prev_att_state.file
+                    if not fname:
+                        continue
+                    new_file = new_media_for_move / fname
+                    if str(new_file).casefold() in written_cf:
+                        continue  # already materialized at the new dir this run
+                    # Carry the attachment's LAST-GOOD content to the new dir by
+                    # materializing from the immutable, content-addressed blob
+                    # store — the prev AttachmentState records the digest, and the
+                    # prior run's GC keeps it (it is referenced by prev state).
+                    # This is independent per page (no cross-page file shuffle, so
+                    # an N-page title rotation sharing a filename is safe) and
+                    # crash-safe (materialize stages via .conex/tmp + os.replace).
+                    # A page whose prev download had failed has no blob → nothing
+                    # to carry → skip; the on-disk file is never the source of
+                    # truth, so a swap partner overwriting it cannot lose bytes.
+                    prev_blob = prev_att_state.blob
+                    if not (prev_blob and blobs.has(prev_blob)):
+                        continue
+                    new_media_for_move.mkdir(parents=True, exist_ok=True)
+                    blobs.materialize(prev_blob, new_file)
+                    # Record the LAST-GOOD attachment state — the content now
+                    # actually on disk — rather than the missing new digest that
+                    # the failed materialize recorded.  This keeps state in sync
+                    # with disk, makes the Step-8 GC keep prev_blob (it is now a
+                    # new-state .blob value), and lets a FURTHER move while the new
+                    # version is still missing rescue it again.  Otherwise GC would
+                    # reclaim the last-good blob and the next move would lose the
+                    # bytes entirely (multi-run data loss).
+                    att_states[prev_att_id] = prev_att_state
+                    result.written.append(new_file)
+                    media_available.add(fname)
+                    written_cf.add(str(new_file).casefold())
 
-            # Defer deletion of old recorded artifacts until after ALL pages
-            # have been written.  This prevents a title-swap (page A's new
-            # path == page B's old path) or a case-only rename on a
-            # case-insensitive filesystem from deleting freshly-written
-            # content (data-safety: title-swap and case-only-retitle fixes).
-            old_md = root / prev.pages[pid].file
-            old_html: Path | None = None
-            if prev.pages[pid].html:
-                old_html = root / prev.pages[pid].html
-            old_media_dir = old_dir_abs / ".media"
-            # Pass the prev att states so deferred cleanup knows CANDIDATES.
-            prev_att_states_for_cleanup = dict(prev.pages[pid].attachments)
-            _deferred_cleanups.append(
-                (old_md, old_html, old_media_dir, old_dir_abs, old_dir_rel,
-                 str(planned_dir_rel), prev_att_states_for_cleanup)
-            )
-
+            # Old-artifact deletion is no longer deferred here: the page's new
+            # paths are now in the new state and its old paths are not, so the
+            # single reconciliation pass (below) deletes the old paths as the
+            # complement of ownership — title-swap/rotation-safe by construction.
             result.moved.append((old_dir_rel, str(planned_dir_rel)))
 
-        # Build PageState.
+        # Build PageState.  rendered_media records the batch-rendered drawio PNGs
+        # (not attachments, so they have no id) so they are part of the page's
+        # owned-path set and the reconciliation deletes the old copy on a move.
         new_page_states[pid] = PageState(
             dir=str(planned_dir_rel),
             file=str(planned_file_rel),
@@ -924,80 +1027,46 @@ def build(
             status=page.status,
             fingerprint=fingerprints[pid],
             attachments=att_states,
+            rendered_media=sorted(rendered_png_digests_to_materialize.keys()),
         )
 
     # -----------------------------------------------------------------------
-    # Step 4 (deferred) — Apply move cleanups after all pages are written
+    # Step 6 — Reconcile the filesystem to the new state
     # -----------------------------------------------------------------------
-    # Build the global KEEP set: casefolded absolute paths of EVERY file written,
-    # materialised, renamed-in, or carried this run.  This is the single source
-    # of truth used by ALL deletion sites in this build — both the deferred
-    # move cleanup (below) and the prune step (Step 6).
+
+    # Guards that ABORT the reconciliation entirely (return prev unchanged, no
+    # deletions, no GC) — these are the only ways a reconcile is skipped.
     #
-    # Building KEEP here (after all writes) ensures that:
-    # 1. Title-swap: page A's new path == page B's old path → KEEP guards it.
-    # 2. Case-only rename on APFS: old and new paths casefold-equal → KEEP guards it.
-    # 3. Prune re-uses freed dir: new page written to pruned page's old dir → KEEP guards it.
-    # 4. DEFECT D (move+media=False): carried media files enter KEEP via the
-    #    media carry-on-move rescue above (they are appended to result.written there).
-    _keep: set[str] = {str(p).casefold() for p in result.written}
-
-    for (
-        old_md, old_html, old_media_dir, old_dir_abs,
-        old_dir_rel, new_dir_rel_str, prev_att_states
-    ) in _deferred_cleanups:
-        # Delete old .md unless it was just written (swap or case-rename).
-        _guarded_delete_file(old_md, _keep, result)
-
-        # Delete old .html unless it was just written.
-        if old_html is not None:
-            _guarded_delete_file(old_html, _keep, result)
-
-        # Old-media cleanup — per-file set-difference design.
-        #
-        # CANDIDATES: the moved page's PREV-recorded media file paths
-        # (from prev AttachmentState entries), resolved to absolute paths.
-        # KEEP: every path written or carried this run (_keep).
-        # Delete CANDIDATES − KEEP file-by-file through the guarded helper.
-        #
-        # On a case-insensitive FS (APFS), the old and new .media/ dirs may
-        # be the same inode when only the parent dir case changed.  The casefold
-        # comparison in _guarded_delete_file handles this correctly.
-        if old_media_dir.exists():
-            for prev_att_state in prev_att_states.values():
-                fname = prev_att_state.file
-                if not fname:
-                    continue
-                candidate = old_media_dir / fname
-                _guarded_delete_file(candidate, _keep, result)
-
-            # rmdir the .media/ dir (and its parent) if now empty.
-            # Never remove non-empty dirs (user files or surviving attachments).
-            _rmdir_empty_parents(old_media_dir, root)
-
-        # rmdir emptied parents bottom-up.  Skip when old and new dirs are
-        # the same path on disk (case-insensitive FS: old_dir = Demo/Hello,
-        # new_dir = Demo/hello — same inode on APFS).
-        new_dir_abs = root / new_dir_rel_str
-        if old_dir_abs.exists() and str(old_dir_abs).casefold() != str(new_dir_abs).casefold():
-            _rmdir_empty_parents(old_dir_abs, root)
-
-    # -----------------------------------------------------------------------
-    # Step 6 — Prune
-    # -----------------------------------------------------------------------
-
-    # I2 zero-pages guard.
-    guarded = False
-    if not plan.dirs and prev is not None and prev.pages:
+    # I2 zero-pages guard — FULL-SPACE only.  An empty plan on a full export
+    # (auth failure, empty listing) must not nuke the export.  An empty plan from
+    # a --path run whose subtree RESOLVED is a legitimately-empty subtree (its
+    # only pages were deleted upstream) is NOT guarded — it falls through to the
+    # scoped reconciliation, which deletes the in-scope pages while preserving
+    # everything out of scope (BL-I2-SUBTREE-GLOBAL).
+    if not plan.dirs and opts.subtree is None and prev is not None and prev.pages:
         msg = (
             "build: plan is empty but previous state has pages; "
             "skipping all pruning to avoid data loss (I2)"
         )
         result.warnings.append(msg)
         warnings.warn(msg, stacklevel=2)
-        # Return prev state unchanged.
-        guarded = True
         return result, prev
+
+    # Defense-in-depth: a subtree was requested but its planned dir could not be
+    # resolved (a truly-missing/typo'd --path).  Without a subtree_dir the
+    # reconciliation cannot scope itself, so skip it rather than risk deleting
+    # out-of-scope pages (the CLI path-not-found check normally catches this
+    # before build is reached).
+    if opts.subtree is not None and plan.subtree_dir is None:
+        msg = (
+            "build: subtree requested but its planned directory could not be "
+            "resolved; skipping all pruning to avoid deleting out-of-scope pages"
+        )
+        result.warnings.append(msg)
+        warnings.warn(msg, stacklevel=2)
+        return result, prev
+
+    snapshot_page_ids = {p.id for p in snapshot.pages}
 
     if prev is not None:
         for pid, ps in prev.pages.items():
@@ -1009,79 +1078,51 @@ def build(
                 new_page_states[pid] = ps
                 continue
 
-            # Subtree scope: only prune pages inside the subtree.
-            # Use a path-boundary-aware check: a page is inside the subtree iff
-            # its dir equals the subtree root OR starts with the subtree root
-            # followed by "/".  A bare startswith() check would wrongly match a
-            # sibling whose sanitized title shares a common prefix (e.g.
-            # "My-Space/Root-One-2".startswith("My-Space/Root-One") is True but
-            # "Root One 2" is NOT a child of "Root One").
+            # A page still present in the snapshot is LIVE — it merely left the
+            # plan because it was reparented out of the exported --path subtree,
+            # not deleted upstream.  Carry it forward; only pages genuinely gone
+            # from the snapshot are pruned.  (On a full export every snapshot page
+            # is in the plan, so this only affects scoped runs.)
+            if pid in snapshot_page_ids:
+                new_page_states[pid] = ps
+                continue
+
+            # Subtree scope: only prune pages inside the subtree.  --no-children
+            # narrows scope to the root alone so descendants are preserved (BL-2:
+            # a scope-narrowing flag must never delete on-disk descendants).
             if opts.subtree is not None and plan.subtree_dir is not None:
-                subtree_prefix = str(plan.subtree_dir)
-                inside = ps.dir == subtree_prefix or ps.dir.startswith(subtree_prefix + "/")
-                if not inside:
+                if not _dir_in_subtree(ps.dir, str(plan.subtree_dir), opts.no_children):
                     new_page_states[pid] = ps
                     continue
 
-            # Delete recorded artifacts — guarded against _keep so that a newly
-            # moved page occupying the same dir cannot have its content deleted
-            # by the prune step (DEFECT C).
-            if ps.file:
-                _guarded_delete_file(root / ps.file, _keep, result)
-            if ps.html:
-                _guarded_delete_file(root / ps.html, _keep, result)
+            # else: genuinely removed upstream and in scope → NOT carried into
+            # new_page_states, so the reconciliation below deletes it.
 
-            page_dir_abs = root / ps.dir
-            media_dir_abs = page_dir_abs / ".media"
-            if media_dir_abs.exists():
-                ws_left = False
-                workspace_dir = page_dir_abs / ".workspace"
-                if workspace_dir.exists():
-                    ws_left = True
-                # Guarded per-file tree delete: KEEP prevents deleting files that
-                # belong to a newly-written or moved page (DEFECT C fix).
-                _guarded_delete_dir_tree(media_dir_abs, _keep, result)
-                _rmdir_empty_parents(media_dir_abs, root)
-                if ws_left:
-                    msg = (
-                        f"prune: non-empty .workspace left at {workspace_dir} "
-                        f"(page {pid!r} removed)"
-                    )
-                    result.warnings.append(msg)
-                    warnings.warn(msg, stacklevel=2)
-            else:
-                workspace_dir = page_dir_abs / ".workspace"
-                if workspace_dir.exists() and any(workspace_dir.iterdir()):
-                    msg = (
-                        f"prune: non-empty .workspace left at {workspace_dir} "
-                        f"(page {pid!r} removed)"
-                    )
-                    result.warnings.append(msg)
-                    warnings.warn(msg, stacklevel=2)
-
-            # rmdir the page dir bottom-up (guarded: won't remove a dir that
-            # still has KEEP-protected files inside).
-            _rmdir_empty_parents(page_dir_abs, root)
-
-        # Prune folder dirs.
+    # Folders recorded in the new state: the plan's folders, plus — on a scoped
+    # subtree run — any prev folders OUTSIDE the subtree carried forward verbatim
+    # (a --path export restricts plan.folder_dirs to the subtree; without this
+    # the rest of the space's folder records would be dropped from state).
+    new_folders: dict[str, str] = {}
+    if opts.subtree is not None and prev is not None and plan.subtree_dir is not None:
         for fid, fdir in (prev.folders or {}).items():
-            if fid in plan.folder_dirs:
-                continue
-            folder_dir_abs = root / fdir
-            if folder_dir_abs.exists():
-                try:
-                    folder_dir_abs.rmdir()
-                except OSError:
-                    # Non-empty — user content; leave + warn.
-                    msg = f"prune: folder dir {folder_dir_abs} is non-empty; leaving"
-                    result.warnings.append(msg)
-                    warnings.warn(msg, stacklevel=2)
+            if not _dir_in_subtree(fdir, str(plan.subtree_dir), opts.no_children):
+                new_folders[fid] = fdir
+    new_folders.update({fid: str(d) for fid, d in plan.folder_dirs.items()})
+
+    # Delete everything prev owned that the new state no longer owns (the
+    # complement of ownership) — ONE set difference covering move-cleanup AND
+    # prune; title-swaps and N-page rotations are safe by construction.
+    if prev is not None:
+        _reconcile_deletions(root, prev, new_page_states, new_folders, result)
 
     # -----------------------------------------------------------------------
     # Step 7 — Build and save ExportState (I6: once, at the end)
     # -----------------------------------------------------------------------
     import datetime as _dt
 
+    # new_page_states (skipped + written + carried survivors) and new_folders
+    # were finalized above, before the reconciliation used them as the authority
+    # for what to keep.
     new_state = ExportState(
         schema_version=1,
         space_key=snapshot.space.key,
@@ -1089,7 +1130,7 @@ def build(
         updated_at=_dt.datetime.now(tz=timezone.utc).isoformat(),
         converter_version=CONVERTER_VERSION,
         pages=new_page_states,
-        folders={fid: str(d) for fid, d in plan.folder_dirs.items()},
+        folders=new_folders,
     )
 
     from conex.store.state import StateStore
@@ -1097,21 +1138,20 @@ def build(
     StateStore(root).save(new_state)
 
     # -----------------------------------------------------------------------
-    # Step 8 — Blob GC (only on non-guarded run)
+    # Step 8 — Blob GC (the abort guards above return before reaching here)
     # -----------------------------------------------------------------------
-    if not guarded:
-        keep: set[str] = set()
-        keep.update(snapshot.body_blobs.values())
-        keep.update(snapshot.attachment_blobs.values())
-        keep.update(snapshot.derived_blobs.values())
-        # Freshly-rendered drawio PNGs are not yet in snapshot.derived_blobs;
-        # include them explicitly so GC does not delete them on the same build.
-        keep.update(freshly_rendered_digests)
-        for ps in new_state.pages.values():
-            for att_state in ps.attachments.values():
-                if att_state.blob:
-                    keep.add(att_state.blob)
-        blobs.gc(keep)
+    keep: set[str] = set()
+    keep.update(snapshot.body_blobs.values())
+    keep.update(snapshot.attachment_blobs.values())
+    keep.update(snapshot.derived_blobs.values())
+    # Freshly-rendered drawio PNGs are not yet in snapshot.derived_blobs;
+    # include them explicitly so GC does not delete them on the same build.
+    keep.update(freshly_rendered_digests)
+    for ps in new_state.pages.values():
+        for att_state in ps.attachments.values():
+            if att_state.blob:
+                keep.add(att_state.blob)
+    blobs.gc(keep)
 
     return result, new_state
 

@@ -400,7 +400,19 @@ def _run_export(args: argparse.Namespace, cfg: ResolvedConfig, output_dir: Path)
         author_lookup=not no_author_lookup,
         subtree=getattr(args, "path", None),
         no_children=getattr(args, "no_children", False),
+        site_url=cfg.site_url,
     )
+
+    # A typo'd --path must fail loudly, not silently export zero pages.
+    if build_opts.subtree is not None:
+        from conex.layout import plan_layout
+        _probe = plan_layout(
+            snapshot.space, snapshot.pages, snapshot.folders, subtree=build_opts.subtree
+        )
+        if _probe.subtree_dir is None:
+            raise ConexError(
+                f"path {build_opts.subtree!r} not found in space {args.space_key}"
+            )
 
     api_for_build = None
     if not cached and build_opts.author_lookup:
@@ -560,9 +572,12 @@ def _report_diff(snapshot, prev_state, args) -> None:
             if ps.dir == subtree_prefix or ps.dir.startswith(subtree_prefix + "/")
         }
     elif path_filter is not None and plan.subtree_dir is None:
-        # Subtree filter specified but subtree not found — plan is empty.
-        # prev_ids is empty too so nothing is reported as deleted.
-        prev_ids = set()
+        # Subtree filter specified but the path resolves to no node.  Surface it
+        # instead of confidently printing "No changes." (a typo'd --path must
+        # not read as "everything is up to date").
+        raise ConexError(
+            f"path {path_filter!r} not found in space {snapshot.space.key}"
+        )
     else:
         prev_ids = set(prev_state.pages.keys())
 

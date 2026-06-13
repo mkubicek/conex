@@ -76,6 +76,7 @@ class Http:
         auth_headers: dict[str, str],
         timeout: float = 30.0,
         max_retries: int = 3,
+        cookie_host: str = "",
     ) -> None:
         self._timeout = timeout
         self._max_retries = max_retries
@@ -83,6 +84,22 @@ class Http:
         self._session = requests.Session()
         self._session.headers.update({"Accept": "application/json"})
         self._session.headers.update(auth_headers)
+
+        # Cookie auth: also install the cookie into the session cookiejar keyed to
+        # the site host.  requests strips the manually-set Cookie HEADER when a
+        # request redirects to a different host (the media-download endpoint often
+        # 302s), re-applying only jar cookies — an empty jar leaves the redirected
+        # request unauthenticated and the download fails.  Populating the jar lets
+        # requests re-attach the cookie across same-host redirects.
+        cookie_header = auth_headers.get("Cookie")
+        if cookie_header and cookie_host:
+            for part in cookie_header.split(";"):
+                if "=" not in part:
+                    continue
+                name, value = part.split("=", 1)
+                name = name.strip()
+                if name:
+                    self._session.cookies.set(name, value.strip(), domain=cookie_host)
 
         # Cross-thread 429 coordination: a 429 on any thread pushes
         # _rate_limit_until forward; every thread waits before each attempt.
@@ -160,9 +177,10 @@ class Http:
 
         Raises:
             AuthError: on 401 or 403.
-            ApiError: on 404 or exhausted 429.
-            requests.exceptions.HTTPError: on non-retryable 5xx (exhausted).
-            requests.exceptions.ConnectionError/Timeout: on exhausted transient.
+            ApiError: on 404, exhausted 429, exhausted/non-retryable 5xx, and
+                exhausted transient connection/timeout errors.  Every terminal
+                failure is a typed ConexError so the CLI never leaks a raw
+                requests traceback as an "Unexpected error".
         """
         if isinstance(exc, requests.exceptions.HTTPError):
             status = exc.response.status_code
@@ -195,7 +213,13 @@ class Http:
                 return  # retry
             if resp is not None:
                 _close_safe(resp)
-            raise exc  # non-retryable or exhausted 5xx
+            # Non-retryable or exhausted 5xx → typed ApiError (not a raw
+            # requests HTTPError) so the CLI reports it cleanly.
+            raise ApiError(
+                f"HTTP {status} from {url} after {self._max_retries} attempt(s)",
+                status=status,
+                url=url,
+            ) from exc
 
         # ConnectionError / Timeout: transient, retry if budget remains
         if attempt < self._max_retries - 1:
@@ -205,7 +229,12 @@ class Http:
             return  # retry
         if resp is not None:
             _close_safe(resp)
-        raise exc
+        # Exhausted transient failure → typed ApiError carrying a retry hint.
+        raise ApiError(
+            f"network request to {url} failed after {self._max_retries} "
+            f"attempt(s): {exc}; re-run to retry",
+            url=url,
+        ) from exc
 
     # -- public API ----------------------------------------------------------
 
@@ -227,11 +256,7 @@ class Http:
                 resp = self._session.get(url, params=params, timeout=self._timeout)
                 resp.raise_for_status()
                 return resp.json()
-            except (
-                requests.exceptions.HTTPError,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-            ) as exc:
+            except requests.exceptions.RequestException as exc:
                 self._handle_error(exc, attempt, url)
         raise ApiError(f"Max retries exceeded for {url}", url=url)  # pragma: no cover
 
@@ -254,11 +279,7 @@ class Http:
                 resp = self._session.get(url, stream=True, timeout=self._timeout)
                 resp.raise_for_status()
                 return resp
-            except (
-                requests.exceptions.HTTPError,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-            ) as exc:
+            except requests.exceptions.RequestException as exc:
                 self._handle_error(exc, attempt, url, resp=resp)
         raise ApiError(f"Max retries exceeded for {url}", url=url)  # pragma: no cover
 

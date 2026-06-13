@@ -35,6 +35,20 @@ def _make_http(max_retries: int = 3, timeout: float = 30.0) -> Http:
     return Http(auth_headers={"Authorization": "Bearer tok"}, timeout=timeout, max_retries=max_retries)
 
 
+def test_cookie_header_installed_in_session_cookiejar() -> None:
+    """Cookie auth must also populate the cookiejar (keyed to the site host) so
+    requests re-attaches it across same-host redirects instead of an empty jar."""
+    h = Http(
+        auth_headers={"Cookie": "sess=abc; other=def"},
+        cookie_host="site.atlassian.net",
+    )
+    jar = {c.name: (c.value, c.domain) for c in h._session.cookies}
+    assert jar.get("sess") == ("abc", "site.atlassian.net")
+    assert jar.get("other") == ("def", "site.atlassian.net")
+    # The raw header is still present for the non-redirect case.
+    assert h._session.headers.get("Cookie") == "sess=abc; other=def"
+
+
 def _http_error(status: int, url: str = "https://example.com/api") -> requests.exceptions.HTTPError:
     """Return an HTTPError carrying a response with the given status."""
     response = MagicMock(spec=requests.Response)
@@ -263,7 +277,7 @@ class TestGetJson5xx:
 
         with patch.object(h._session, "get", return_value=fail):
             with patch("conex.http.time.sleep"):
-                with pytest.raises(requests.exceptions.HTTPError):
+                with pytest.raises(ApiError):
                     h.get_json("https://example.com/api")
 
     def test_5xx_exhausted_call_count(self) -> None:
@@ -273,7 +287,7 @@ class TestGetJson5xx:
 
         with patch.object(h._session, "get", return_value=fail) as mock_get:
             with patch("conex.http.time.sleep"):
-                with pytest.raises(requests.exceptions.HTTPError):
+                with pytest.raises(ApiError):
                     h.get_json("https://example.com/api")
 
         assert mock_get.call_count == 3
@@ -452,7 +466,34 @@ class TestTransientErrors:
             side_effect=requests.exceptions.ConnectionError("no route"),
         ):
             with patch("conex.http.time.sleep"):
-                with pytest.raises(requests.exceptions.ConnectionError):
+                with pytest.raises(ApiError):
+                    h.get_json("https://example.com/api")
+
+    def test_chunked_encoding_error_wrapped_in_api_error(self) -> None:
+        """A truncated chunked transfer (ChunkedEncodingError) is a RequestException
+        that is NOT ConnectionError/Timeout/HTTPError — it must still be retried
+        and surface as a typed ApiError, not escape as 'Unexpected error'."""
+        h = _make_http(max_retries=2)
+        with patch.object(
+            h._session,
+            "get",
+            side_effect=requests.exceptions.ChunkedEncodingError("truncated"),
+        ):
+            with patch("conex.http.time.sleep"):
+                with pytest.raises(ApiError):
+                    h.get_json("https://example.com/api")
+
+    def test_json_decode_error_wrapped_in_api_error(self) -> None:
+        """A 200 with a non-JSON body (proxy interstitial) raises requests'
+        JSONDecodeError from resp.json() — must surface as ApiError, not a raw
+        traceback."""
+        h = _make_http(max_retries=2)
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.side_effect = requests.exceptions.JSONDecodeError("x", "doc", 0)
+        with patch.object(h._session, "get", return_value=resp):
+            with patch("conex.http.time.sleep"):
+                with pytest.raises(ApiError):
                     h.get_json("https://example.com/api")
 
 
@@ -536,7 +577,7 @@ class TestGetStreamClosesOnError:
 
         with patch.object(h._session, "get", return_value=fail_resp):
             with patch("conex.http.time.sleep"):
-                with pytest.raises(requests.exceptions.HTTPError):
+                with pytest.raises(ApiError):
                     h.get_stream("https://example.com/file")
 
         assert fail_resp.close.call_count == 2  # once per attempt
@@ -780,7 +821,7 @@ class TestEdgeCases:
 
         with patch.object(h._session, "get", return_value=fail) as mock_get:
             with patch("conex.http.time.sleep"):
-                with pytest.raises(requests.exceptions.HTTPError):
+                with pytest.raises(ApiError):
                     h.get_json("https://example.com/api")
 
         assert mock_get.call_count == 1

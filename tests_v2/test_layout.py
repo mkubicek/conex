@@ -522,6 +522,41 @@ class TestSubtreeFolderRoot:
         assert "p1" not in plan.dirs
 
 
+class TestSubtreeArchivedRoot:
+    """Regression: a subtree rooted at the synthetic ``_archived`` node must
+    resolve ``subtree_dir`` to its real allocated dir (``<space>/_archived``).
+
+    The synthetic ``__archived__`` node is deliberately absent from ``dirs``
+    and ``folder_dirs``, so resolving subtree_dir from those maps yielded
+    ``None``.  A None subtree_dir with a non-empty plan disables build's
+    prune-scope guard and silently deletes every out-of-subtree live page on
+    ``export --include-archived --path _archived``.
+    """
+
+    def test_archived_subtree_dir_is_resolved_not_none(self):
+        space = make_space("S")
+        live = make_page("lp", "Live Doc", status="current")
+        archived = make_page("ap", "Old Doc", status="archived")
+        plan = plan_layout(space, [live, archived], [], subtree="/_archived")
+        # The bug: subtree_dir was None here.
+        assert plan.subtree_dir is not None
+        assert plan.subtree_dir == PurePosixPath("S/_archived")
+
+    def test_archived_subtree_restricts_to_archived_pages_only(self):
+        space = make_space("S")
+        live = make_page("lp", "Live Doc", status="current")
+        archived = make_page("ap", "Old Doc", status="archived")
+        plan = plan_layout(space, [live, archived], [], subtree="/_archived")
+        # Only the archived page is in scope; the live page is excluded.
+        assert "ap" in plan.dirs
+        assert "lp" not in plan.dirs
+        # And every in-scope dir sits under the resolved subtree_dir.
+        prefix = str(plan.subtree_dir)
+        for d in plan.dirs.values():
+            s = str(d)
+            assert s == prefix or s.startswith(prefix + "/")
+
+
 # ---------------------------------------------------------------------------
 # PR3 — live children of archived pages
 # ---------------------------------------------------------------------------

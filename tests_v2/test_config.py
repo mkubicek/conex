@@ -912,3 +912,315 @@ class TestApiBaseUrlEnvVar:
             cfg = resolve_config(tmp_path)
         assert cfg.dialect is Dialect.COOKIE_V1
         assert cfg.api_base_url == "https://site.atlassian.net"
+
+
+class TestCrossOriginCredentialSafety:
+    """A credential must never be sent to an origin a *different* config layer
+    introduced.  Regression for the cross-origin credential-leak P0.
+    """
+
+    def test_global_creds_not_leaked_to_local_different_origin(self, tmp_path: Path) -> None:
+        # Global config carries creds scoped to the victim site.
+        global_cfg = tmp_path / "global_config.json"
+        global_cfg.write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://victim.atlassian.net",
+            "auth": {"email": "victim@example.com", "token": "victim-token"},
+        }))
+        # Higher-priority local config points at a DIFFERENT origin, no creds.
+        project = tmp_path / "project"
+        project.mkdir()
+        _write_v2_config(
+            project / ".conex" / "config.json",
+            site_url="https://attacker.example.com",
+        )
+        with patch("conex.config._GLOBAL_CONFIG_PATH", global_cfg):
+            with pytest.raises(AuthError):
+                resolve_config(project)
+
+    def test_env_api_base_different_origin_drops_inherited_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Local config has token creds for the site...
+        _write_v2_config(
+            tmp_path / ".conex" / "config.json",
+            site_url="https://victim.atlassian.net",
+            email="victim@example.com",
+            token="victim-token",
+        )
+        # ...and a stray env api_base points the endpoint at another host.
+        monkeypatch.setenv("CONFLUENCE_API_BASE_URL", "https://evil.example.com")
+        with patch("conex.config._GLOBAL_CONFIG_PATH", tmp_path / "nonexistent.json"):
+            with pytest.raises(AuthError):
+                resolve_config(tmp_path)
+
+    def test_same_origin_local_override_keeps_global_creds(self, tmp_path: Path) -> None:
+        global_cfg = tmp_path / "global_config.json"
+        global_cfg.write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://site.atlassian.net",
+            "auth": {"email": "g@example.com", "token": "g-token"},
+        }))
+        project = tmp_path / "project"
+        project.mkdir()
+        # Same origin, just present without creds → inherited creds still apply.
+        _write_v2_config(
+            project / ".conex" / "config.json",
+            site_url="https://site.atlassian.net",
+        )
+        with patch("conex.config._GLOBAL_CONFIG_PATH", global_cfg):
+            cfg = resolve_config(project)
+        assert cfg.auth_headers == {"Authorization": _basic_auth("g@example.com", "g-token")}
+
+    def test_env_creds_only_not_leaked_to_attacker_local_site(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BYPASS regression: higher-priority env creds (no site) must NOT attach
+        to a lower-priority local config's attacker-controlled site_url."""
+        _write_v2_config(
+            tmp_path / ".conex" / "config.json",
+            site_url="https://attacker.example.com",
+        )
+        monkeypatch.setenv("CONFLUENCE_EMAIL", "victim@example.com")
+        monkeypatch.setenv("CONFLUENCE_API_TOKEN", "secret")
+        with patch("conex.config._GLOBAL_CONFIG_PATH", tmp_path / "nonexistent.json"):
+            # Refused with an actionable error: a portable secret must not be
+            # sent to a site supplied by an untrusted local .conex config.
+            with pytest.raises(ConfigError):
+                resolve_config(tmp_path)
+
+    def test_global_creds_only_not_leaked_to_attacker_local_site(self, tmp_path: Path) -> None:
+        """BYPASS regression: URL-less global creds must not attach to an
+        attacker-controlled local site_url."""
+        global_cfg = tmp_path / "global_config.json"
+        global_cfg.write_text(json.dumps({
+            "version": 2,
+            "auth": {"email": "victim@example.com", "token": "secret"},
+        }))
+        project = tmp_path / "project"
+        project.mkdir()
+        _write_v2_config(
+            project / ".conex" / "config.json",
+            site_url="https://attacker.example.com",
+        )
+        with patch("conex.config._GLOBAL_CONFIG_PATH", global_cfg):
+            with pytest.raises(ConfigError):
+                resolve_config(project)
+
+    def test_cookie_with_token_and_api_base_not_leaked_cross_origin(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BYPASS regression: a cookie is transported to site_url even when a
+        token + api_base coexist (COOKIE_V1 ignores api_base).  The binding must
+        follow effective auth (cookie→site), so a lower attacker site_url drops
+        the cookie rather than leaking it to api_base's apparent origin."""
+        _write_v2_config(
+            tmp_path / ".conex" / "config.json",
+            site_url="https://attacker.example.com",
+        )
+        monkeypatch.setenv("CONFLUENCE_COOKIE", "victim-sess=secret")
+        monkeypatch.setenv("CONFLUENCE_API_TOKEN", "plainjunk")
+        monkeypatch.setenv("CONFLUENCE_API_BASE_URL", "https://victim.atlassian.net")
+        with patch("conex.config._GLOBAL_CONFIG_PATH", tmp_path / "nonexistent.json"):
+            with pytest.raises(ConfigError):
+                resolve_config(tmp_path)
+
+    def test_global_and_local_same_site_with_env_creds_works(self, tmp_path, monkeypatch):
+        """Over-refusal regression: when a TRUSTED layer (global) declares the
+        same site a local .conex redundantly pins, an env secret must still be
+        honored — refuse only when the local .conex is the SOLE origin source."""
+        global_cfg = tmp_path / "global_config.json"
+        global_cfg.write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://trusted.atlassian.net",
+        }))
+        project = tmp_path / "project"
+        project.mkdir()
+        _write_v2_config(
+            project / ".conex" / "config.json",
+            site_url="https://trusted.atlassian.net",
+        )
+        monkeypatch.setenv("CONFLUENCE_EMAIL", "u@e.com")
+        monkeypatch.setenv("CONFLUENCE_API_TOKEN", "tok")
+        with patch("conex.config._GLOBAL_CONFIG_PATH", global_cfg):
+            cfg = resolve_config(project)
+        assert cfg.auth_headers == {"Authorization": _basic_auth("u@e.com", "tok")}
+
+    def test_secret_in_env_with_site_in_global_config_works(self, tmp_path, monkeypatch):
+        """Trusted split: secret in env + site in GLOBAL config (not local .conex)
+        is the standard CI/CD pattern and MUST yield working credentials."""
+        global_cfg = tmp_path / "global_config.json"
+        global_cfg.write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://site.atlassian.net",
+        }))
+        project = tmp_path / "project"
+        project.mkdir()
+        monkeypatch.setenv("CONFLUENCE_EMAIL", "u@e.com")
+        monkeypatch.setenv("CONFLUENCE_API_TOKEN", "tok")
+        with patch("conex.config._GLOBAL_CONFIG_PATH", global_cfg):
+            cfg = resolve_config(project)
+        assert cfg.auth_headers == {"Authorization": _basic_auth("u@e.com", "tok")}
+        assert cfg.site_url == "https://site.atlassian.net"
+
+    def test_cloud_id_from_local_config_does_not_redirect_scoped_token(self, tmp_path):
+        """A planted local .conex cloud_id must not redirect a scoped token's
+        gateway to a different (attacker) Atlassian tenant while keeping the
+        victim's credentials."""
+        global_cfg = tmp_path / "global_config.json"
+        global_cfg.write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://victim.atlassian.net",
+            "auth": {"email": "victim@corp.com", "token": SCOPED},
+        }))
+        project = tmp_path / "project"
+        project.mkdir()
+        _write_v2_config(
+            project / ".conex" / "config.json",
+            site_url="https://victim.atlassian.net",
+            cloud_id="ATTACKER-TENANT-9999",
+        )
+        with patch("conex.config._GLOBAL_CONFIG_PATH", global_cfg):
+            with pytest.raises((AuthError, ConfigError)):
+                resolve_config(project, resolve_cloud=lambda u: "victim-cloud")
+
+    def test_cross_layer_cookie_leak_blocked(self, tmp_path, monkeypatch):
+        """A victim cookie in global config must not be exfiltrated to an
+        attacker site set in env, even when a junk token sits in env."""
+        global_cfg = tmp_path / "global_config.json"
+        global_cfg.write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://victim.atlassian.net",
+            "auth": {"cookie_header": "VICTIM-SESSION=topsecret"},
+        }))
+        project = tmp_path / "project"
+        project.mkdir()
+        monkeypatch.setenv("CONFLUENCE_SITE_URL", "https://attacker.evil.com")
+        monkeypatch.setenv("CONFLUENCE_API_TOKEN", "junk")
+        with patch("conex.config._GLOBAL_CONFIG_PATH", global_cfg):
+            with pytest.raises((AuthError, ConfigError)):
+                resolve_config(project)
+
+    def test_explicit_default_port_is_same_origin(self, tmp_path: Path) -> None:
+        """Regression: site.atlassian.net and site.atlassian.net:443 are the same
+        origin — an explicit :443 in one layer must NOT drop inherited creds."""
+        global_cfg = tmp_path / "global_config.json"
+        global_cfg.write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://site.atlassian.net",
+            "auth": {"email": "u@e.com", "token": "tok"},
+        }))
+        project = tmp_path / "project"
+        project.mkdir()
+        _write_v2_config(
+            project / ".conex" / "config.json",
+            site_url="https://site.atlassian.net:443",
+        )
+        with patch("conex.config._GLOBAL_CONFIG_PATH", global_cfg):
+            cfg = resolve_config(project)
+        assert cfg.auth_headers == {"Authorization": _basic_auth("u@e.com", "tok")}
+
+    def test_cookie_not_dropped_by_unrelated_env_api_base(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Cookie auth in a local config; api_base is irrelevant to cookie mode
+        # and must NOT drop the cookie even on a different origin.
+        _write_v2_config(
+            tmp_path / ".conex" / "config.json",
+            site_url="https://site.atlassian.net",
+            cookie="sess=abc",
+            auth_type="cookie",
+        )
+        monkeypatch.setenv("CONFLUENCE_API_BASE_URL", "https://unrelated.example.com")
+        with patch("conex.config._GLOBAL_CONFIG_PATH", tmp_path / "nonexistent.json"):
+            cfg = resolve_config(tmp_path)
+        assert cfg.dialect is Dialect.COOKIE_V1
+        assert cfg.auth_headers == {"Cookie": "sess=abc"}
+
+
+class TestApiBaseUrlCliFlag:
+    """The --api-base-url CLI flag must be honored (was silently ignored)."""
+
+    def test_cli_api_base_url_honored_with_colocated_creds(self, tmp_path: Path) -> None:
+        # site + api_base + creds all supplied together (CLI layer) → intentional.
+        cfg = resolve_config(tmp_path, overrides={
+            "site_url": "https://site.atlassian.net",
+            "api_base_url": "https://proxy.internal",
+            "email": "e@example.com",
+            "api_token": "tok",
+        })
+        assert cfg.api_base_url == "https://proxy.internal"
+        assert cfg.auth_headers == {"Authorization": _basic_auth("e@example.com", "tok")}
+
+    def test_cli_api_base_url_same_origin_keeps_config_creds(self, tmp_path: Path) -> None:
+        _write_v2_config(
+            tmp_path / ".conex" / "config.json",
+            site_url="https://site.atlassian.net",
+            email="e@example.com",
+            token="tok",
+        )
+        cfg = resolve_config(
+            tmp_path, overrides={"api_base_url": "https://site.atlassian.net/wiki"}
+        )
+        assert cfg.api_base_url == "https://site.atlassian.net/wiki"
+        assert cfg.auth_headers == {"Authorization": _basic_auth("e@example.com", "tok")}
+
+
+class TestApiBaseUrlFromConfigFile:
+    def test_api_base_url_in_config_file_honored(self, tmp_path: Path) -> None:
+        """A config-file api_base_url (v1 read it) must be honored, not dropped —
+        proxy/gateway users rely on it.  Co-located with creds, so the cross-origin
+        guard treats it as an intentional same-layer endpoint."""
+        cfg_path = tmp_path / ".conex" / "config.json"
+        cfg_path.parent.mkdir(parents=True)
+        cfg_path.write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://site.atlassian.net",
+            "api_base_url": "https://proxy.internal/wiki",
+            "auth": {"email": "e@example.com", "token": "tok"},
+        }))
+        with patch("conex.config._GLOBAL_CONFIG_PATH", tmp_path / "nonexistent.json"):
+            cfg = resolve_config(tmp_path)
+        assert cfg.api_base_url == "https://proxy.internal/wiki"
+        assert cfg.auth_headers == {"Authorization": _basic_auth("e@example.com", "tok")}
+
+
+class TestApiBaseUrlHttpsRequired:
+    def test_http_api_base_url_rejected(self, tmp_path: Path) -> None:
+        """api_base_url carries Basic/Bearer creds, so a plaintext http:// value
+        must be rejected (never emit a credential to an unencrypted endpoint)."""
+        cfg_path = tmp_path / ".conex" / "config.json"
+        cfg_path.parent.mkdir(parents=True)
+        cfg_path.write_text(json.dumps({
+            "version": 2,
+            "site_url": "https://site.atlassian.net",
+            "api_base_url": "http://proxy.internal/wiki",
+            "auth": {"email": "e@example.com", "token": "tok"},
+        }))
+        with patch("conex.config._GLOBAL_CONFIG_PATH", tmp_path / "nonexistent.json"):
+            with pytest.raises(ConfigError):
+                resolve_config(tmp_path)
+
+
+class TestMalformedUrl:
+    def test_malformed_port_site_url_raises_configerror_not_crash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A typo'd port in site_url must raise a clean ConfigError, never an
+        unhandled ValueError traceback (the origin check must not crash)."""
+        monkeypatch.setenv("CONFLUENCE_SITE_URL", "https://acme.atlassian.net:8O80")
+        monkeypatch.setenv("CONFLUENCE_EMAIL", "u@e.com")
+        monkeypatch.setenv("CONFLUENCE_API_TOKEN", "tok")
+        with patch("conex.config._GLOBAL_CONFIG_PATH", tmp_path / "nonexistent.json"):
+            with pytest.raises(ConfigError):
+                resolve_config(tmp_path)
+
+
+class TestGatewayUrlRejectedAsSiteUrl:
+    def test_gateway_url_as_site_url_rejected(self, tmp_path: Path) -> None:
+        with patch("conex.config._GLOBAL_CONFIG_PATH", tmp_path / "nonexistent.json"):
+            with pytest.raises(ConfigError, match="gateway"):
+                resolve_config(tmp_path, overrides={
+                    "site_url": "https://api.atlassian.com/ex/confluence/abc",
+                    "cookie": "sess=abc",
+                })

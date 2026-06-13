@@ -40,6 +40,15 @@ from conex.store.blobs import BlobStore
 DRAWIO_RENDER_VERSION: int = 1
 """Bump when CLI flags or render parameters change to invalidate cached PNGs."""
 
+_RENDER_TIMEOUT_S: float = 120.0
+"""Per-invocation wall-clock budget for a draw.io CLI call.
+
+draw.io is Electron-based and can hang on headless cleanup; without a deadline
+a single bad diagram would freeze the whole (lock-held) export.  On timeout
+``subprocess.run`` kills and reaps the child, so no process leaks: folder-mode
+falls back to per-file, and a per-file timeout warns and skips that diagram.
+"""
+
 # Sentinel for the which-cache: None means "not yet looked up"; False means
 # "looked up and not found"; a non-empty str is the resolved path.
 _DRAWIO_CLI: str | None | bool = None  # type: ignore[assignment]
@@ -225,6 +234,7 @@ def render_batch(
             folder_argv,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=_RENDER_TIMEOUT_S,
         )
         if proc.returncode == 0:
             # Attempt to map folder outputs back to staged input names.
@@ -245,6 +255,12 @@ def render_batch(
             if folder_result:
                 folder_mode_ok = True
                 result = folder_result
+    except subprocess.TimeoutExpired:
+        warnings.warn(
+            f"draw.io folder-mode render timed out after "
+            f"{_RENDER_TIMEOUT_S:.0f}s; falling back to per-file rendering",
+            stacklevel=2,
+        )
     except OSError:
         pass  # fall through to per-file
 
@@ -267,6 +283,7 @@ def render_batch(
                 argv,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                timeout=_RENDER_TIMEOUT_S,
             )
             if proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
                 digest = blobs.add_bytes(out_path.read_bytes())
@@ -277,6 +294,12 @@ def render_batch(
                     f"(exit code {proc.returncode})",
                     stacklevel=2,
                 )
+        except subprocess.TimeoutExpired:
+            warnings.warn(
+                f"draw.io render timed out for {name!r} after "
+                f"{_RENDER_TIMEOUT_S:.0f}s; skipping",
+                stacklevel=2,
+            )
         except OSError as exc:
             warnings.warn(
                 f"draw.io render error for {name!r}: {exc}",

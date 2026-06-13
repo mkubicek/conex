@@ -134,18 +134,29 @@ def build_frontmatter(
     space: Space,
     human_path: str,
     site_url: str,
+    attachments: list[Attachment] | None = None,
 ) -> str:
     """Build the YAML frontmatter block for a page's markdown file.
 
     Shape (v1 parity):
     - title, page_id, space_key, path, url, last_modified, version
     - status: archived — only when page.status == "archived"
+    - attachments: [{name, type, size}, …] — only when the page has attachments
 
     Returns a string of the form ``---\\n<yaml>---\\n\\n``.
     """
     url = ""
     if site_url and page.web_url:
-        url = page.web_url if page.web_url.startswith("http") else f"{site_url.rstrip('/')}{page.web_url}"
+        if page.web_url.startswith("http"):
+            url = page.web_url
+        else:
+            # v2 stores the API `_links.webui` path (e.g. "/spaces/SP/pages/123"),
+            # which is relative to the Confluence app root at /wiki — v1 emitted
+            # f"{base}/wiki{webui}".  Prepend /wiki for a clickable link.
+            path = page.web_url if page.web_url.startswith("/") else "/" + page.web_url
+            if not path.startswith("/wiki/") and path != "/wiki":
+                path = "/wiki" + path
+            url = f"{site_url.rstrip('/')}{path}"
 
     meta: dict = {
         "title": page.title,
@@ -158,6 +169,12 @@ def build_frontmatter(
     }
     if page.status == "archived":
         meta["status"] = "archived"
+
+    if attachments:
+        meta["attachments"] = [
+            {"name": a.title, "type": a.media_type, "size": a.file_size}
+            for a in attachments
+        ]
 
     yaml_str = yaml.dump(meta, default_flow_style=False, allow_unicode=True, sort_keys=False)
     return f"---\n{yaml_str}---\n\n"

@@ -280,6 +280,65 @@ class TestIncrementalAttachments:
             version=PageVersion(number=version),
         )
 
+    def test_body_fetch_failure_carries_prev_body(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A transient body-fetch failure must NOT blank a previously-good page:
+        carry the prev body blob so the fingerprint is unchanged and the
+        last-good markdown is preserved."""
+        from conex.errors import ApiError
+
+        good = blobs.add_bytes(b"Important content")
+        prev = Snapshot(body_blobs={"p1": good})
+
+        class FailBodyAPI(FakeAPI):
+            def get_page_body(self, page_id: str) -> str:
+                raise ApiError("HTTP 404", status=404, url="x")
+
+        api = FailBodyAPI(
+            pages=[Page(id="p1", title="P1", space_id="S1", body_storage="")],
+            attachments={},
+        )
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert snap.body_blobs["p1"] == good  # carried prev, not an empty blob
+
+    def test_body_fetch_failure_is_best_effort(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A single page-body fetch failure must NOT abort the whole pull — the
+        page gets an empty body and the export proceeds (v1 parity)."""
+        from conex.errors import ApiError
+
+        class FailBodyAPI(FakeAPI):
+            def get_page_body(self, page_id: str) -> str:
+                raise ApiError("HTTP 404", status=404, url="x")
+
+        api = FailBodyAPI(
+            pages=[Page(id="p1", title="P1", space_id="S1", body_storage="")],
+            attachments={},
+        )
+        # Must not raise.
+        snap = pull(api, "TEST", tmp_root, blobs, None, _default_opts())
+        assert "p1" in snap.body_blobs
+        assert blobs.read_bytes(snap.body_blobs["p1"]) == b""
+
+    def test_no_media_carries_prev_attachment_blobs(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """fetch_media=False (the diff path) must carry prev.attachment_blobs
+        forward — persisting an empty map would let a later build's GC delete
+        the blobs out from under the exported .media/ files."""
+        existing_digest = blobs.add_bytes(b"some-bytes")
+        prev = Snapshot(attachment_blobs={"a1@3": existing_digest})
+        att = self._make_attachment("a1", version=3)
+        api = FakeAPI(
+            pages=[Page(id="p1", title="P1", space_id="S1", body_storage="x")],
+            attachments={"p1": [att]},
+        )
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts(fetch_media=False))
+        assert snap.attachment_blobs.get("a1@3") == existing_digest
+        assert att.download_url not in api.download_calls  # no download attempted
+
     def test_incremental_skip_when_blob_present(
         self, tmp_root: Path, blobs: BlobStore
     ) -> None:

@@ -426,6 +426,225 @@ class TestBuildSkip:
 
 
 class TestBuildMove:
+    def test_move_with_attachment_rename_leaves_no_orphan(self, tmp_root, blobs):
+        """BL-1: a page move + attachment rename in the same run must not strand
+        the old-named attachment (KEEP-protected) in the new .media/."""
+        body = seed_blob(blobs, b"<p>x</p>")
+        old_blob = seed_blob(blobs, b"OLDPNG")
+
+        att_v1 = make_attachment("a1", "old.png", version=1, created_at="2024-01-01T00:00:00Z")
+        snap1 = make_snapshot(
+            pages=[make_page("p1", "Before")],
+            body_blobs={"p1": body},
+            attachments={"p1": [att_v1]},
+            attachment_blobs={"a1@1": old_blob},
+        )
+        _, state1 = build(tmp_root, snap1, blobs, None, default_opts(media=True))
+        assert (tmp_root / state1.pages["p1"].dir / ".media" / "old.png").exists()
+
+        # Page retitled (→ move) AND attachment bumped + renamed in the same run.
+        # Seed the new blob AFTER run 1 so run 1's GC doesn't reclaim it.
+        new_blob = seed_blob(blobs, b"NEWPNG")
+        att_v2 = make_attachment("a1", "new.png", version=2, created_at="2024-01-02T00:00:00Z")
+        snap2 = make_snapshot(
+            pages=[make_page("p1", "After")],
+            body_blobs={"p1": body},
+            attachments={"p1": [att_v2]},
+            attachment_blobs={"a1@2": new_blob},
+        )
+        _, state2 = build(tmp_root, snap2, blobs, state1, default_opts(media=True))
+
+        new_media = tmp_root / state2.pages["p1"].dir / ".media"
+        assert (new_media / "new.png").read_bytes() == b"NEWPNG"
+        assert not (new_media / "old.png").exists(), "stale old-named orphan in new .media (BL-1)"
+        assert state2.pages["p1"].attachments["a1"].file == "new.png"
+
+    def test_three_page_title_rotation_preserves_each_pages_media(self, tmp_root, blobs):
+        """BL-RESCUE-OVERWRITE-CYCLE: an N-page title rotation sharing an
+        attachment filename (with missing new blobs) must land EACH page's own
+        original bytes at its own new dir — no cyclic overwrite."""
+        body = seed_blob(blobs, b"<p>x</p>")
+        snap1 = make_snapshot(
+            pages=[make_page("A", "Foo"), make_page("B", "Bar"), make_page("C", "Baz")],
+            body_blobs={"A": body, "B": body, "C": body},
+            attachments={
+                "A": [make_attachment("a", "x.png", version=1)],
+                "B": [make_attachment("b", "x.png", version=1)],
+                "C": [make_attachment("c", "x.png", version=1)],
+            },
+            attachment_blobs={
+                "a@1": seed_blob(blobs, b"AAA"),
+                "b@1": seed_blob(blobs, b"BBB"),
+                "c@1": seed_blob(blobs, b"CCC"),
+            },
+        )
+        _, s1 = build(tmp_root, snap1, blobs, None, default_opts(media=True))
+
+        # Rotate titles A->Bar, B->Baz, C->Foo; keep x.png bumped with MISSING blobs.
+        snap2 = make_snapshot(
+            pages=[make_page("A", "Bar"), make_page("B", "Baz"), make_page("C", "Foo")],
+            body_blobs={"A": body, "B": body, "C": body},
+            attachments={
+                "A": [make_attachment("a", "x.png", version=2)],
+                "B": [make_attachment("b", "x.png", version=2)],
+                "C": [make_attachment("c", "x.png", version=2)],
+            },
+            attachment_blobs={"a@2": "0" * 64, "b@2": "1" * 64, "c@2": "2" * 64},
+        )
+        _, s2 = build(tmp_root, snap2, blobs, s1, default_opts(media=True))
+
+        for pid, original in (("A", b"AAA"), ("B", b"BBB"), ("C", b"CCC")):
+            f = tmp_root / s2.pages[pid].dir / ".media" / "x.png"
+            assert f.exists() and f.read_bytes() == original, f"page {pid} media wrong/lost at {f}"
+
+    def test_rescue_crash_then_clean_rerun_recovers_each_pages_bytes(self, tmp_root, blobs, monkeypatch):
+        """A crash mid-swap-rescue must not lose data: the carried bytes are
+        materialized from the immutable, content-addressed blob store (referenced
+        by prev state, so still present after a crash that never saves new state),
+        and a clean re-run recovers EACH page's own bytes."""
+        body = seed_blob(blobs, b"<p>x</p>")
+        aaa = seed_blob(blobs, b"AAA")
+        bbb = seed_blob(blobs, b"BBB")
+        snap1 = make_snapshot(
+            pages=[make_page("A", "Foo"), make_page("B", "Bar")],
+            body_blobs={"A": body, "B": body},
+            attachments={
+                "A": [make_attachment("a", "x.png", version=1)],
+                "B": [make_attachment("b", "x.png", version=1)],
+            },
+            attachment_blobs={"a@1": aaa, "b@1": bbb},
+        )
+        _, s1 = build(tmp_root, snap1, blobs, None, default_opts(media=True))
+
+        snap2 = make_snapshot(
+            pages=[make_page("A", "Bar"), make_page("B", "Foo")],
+            body_blobs={"A": body, "B": body},
+            attachments={
+                "A": [make_attachment("a", "x.png", version=2)],
+                "B": [make_attachment("b", "x.png", version=2)],
+            },
+            attachment_blobs={"a@2": "0" * 64, "b@2": "1" * 64},
+        )
+
+        # Crash on the 2nd rescue materialize (into a .media dir).
+        real_mat = type(blobs).materialize
+        seen = {"n": 0}
+
+        def crashing_materialize(self, digest, dest, **k):
+            if dest.parent.name == ".media":
+                seen["n"] += 1
+                if seen["n"] >= 2:
+                    raise RuntimeError("simulated crash mid-rescue")
+            return real_mat(self, digest, dest, **k)
+
+        monkeypatch.setattr(type(blobs), "materialize", crashing_materialize)
+        with pytest.raises(RuntimeError):
+            build(tmp_root, snap2, blobs, s1, default_opts(media=True))
+
+        # The source of truth (prev blobs) survives the crash (state never saved).
+        assert blobs.has(aaa) and blobs.has(bbb)
+
+        # A clean re-run recovers each page's OWN bytes at its own new dir.
+        monkeypatch.undo()
+        _, s2 = build(tmp_root, snap2, blobs, s1, default_opts(media=True))
+        for pid, original in (("A", b"AAA"), ("B", b"BBB")):
+            f = tmp_root / s2.pages[pid].dir / ".media" / "x.png"
+            assert f.read_bytes() == original, f"page {pid} not recovered: {f}"
+
+    def test_title_swap_with_media_no_partner_media_loss(self, tmp_root, blobs):
+        """BL-INLINE-STALE-NEWDIR: a moved page's inline stale-media cleanup runs
+        against its NEW dir but the OLD recorded filenames; on a title swap that
+        new dir is the partner's old dir, so the cleanup must not delete the
+        partner's media there."""
+        body = seed_blob(blobs, b"<p>x</p>")
+        aaa = seed_blob(blobs, b"AAA")
+        bbb = seed_blob(blobs, b"BBB")
+        a1 = make_attachment("ax", "x.png", version=1)
+        b1 = make_attachment("bx", "x.png", version=1)
+        snap1 = make_snapshot(
+            pages=[make_page("pa", "Foo"), make_page("pb", "Bar")],
+            body_blobs={"pa": body, "pb": body},
+            attachments={"pa": [a1], "pb": [b1]},
+            attachment_blobs={"ax@1": aaa, "bx@1": bbb},
+        )
+        _, state1 = build(tmp_root, snap1, blobs, None, default_opts(media=True))
+
+        # Swap titles. pa Foo->Bar drops its attachment; pb Bar->Foo bumps its
+        # attachment to a version whose blob is MISSING (failed download), so it
+        # must rely on rescuing its OLD media that pa's cleanup would have deleted.
+        b2 = make_attachment("bx", "x.png", version=2)
+        snap2 = make_snapshot(
+            pages=[make_page("pa", "Bar"), make_page("pb", "Foo")],
+            body_blobs={"pa": body, "pb": body},
+            attachments={"pa": [], "pb": [b2]},
+            attachment_blobs={"bx@2": "0" * 64},
+        )
+        build(tmp_root, snap2, blobs, state1, default_opts(media=True))
+
+        survivors = [
+            p for p in tmp_root.rglob("*")
+            if p.is_file() and p.read_bytes() == b"BBB"
+        ]
+        assert survivors, "swap partner's media destroyed by moved page inline cleanup"
+
+    def test_repeated_moves_with_missing_blob_preserve_bytes(self, tmp_root, blobs):
+        """Multi-run: a page moved across SEVERAL syncs while its new-version blob
+        stays missing must keep its last-good bytes — the rescued blob must not be
+        GC-reclaimed and the next move must still find it."""
+        body = seed_blob(blobs, b"<p>x</p>")
+        orig = seed_blob(blobs, b"ORIGINAL")
+        snap1 = make_snapshot(
+            pages=[make_page("p1", "T1")],
+            body_blobs={"p1": body},
+            attachments={"p1": [make_attachment("a", "x.png", version=1)]},
+            attachment_blobs={"a@1": orig},
+        )
+        _, state = build(tmp_root, snap1, blobs, None, default_opts(media=True))
+
+        # Retitle (move) repeatedly; each run the new version's blob is MISSING.
+        for i, title in enumerate(["T2", "T3", "T4"], start=2):
+            snap = make_snapshot(
+                pages=[make_page("p1", title)],
+                body_blobs={"p1": body},
+                attachments={"p1": [make_attachment("a", "x.png", version=i)]},
+                attachment_blobs={f"a@{i}": str(i) * 64},
+            )
+            _, state = build(tmp_root, snap, blobs, state, default_opts(media=True))
+            media = tmp_root / state.pages["p1"].dir / ".media" / "x.png"
+            assert media.exists() and media.read_bytes() == b"ORIGINAL", (
+                f"original bytes lost after move {i}"
+            )
+
+    def test_move_with_failed_rename_preserves_old_bytes(self, tmp_root, blobs):
+        """BL-1 regression: if a moved page's renamed attachment FAILS to
+        materialize (missing blob), the old bytes must be preserved on disk, not
+        destroyed by deferred cleanup (the rescue must fall through on failure)."""
+        body = seed_blob(blobs, b"<p>x</p>")
+        old_blob = seed_blob(blobs, b"OLDPNG")
+        att_v1 = make_attachment("a1", "old.png", version=1, created_at="2024-01-01T00:00:00Z")
+        snap1 = make_snapshot(
+            pages=[make_page("p1", "Before")], body_blobs={"p1": body},
+            attachments={"p1": [att_v1]}, attachment_blobs={"a1@1": old_blob},
+        )
+        _, state1 = build(tmp_root, snap1, blobs, None, default_opts(media=True))
+
+        # Move (retitle) + rename to new.png, but the new blob digest is NOT in
+        # the store → materialize fails, so new.png is never written.
+        att_v2 = make_attachment("a1", "new.png", version=2, created_at="2024-01-02T00:00:00Z")
+        snap2 = make_snapshot(
+            pages=[make_page("p1", "After")], body_blobs={"p1": body},
+            attachments={"p1": [att_v2]}, attachment_blobs={"a1@2": "0" * 64},
+        )
+        # build emits a UserWarning for the failed materialize (expected).
+        _, state2 = build(tmp_root, snap2, blobs, state1, default_opts(media=True))
+
+        new_media = tmp_root / state2.pages["p1"].dir / ".media"
+        survivors = [
+            p for p in new_media.glob("*")
+            if p.is_file() and p.read_bytes() == b"OLDPNG"
+        ]
+        assert survivors, "old attachment bytes destroyed on failed rename (BL-1 regression)"
+
     def test_move_on_title_change(self, tmp_root, blobs):
         body_digest = seed_blob(blobs, b"<p>x</p>")
         p_v1 = make_page(title="Old Title")
@@ -832,6 +1051,131 @@ class TestSubtreeScope:
         # p2 is outside → preserved.
         assert "p2" in state2.pages
 
+    def test_archived_subtree_does_not_prune_live_pages_regression(self, tmp_root, blobs):
+        """P0 regression: ``export --include-archived --path _archived`` must
+        NOT delete out-of-subtree LIVE pages.
+
+        The synthetic ``_archived`` subtree previously resolved
+        ``subtree_dir=None``; with a non-empty plan that disabled the
+        prune-scope guard and pruned every live page from a prior full export.
+        """
+        d = seed_blob(blobs, b"<p>x</p>")
+        live = make_page("lp", "Live Doc", status="current")
+        archived = make_page("ap", "Old Doc", status="archived")
+
+        # Full export including archived → prev state has both pages on disk.
+        snap1 = make_snapshot(
+            pages=[live, archived],
+            body_blobs={"lp": d, "ap": d},
+            include_archived=True,
+        )
+        _, state1 = build(tmp_root, snap1, blobs, None, default_opts())
+        assert {"lp", "ap"} <= set(state1.pages)
+        live_md = tmp_root / state1.pages["lp"].file
+        assert live_md.exists()
+
+        # Re-export scoped to the _archived subtree.
+        snap2 = make_snapshot(
+            pages=[live, archived],
+            body_blobs={"lp": d, "ap": d},
+            include_archived=True,
+        )
+        _, state2 = build(tmp_root, snap2, blobs, state1, default_opts(subtree="_archived"))
+
+        # The live page is OUTSIDE the subtree → must be preserved on disk
+        # and in state; only the archived subtree was in scope.
+        assert "lp" in state2.pages, "live page wrongly pruned by _archived subtree"
+        assert live_md.exists(), "live page .md wrongly deleted by _archived subtree"
+        assert "ap" in state2.pages
+
+    def test_scoped_export_preserves_reparented_out_page(self, tmp_root, blobs):
+        """BL-SCOPED-PRUNE-MOVEOUT: a --path export must NOT delete a live page
+        reparented OUT of the subtree (still present in the snapshot)."""
+        d = seed_blob(blobs, b"<p>x</p>")
+        root_p = make_page("root", "Root")
+        child = make_page("c", "Child", parent_id="root", parent_type="page")
+        snap1 = make_snapshot(pages=[root_p, child], body_blobs={"root": d, "c": d})
+        _, state1 = build(tmp_root, snap1, blobs, None, default_opts())
+        child_md = tmp_root / state1.pages["c"].file
+        assert child_md.exists()
+
+        # Child reparented to a sibling 'Other' (still live), scoped re-export of Root.
+        other = make_page("o", "Other")
+        child_moved = make_page("c", "Child", parent_id="o", parent_type="page")
+        snap2 = make_snapshot(
+            pages=[root_p, other, child_moved],
+            body_blobs={"root": d, "o": d, "c": d},
+        )
+        _, state2 = build(tmp_root, snap2, blobs, state1, default_opts(subtree="Root"))
+        assert "c" in state2.pages, "live reparented-out page wrongly pruned"
+        assert child_md.exists(), "live reparented-out page .md wrongly deleted"
+
+    def test_site_url_change_rewrites_pages(self, tmp_root, blobs):
+        """site_url is a frontmatter content input, so changing it must invalidate
+        the per-page skip and rewrite the stale url: line (not silently skip)."""
+        d = seed_blob(blobs, b"<p>x</p>")
+        page = make_page("p1", "Home", web_url="/spaces/SP/pages/1/Home")
+        snap1 = make_snapshot(pages=[page], body_blobs={"p1": d})
+        _, state1 = build(tmp_root, snap1, blobs, None, default_opts(site_url="https://a.atlassian.net"))
+
+        snap2 = make_snapshot(pages=[page], body_blobs={"p1": d})
+        result2, _ = build(tmp_root, snap2, blobs, state1, default_opts(site_url="https://b.atlassian.net"))
+        assert result2.skipped == 0, "site_url change must force a rewrite"
+        md = (tmp_root / "My-Space" / "Home" / "Home.md").read_text()
+        assert "b.atlassian.net" in md and "a.atlassian.net" not in md
+
+    def test_frontmatter_url_threaded_from_opts(self, tmp_root, blobs):
+        """The configured site_url reaches frontmatter (url is non-empty, /wiki-prefixed)."""
+        d = seed_blob(blobs, b"<p>x</p>")
+        page = make_page("p1", "Home", web_url="/spaces/SP/pages/1/Home")
+        snap = make_snapshot(pages=[page], body_blobs={"p1": d})
+        build(tmp_root, snap, blobs, None, default_opts(site_url="https://x.atlassian.net"))
+        md = (tmp_root / "My-Space" / "Home" / "Home.md").read_text()
+        assert "url: https://x.atlassian.net/wiki/spaces/SP/pages/1/Home" in md
+
+    def test_empty_resolved_subtree_prunes_in_scope_not_global(self, tmp_root, blobs):
+        """BL-I2-SUBTREE-GLOBAL: an empty-but-RESOLVED --path subtree (its only
+        page deleted upstream) must run the subtree-scoped prune — deleting the
+        in-scope page — not trigger the global I2 freeze that keeps everything."""
+        d = seed_blob(blobs, b"<p>x</p>")
+        folder = Folder(id="f", title="Docs", parent_id="", position=0)
+        inside = make_page("inside", "Inside", parent_id="f", parent_type="folder")
+        other = make_page("other", "Other")
+        snap1 = make_snapshot(
+            pages=[inside, other], folders=[folder],
+            body_blobs={"inside": d, "other": d},
+        )
+        _, s1 = build(tmp_root, snap1, blobs, None, default_opts())
+        inside_md = tmp_root / s1.pages["inside"].file
+        assert inside_md.exists()
+
+        # Inside deleted upstream (folder Docs survives); scoped export of Docs.
+        snap2 = make_snapshot(pages=[other], folders=[folder], body_blobs={"other": d})
+        _, s2 = build(tmp_root, snap2, blobs, s1, default_opts(subtree="Docs"))
+        assert "inside" not in s2.pages, "in-scope deleted page must be pruned"
+        assert not inside_md.exists(), "in-scope deleted page .md must be removed"
+        assert "other" in s2.pages, "out-of-scope page must be preserved"
+
+    def test_no_children_reexport_keeps_descendants(self, tmp_root, blobs):
+        """BL-2: a ``--path Parent --no-children`` re-export must NOT prune the
+        subtree's previously-exported descendants (scope-narrowing != delete)."""
+        d = seed_blob(blobs, b"<p>x</p>")
+        parent = make_page("par", "Parent")
+        child = make_page("ch", "Child", parent_id="par", parent_type="page")
+        snap1 = make_snapshot(pages=[parent, child], body_blobs={"par": d, "ch": d})
+        _, state1 = build(tmp_root, snap1, blobs, None, default_opts())
+        assert {"par", "ch"} <= set(state1.pages)
+        child_md = tmp_root / state1.pages["ch"].file
+        assert child_md.exists()
+
+        snap2 = make_snapshot(pages=[parent, child], body_blobs={"par": d, "ch": d})
+        _, state2 = build(
+            tmp_root, snap2, blobs, state1, default_opts(subtree="Parent", no_children=True)
+        )
+        assert "ch" in state2.pages, "descendant wrongly pruned by --no-children"
+        assert child_md.exists(), "descendant .md wrongly deleted by --no-children"
+        assert "par" in state2.pages
+
     def test_subtree_outside_pages_skipped_from_write(self, tmp_root, blobs):
         """Pages outside the subtree are not written (scope exclusion)."""
         d = seed_blob(blobs, b"<p>x</p>")
@@ -1230,6 +1574,59 @@ class TestDrawioHandling:
         assert len(render_calls) == 1  # Called once per build.
         assert render_calls[0] == "called"
 
+    def test_batch_render_no_cross_page_title_collision(self, tmp_root, blobs):
+        """BL-3: two pages each owning a same-TITLED but different-CONTENT diagram
+        must embed their OWN render, not collapse to a single shared PNG."""
+        xml_a = seed_blob(blobs, b"<xml>A</xml>")
+        xml_b = seed_blob(blobs, b"<xml>B</xml>")
+        body = seed_blob(blobs, b"<p>x</p>")
+        att_a = make_attachment("ax", "diagram.drawio", version=1, created_at="2024-01-02T00:00:00Z")
+        att_b = make_attachment("bx", "diagram.drawio", version=1, created_at="2024-01-02T00:00:00Z")
+        snap = make_snapshot(
+            pages=[make_page("p1", "Page A"), make_page("p2", "Page B")],
+            body_blobs={"p1": body, "p2": body},
+            attachments={"p1": [att_a], "p2": [att_b]},
+            attachment_blobs={"ax@1": xml_a, "bx@1": xml_b},
+        )
+
+        def fake_render_batch(xml_blobs, b):
+            # Real render_batch contract: keyed by xml content digest; render each
+            # distinct source to a distinct PNG blob.
+            return {key: b.add_bytes(b"PNG-" + b.read_bytes(dig)) for key, dig in xml_blobs.items()}
+
+        with patch("conex.drawio.render_batch", fake_render_batch):
+            build(tmp_root, snap, blobs, None, default_opts(media=True, render_drawio=True))
+
+        png_a = tmp_root / "My-Space" / "Page-A" / ".media" / "diagram.png"
+        png_b = tmp_root / "My-Space" / "Page-B" / ".media" / "diagram.png"
+        assert png_a.read_bytes() == b"PNG-<xml>A</xml>"
+        assert png_b.read_bytes() == b"PNG-<xml>B</xml>", "page B got page A's diagram (BL-3)"
+
+    def test_batch_render_filename_sanitized(self, tmp_root, blobs):
+        """BL-4: a drawio source whose title has path separators must yield a
+        sanitized PNG name inside the flat .media/ namespace, not a nested path."""
+        xml = seed_blob(blobs, b"<xml/>")
+        body = seed_blob(blobs, b"<p>x</p>")
+        att = make_attachment("ax", "sub/evil.drawio", version=1, created_at="2024-01-02T00:00:00Z")
+        snap = make_snapshot(
+            pages=[make_page("p1", "Page A")],
+            body_blobs={"p1": body},
+            attachments={"p1": [att]},
+            attachment_blobs={"ax@1": xml},
+        )
+
+        def fake_render_batch(xml_blobs, b):
+            return {key: b.add_bytes(b"PNG") for key in xml_blobs}
+
+        with patch("conex.drawio.render_batch", fake_render_batch):
+            build(tmp_root, snap, blobs, None, default_opts(media=True, render_drawio=True))
+
+        media = tmp_root / "My-Space" / "Page-A" / ".media"
+        # No nested directory escaped the flat .media namespace.
+        assert not (media / "sub").exists()
+        pngs = list(media.glob("*.png"))
+        assert pngs and all("/" not in p.name and p.parent == media for p in pngs)
+
     def test_batch_render_png_materialised_and_survives_gc(self, tmp_root, blobs):
         """Regression: batch-rendered PNG must land on disk under .media/ AND
         its blob must survive GC on the same build that produced it."""
@@ -1258,7 +1655,8 @@ class TestDrawioHandling:
         )
 
         def fake_run_drawio_render(snapshot, b, pages, opts):
-            return {"diagram.drawio": rendered_digest}
+            # _run_drawio_render is keyed by xml CONTENT digest (BL-3), not title.
+            return {xml_digest: rendered_digest}
 
         with patch("conex.build._run_drawio_render", fake_run_drawio_render):
             result, state = build(
@@ -1277,6 +1675,58 @@ class TestDrawioHandling:
         assert blobs.has(rendered_digest), (
             "batch-rendered PNG blob must survive GC on the same build that produced it"
         )
+
+    def test_moved_page_rendered_png_not_orphaned(self, tmp_root, blobs):
+        """Regression (reconciliation): a moved page's batch-rendered drawio PNG
+        is recorded as an owned path (PageState.rendered_media), so the move
+        deletes the old copy instead of leaking it forever at the old location.
+
+        The rendered PNG is not an attachment (it has no id), so before
+        rendered_media it was invisible to the ownership set and accumulated one
+        stale copy per move."""
+        xml_att = make_attachment(
+            "xml1", "diagram.drawio", version=1, created_at="2024-01-02T00:00:00Z",
+        )
+        body_d = seed_blob(blobs, b"<p>x</p>")
+        xml_digest = seed_blob(blobs, b"<xml/>")
+        rendered_digest = seed_blob(blobs, b"rendered_png_bytes_unique")
+
+        def fake_run_drawio_render(snapshot, b, pages, opts):
+            return {xml_digest: rendered_digest}
+
+        def snap_at(title):
+            return make_snapshot(
+                pages=[make_page(title=title)],
+                body_blobs={"p1": body_d},
+                attachments={"p1": [xml_att]},
+                attachment_blobs={"xml1@1": xml_digest},
+            )
+
+        # Build 1: page at "Page One".
+        with patch("conex.build._run_drawio_render", fake_run_drawio_render):
+            _, state1 = build(
+                tmp_root, snap_at("Page One"), blobs, None,
+                default_opts(media=True, render_drawio=True),
+            )
+        old_dir = tmp_root / state1.pages["p1"].dir
+        old_media = old_dir / ".media"
+        assert (old_media / "diagram.png").exists()
+        assert state1.pages["p1"].rendered_media == ["diagram.png"]
+
+        # Build 2: same page retitled "Page Two" → moves to a new dir.
+        with patch("conex.build._run_drawio_render", fake_run_drawio_render):
+            _, state2 = build(
+                tmp_root, snap_at("Page Two"), blobs, state1,
+                default_opts(media=True, render_drawio=True),
+            )
+        new_media = tmp_root / state2.pages["p1"].dir / ".media"
+        assert new_media != old_media, "test setup: page must actually move"
+        assert (new_media / "diagram.png").read_bytes() == b"rendered_png_bytes_unique"
+        assert not (old_media / "diagram.png").exists(), (
+            "moved page's rendered drawio PNG orphaned at the old location"
+        )
+        assert not old_dir.exists(), "emptied old page dir not removed after move"
+        assert state2.pages["p1"].rendered_media == ["diagram.png"]
 
 
 # ---------------------------------------------------------------------------
@@ -2011,10 +2461,13 @@ class TestDeferredCleanupSetDifference:
             f"state records file at {state_path} but it does not exist (state/disk divergence)"
         )
 
-        # The media file must NOT appear in result.deleted.
+        # The carried (new-location) media must NOT be staged for removal.
         deleted_strs = {str(p) for p in result2.deleted}
         assert str(new_media) not in deleted_strs, "carried media must NOT be in result.deleted"
-        assert str(old_media) not in deleted_strs, "old media path must NOT be in result.deleted"
+        # The page move is recorded; carrying the attachment from the immutable
+        # blob store to the new dir preserves the content (asserted above), and
+        # the old path's removal is the git-rename half of the move.
+        assert result2.moved, "the page move must be recorded in result.moved"
 
 
 # ---------------------------------------------------------------------------
@@ -2210,7 +2663,9 @@ class TestPruneSafetyAndMediaFalseMove:
 
         deleted_strs = {str(p) for p in result2.deleted}
         assert str(new_media) not in deleted_strs, "keep.png at new dir must NOT be in result.deleted"
-        assert str(old_media) not in deleted_strs, "keep.png at old dir must NOT be in result.deleted"
+        # The media is carried (preserved at the new dir, asserted above); the old
+        # path's removal is the git-rename half of the move, so the move is tracked.
+        assert result2.moved, "the page move must be recorded in result.moved"
 
     def test_move_with_media_false_dropped_attachment_spec_conformance(self, tmp_root, blobs):
         """DEFECT D / spec conformance: media=False + move + dropped attachment.
@@ -2270,9 +2725,9 @@ class TestPruneSafetyAndMediaFalseMove:
         )
 
         deleted_strs = {str(p) for p in result2.deleted}
-        assert str(old_media) not in deleted_strs, (
-            "old media path must NOT be in result.deleted with media=False"
-        )
         assert str(new_media) not in deleted_strs, (
             "new media path must NOT be in result.deleted with media=False"
         )
+        # The media is carried to the new dir (asserted above); the old path's
+        # removal is the git-rename half of the move, so the move is tracked.
+        assert result2.moved, "the page move must be recorded in result.moved"

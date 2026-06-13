@@ -69,6 +69,11 @@ class PageState(NullTolerantModel):
     status: str = "current"
     fingerprint: str = ""
     attachments: dict[str, AttachmentState] = {}
+    # Derived media filenames written into the page's .media/ that are NOT
+    # attachments (currently batch-rendered drawio PNGs).  Recorded so they are
+    # part of the page's owned-path set and the reconciliation deletes the old
+    # copy when the page moves or is pruned.
+    rendered_media: list[str] = []
 
 
 class ExportState(NullTolerantModel):
