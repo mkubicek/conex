@@ -40,3 +40,13 @@ class LockHeldError(ConexError):
 
 class GitError(ConexError):
     """Raised when a git subprocess call fails."""
+
+
+class StateError(ConexError):
+    """Raised when the on-disk export state is unsafe to reconcile against.
+
+    Covers a space-identity mismatch (the output directory holds a different
+    space's export) and a tampered tree (a symlinked page/media directory that
+    would redirect conex writes outside the export root).  Both abort the build
+    before any deletion so no data is destroyed.
+    """

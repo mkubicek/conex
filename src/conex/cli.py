@@ -370,6 +370,15 @@ def _run_export(args: argparse.Namespace, cfg: ResolvedConfig, output_dir: Path)
             raise ConexError(
                 "--cached specified but no snapshot found; run without --cached first"
             )
+        # The cached snapshot must be for the space being exported — otherwise
+        # build() would reconcile this space against another space's snapshot.
+        cached_key = (snapshot.space.key or "").strip()
+        if cached_key and cached_key != args.space_key.strip():
+            raise ConexError(
+                f"--cached snapshot is for space {cached_key!r} but this run "
+                f"targets {args.space_key!r}; re-run without --cached or point "
+                f"-o at that space's directory"
+            )
     else:
         api = make_api(cfg)
         prev_snapshot = snapshot_store.load()

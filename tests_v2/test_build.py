@@ -971,6 +971,82 @@ class TestI2Guard:
 
 
 # ---------------------------------------------------------------------------
+# Space-identity guard + symlink write-through defense (S1)
+# ---------------------------------------------------------------------------
+
+
+class TestSpaceIdentityGuard:
+    def test_cross_space_reconcile_aborts_without_deleting(self, tmp_root, blobs):
+        """Exporting space B into a dir holding space A must raise StateError
+        BEFORE any deletion — not prune A's entire export as 'absent'."""
+        from conex.errors import StateError
+
+        d = seed_blob(blobs, b"<p>a</p>")
+        space_a = make_space(id="SA", key="AAA")
+        snap_a = make_snapshot(pages=[make_page()], body_blobs={"p1": d}, space=space_a)
+        _, state_a = build(tmp_root, snap_a, blobs, None, default_opts())
+        existing = list((tmp_root / state_a.pages["p1"].dir).glob("*.md"))
+        assert existing, "space A export must exist before the cross-space run"
+
+        space_b = make_space(id="SB", key="BBB")
+        snap_b = make_snapshot(
+            pages=[make_page("p9", "Other")], body_blobs={"p9": d}, space=space_b
+        )
+        with pytest.raises(StateError) as exc:
+            build(tmp_root, snap_b, blobs, state_a, default_opts())
+        assert "AAA" in str(exc.value) and "BBB" in str(exc.value)
+        # A's files are untouched (abort happened before any reconcile delete).
+        assert existing[0].exists(), "space A export was deleted despite the guard"
+
+    def test_same_space_id_with_renamed_key_is_not_mismatch(self, tmp_root, blobs):
+        """A space renamed (same id, new key) must keep reconciling, not abort."""
+        d = seed_blob(blobs, b"<p>a</p>")
+        snap1 = make_snapshot(
+            pages=[make_page()], body_blobs={"p1": d}, space=make_space(id="SA", key="OLD"),
+        )
+        _, state1 = build(tmp_root, snap1, blobs, None, default_opts())
+        snap2 = make_snapshot(
+            pages=[make_page()], body_blobs={"p1": d}, space=make_space(id="SA", key="NEW"),
+        )
+        # Same id → no mismatch → builds cleanly.
+        _, state2 = build(tmp_root, snap2, blobs, state1, default_opts())
+        assert state2.space_key == "NEW"
+
+    def test_legacy_state_without_space_identity_not_rejected(self, tmp_root, blobs):
+        """Migrated/hand-written state with no recorded space must not abort."""
+        d = seed_blob(blobs, b"<p>a</p>")
+        snap1 = make_snapshot(pages=[make_page()], body_blobs={"p1": d})
+        _, state1 = build(tmp_root, snap1, blobs, None, default_opts())
+        # Simulate a legacy state that never recorded its space identity.
+        legacy = state1.model_copy(update={"space_key": "", "space_id": ""})
+        snap2 = make_snapshot(pages=[make_page()], body_blobs={"p1": d})
+        _, state2 = build(tmp_root, snap2, blobs, legacy, default_opts())
+        assert "p1" in state2.pages
+
+    def test_symlinked_page_dir_refused(self, tmp_root, blobs):
+        """A planted symlinked page dir must abort the build (S1), not be
+        written through to the symlink target outside the export."""
+        from conex.errors import StateError
+
+        d = seed_blob(blobs, b"<p>x</p>")
+        snap = make_snapshot(pages=[make_page()], body_blobs={"p1": d})
+        # Pre-create the planned page dir as a symlink to an outside target.
+        from conex.layout import plan_layout
+        plan = plan_layout(snap.space, snap.pages, snap.folders)
+        page_dir = tmp_root / str(plan.dirs["p1"])
+        outside = tmp_root.parent / "conex_symlink_escape_target"
+        outside.mkdir(parents=True, exist_ok=True)
+        page_dir.parent.mkdir(parents=True, exist_ok=True)
+        page_dir.symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(StateError) as exc:
+            build(tmp_root, snap, blobs, None, default_opts())
+        assert "symlink" in str(exc.value).lower()
+        # Nothing was written through the symlink into the outside target.
+        assert not any(outside.iterdir()), "wrote through a symlinked page dir"
+
+
+# ---------------------------------------------------------------------------
 # I3 archived preservation
 # ---------------------------------------------------------------------------
 

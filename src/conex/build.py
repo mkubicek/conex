@@ -125,6 +125,7 @@ from conex.convert import (
     build_frontmatter,
     convert_page,
 )
+from conex.errors import StateError
 from conex.layout import plan_layout
 from conex.models import Attachment, Page
 from conex.paths import plan_attachment_names, safe_attachment_name
@@ -459,6 +460,50 @@ def _dir_in_subtree(dir_str: str, subtree_prefix: str, no_children: bool) -> boo
     return dir_str == subtree_prefix or dir_str.startswith(subtree_prefix + "/")
 
 
+def _space_mismatch(prev: "ExportState", snapshot: "Snapshot") -> bool:
+    """True if ``prev`` describes a DIFFERENT space than ``snapshot``.
+
+    Compared by id first (stable across renames), then by key.  An empty
+    identity on either side is treated as 'unknown' — never a mismatch — so
+    legacy or hand-written state that never recorded a space is not falsely
+    rejected.  A real mismatch means the output directory holds another space's
+    export; reconciling would delete it as the complement of ownership.
+    """
+    pid, sid = prev.space_id.strip(), snapshot.space.id.strip()
+    if pid and sid:
+        return pid != sid
+    pk, sk = prev.space_key.strip(), snapshot.space.key.strip()
+    if pk and sk:
+        return pk != sk
+    return False
+
+
+def _assert_writable_dir(root_real: Path, dir_abs: Path) -> None:
+    """Refuse to write into a directory reached through a symlink (S1 posture).
+
+    conex never creates symlinks in an export tree, so a symlinked page/media
+    directory — or any symlinked ancestor that resolves outside the root — is a
+    sign of a planted redirect that would carry conex writes (and, worse, the
+    reconciliation's deletes) outside the export.  Mirrors v1's refusal of
+    symlinked page/media dirs, generalized to the multi-segment path via a
+    realpath containment check.  Raises before any mkdir/replace, so a tampered
+    tree aborts the build rather than being written or deleted through.
+    """
+    if dir_abs.is_symlink():
+        raise StateError(f"refusing to write through symlinked path: {dir_abs}")
+    try:
+        resolved = dir_abs.resolve()
+    except OSError:
+        return
+    try:
+        resolved.relative_to(root_real)
+    except ValueError as exc:
+        raise StateError(
+            f"refusing to write outside the export root via a symlinked "
+            f"ancestor: {dir_abs} resolves to {resolved}"
+        ) from exc
+
+
 def _page_owned_paths(root: Path, ps: "PageState") -> list[Path]:
     """Absolute paths a single PageState records as conex-owned output."""
     out: list[Path] = []
@@ -596,6 +641,7 @@ def build(
     conex_dir = root / ".conex"
     tmp_dir = conex_dir / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
+    root_real = root.resolve()
 
     # -----------------------------------------------------------------------
     # Step 1 — Layout
@@ -716,6 +762,10 @@ def build(
         planned_dir_abs = root / str(planned_dir_rel)
         planned_file_abs = root / str(planned_file_rel)
 
+        # S1: refuse a symlinked/escaping page dir before the FIRST write into
+        # it (the media phase below may mkdir(parents=True) through it).
+        _assert_writable_dir(root_real, planned_dir_abs)
+
         is_move = (
             prev is not None
             and pid in prev.pages
@@ -785,8 +835,10 @@ def build(
             if prev is not None and pid in prev.pages:
                 att_states = dict(prev.pages[pid].attachments)
         else:
-            # Ensure the media dir exists.
+            # Ensure the media dir exists.  S1: a .media symlink can be planted
+            # independently of a clean page dir, so check it too.
             media_dir = planned_dir_abs / ".media"
+            _assert_writable_dir(root_real, media_dir)
 
             for att in atts:
                 att_key = f"{att.id}@{att.version.number}"
@@ -902,7 +954,8 @@ def build(
         else:
             body_storage = ""
 
-        # Render markdown.
+        # Render markdown.  (planned_dir_abs was symlink-checked at the top of
+        # this iteration, before the media phase's first write into it.)
         planned_dir_abs.mkdir(parents=True, exist_ok=True)
         human_path = str(planned_dir_rel)
         frontmatter = build_frontmatter(
@@ -962,6 +1015,7 @@ def build(
             # so it enters _keep before the deferred old-media cleanup runs.
             if prev is not None and pid in prev.pages:
                 new_media_for_move = planned_dir_abs / ".media"
+                _assert_writable_dir(root_real, new_media_for_move)
                 written_cf = {str(p).casefold() for p in result.written}
                 for prev_att_id, prev_att_state in prev.pages[pid].attachments.items():
                     # Only carry attachments still tracked this run.  Attachments
@@ -1033,6 +1087,20 @@ def build(
     # -----------------------------------------------------------------------
     # Step 6 — Reconcile the filesystem to the new state
     # -----------------------------------------------------------------------
+
+    # Space-identity guard — the output directory must hold THIS space's export.
+    # Without it, exporting space B into a directory that holds space A's export
+    # makes every page of A absent from B's snapshot, and the reconciliation
+    # below deletes them as the complement of ownership (a quiet, easy-to-trigger
+    # data-loss path: `conex export B -o dir_of_A`).  Abort before any deletion.
+    if prev is not None and prev.pages and _space_mismatch(prev, snapshot):
+        raise StateError(
+            f"output directory holds an export of space "
+            f"{(prev.space_key or prev.space_id)!r} but this run targets space "
+            f"{(snapshot.space.key or snapshot.space.id)!r}; refusing to "
+            f"reconcile across spaces (it would delete the existing export). "
+            f"Use a different output directory."
+        )
 
     # Guards that ABORT the reconciliation entirely (return prev unchanged, no
     # deletions, no GC) — these are the only ways a reconcile is skipped.

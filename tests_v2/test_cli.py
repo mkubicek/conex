@@ -997,6 +997,34 @@ def test_cached_skips_pull(tmp_path):
     assert pull_calls == [], "pull() must not be called with --cached"
 
 
+def test_cached_space_mismatch_aborts(tmp_path, capsys):
+    """--cached snapshot for a different space must abort before build()."""
+    from conex.cli import main
+
+    snapshot = _make_mock_snapshot()  # space.key == "TS"
+    build_calls: list = []
+
+    with patch("conex.cli.resolve_config", return_value=_make_mock_cfg()), \
+         patch("conex.cli.ExportLock") as mock_lock_cls, \
+         patch("conex.cli._clear_tmp"), \
+         patch("conex.store.state.SnapshotStore.load", return_value=snapshot), \
+         patch("conex.store.state.StateStore.load", return_value=None), \
+         patch("conex.build.build", side_effect=lambda *a, **k: build_calls.append(a)):
+
+        mock_lock = MagicMock()
+        mock_lock.__enter__ = MagicMock(return_value=mock_lock)
+        mock_lock.__exit__ = MagicMock(return_value=False)
+        mock_lock_cls.return_value = mock_lock
+
+        with pytest.raises(SystemExit) as exc:
+            main(["export", "OTHER", "-o", str(tmp_path), "--cached"])
+        assert exc.value.code == 1
+
+    assert build_calls == [], "build() must not run on a cached space mismatch"
+    err = capsys.readouterr().err
+    assert "OTHER" in err and "TS" in err
+
+
 # ---------------------------------------------------------------------------
 # Test: find happy-path (covers BLOCKER — PurePosixPath must be importable)
 # ---------------------------------------------------------------------------
