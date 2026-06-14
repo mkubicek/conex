@@ -128,7 +128,12 @@ from conex.convert import (
 from conex.errors import StateError
 from conex.layout import plan_layout
 from conex.models import Attachment, Page
-from conex.paths import assert_within, plan_attachment_names, safe_attachment_name
+from conex.paths import (
+    assert_within,
+    durable_replace,
+    plan_attachment_names,
+    safe_attachment_name,
+)
 from conex.store.blobs import BlobStore
 from conex.store.state import (
     AttachmentState,
@@ -445,6 +450,15 @@ def _run_drawio_render(
         att_key = f"{xml_att.id}@{xml_att.version.number}"
         digest = snapshot.attachment_blobs.get(att_key)
         if digest:
+            # Reuse a previously-rendered PNG instead of shelling out to the
+            # (slow, Electron-based) drawio CLI again.  The cache is keyed by
+            # render version + xml content digest, so a changed diagram or a
+            # bumped renderer invalidates it; an unchanged one is skipped even
+            # when its page is being rewritten.
+            derived_key = f"drawio-png:v{_get_drawio_render_version()}:{digest}"
+            cached = snapshot.derived_blobs.get(derived_key)
+            if cached and blobs.has(cached):
+                continue
             # Key by CONTENT digest, not title: two pages can own diagrams with
             # the same filename but different content — a title-keyed map would
             # collapse them and embed one page's render into the other (BL-3).
@@ -694,13 +708,27 @@ def build(
     # Collect pages in plan order.
     plan_pages = [p for p in snapshot.pages if p.id in plan.dirs]
 
-    # Run drawio render once for all pages.
+    # Run drawio render once for all pages.  _run_drawio_render only renders
+    # diagrams whose PNG is not already cached in snapshot.derived_blobs, so a
+    # warm re-export shells out to the drawio CLI zero times.
     drawio_results: dict[str, str] = {}
     if opts.render_drawio and plan_pages:
         drawio_results = _run_drawio_render(snapshot, blobs, plan_pages, opts)
 
-    # All freshly-rendered PNG digests produced this run — they are not yet in
-    # snapshot.derived_blobs so they must be added to the GC keep set explicitly.
+    # Persist fresh renders into snapshot.derived_blobs (keyed by render version
+    # + xml content digest) so the next run reuses them.  pull carries
+    # derived_blobs forward, so the snapshot just needs re-saving once below.
+    snapshot_dirty = False
+    if drawio_results:
+        render_version = _get_drawio_render_version()
+        for xml_digest, png_digest in drawio_results.items():
+            snapshot.derived_blobs[
+                f"drawio-png:v{render_version}:{xml_digest}"
+            ] = png_digest
+        snapshot_dirty = True
+
+    # Freshly-rendered PNG digests produced this run (now also recorded in
+    # snapshot.derived_blobs); kept explicit for the GC keep set below.
     freshly_rendered_digests: set[str] = set(drawio_results.values())
 
     # Compute per-page name plans and fingerprints.
@@ -995,11 +1023,15 @@ def build(
         )
         md_body = convert_page(body_storage, ctx)
         md_content = frontmatter + md_body
+        # POSIX text files end with a newline (matches v1); also keeps the file
+        # from showing a no-newline-at-eof diff in git.
+        if not md_content.endswith("\n"):
+            md_content += "\n"
 
-        # Write .md via tmp + os.replace (I4).
+        # Write .md via tmp + crash-durable os.replace (I4/I6).
         md_tmp = tmp_dir / f"page-{pid}.md.tmp"
         md_tmp.write_text(md_content, encoding="utf-8")
-        os.replace(md_tmp, planned_file_abs)
+        durable_replace(md_tmp, planned_file_abs)
         result.written.append(planned_file_abs)
 
         # Write --include-html artifact.
@@ -1009,7 +1041,7 @@ def build(
             html_rel = str(planned_dir_rel / f"{planned_file_abs.stem}.html")
             html_tmp = tmp_dir / f"page-{pid}.html.tmp"
             html_tmp.write_text(body_storage, encoding="utf-8")
-            os.replace(html_tmp, html_path_abs)
+            durable_replace(html_tmp, html_path_abs)
             result.written.append(html_path_abs)
 
         # --- Step 4: Move .workspace after new artifacts are landed ---
@@ -1240,6 +1272,14 @@ def build(
     from conex.store.state import StateStore
 
     StateStore(root).save(new_state)
+
+    # Persist the snapshot too when fresh drawio renders were merged into
+    # derived_blobs, so the next run reuses the render cache instead of
+    # re-rendering every diagram.
+    if snapshot_dirty:
+        from conex.store.state import SnapshotStore
+
+        SnapshotStore(root).save(snapshot)
 
     # -----------------------------------------------------------------------
     # Step 8 — Blob GC (the abort guards above return before reaching here)

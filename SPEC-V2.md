@@ -409,6 +409,16 @@ pages AND folders: a folder is an internal node (a path segment dir, no
 parents resolve by id across the merged page+folder set; a folder whose
 parent is unknown surfaces as a root. Do NOT "port" v1's page-only logic.
 
+**MIGRATION NOTE — space-root directory level (intentional divergence):** v2
+roots every export at a `<Space-Name>/` directory (`out/<Space-Name>/Home/...`),
+whereas v1 rooted at the space homepage (`out/Home/...`). This is deliberate: it
+lets several spaces export into one output tree without colliding, and keeps the
+space identity visible on disk. Consequence for anyone re-exporting a v1 tree
+with v2: every file moves down one level, so `git log --follow` continuity and
+any path-based tooling break across the switch. To preserve history, start the
+v2 export in a fresh output directory (or `git mv` the old tree under the new
+space dir before the first v2 run).
+
 `subtree` ("/A/B"): segments match RAW TITLES case-insensitively (**PORT**
 v1 `find_node_by_path`, including first-match-wins among same-titled
 siblings — accepted behavior, do not "fix"). `plan_layout` resolves the

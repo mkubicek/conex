@@ -104,7 +104,7 @@ class FakeAPI:
                 return page.body_storage
         return ""
 
-    def get_folders(self, space_id: str) -> list[Folder]:
+    def get_folders(self, space_id: str, pages: list[Page]) -> list[Folder]:
         self.get_folders_calls.append(space_id)
         return list(self._folders)
 

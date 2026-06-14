@@ -31,6 +31,7 @@ are all pages; folder parents are invisible). Document this in callers.
 
 from __future__ import annotations
 
+import sys
 from urllib.parse import parse_qs, quote, urlparse
 
 import requests
@@ -140,12 +141,20 @@ class CookieV1API:
         storage = (body.get("storage") or {})
         return storage.get("value") or ""
 
-    def get_folders(self, space_id: str) -> list[Folder]:
-        """Return [] — v1 REST has no folder concept.
+    def get_folders(self, space_id: str, pages: list[Page]) -> list[Folder]:
+        """Return [] — v1 REST has no folder concept; warn loudly.
 
-        Callers that build the page tree will surface folder-parented pages
-        as roots (parent_id will resolve to nothing).
+        The legacy cookie/v1 API exposes no folders, so any folder-parented
+        page collapses to the space root (the hierarchy is silently flattened).
+        Emit a loud stderr warning so the user knows to use an API token for
+        the full hierarchy.  *pages* is accepted for protocol parity and unused.
         """
+        print(
+            "conex: warning: cookie/v1 auth cannot list folders — "
+            "folder-parented pages will appear at the space root "
+            "(use an API token / v2 dialect for the full hierarchy)",
+            file=sys.stderr,
+        )
         return []
 
     def get_attachments(self, page_id: str) -> list[Attachment]:

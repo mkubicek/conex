@@ -337,39 +337,63 @@ def test_get_page_body_missing_storage():
 # ---------------------------------------------------------------------------
 
 
-def _folder_row(fid: str = "F1", title: str = "Folder", parent: str = "S1") -> dict:
-    return {"id": fid, "title": title, "parentId": parent, "position": 0}
+# There is NO /spaces/{id}/folders endpoint — folders are discovered from the
+# page set via /folders/{id}, recursing on folder-parented folders.
 
 
-def test_get_folders():
-    payload = {"results": [_folder_row()], "_links": {}}
-    api = _make_api(FakeHttp({"/wiki/api/v2/spaces/S1/folders": payload}))
-    folders = api.get_folders("S1")
+def _page(pid: str, parent_id: str = "", parent_type: str = "") -> Page:
+    return Page(
+        id=pid,
+        title=pid,
+        space_id="S1",
+        parent_id=parent_id,
+        parent_type=parent_type,
+        version=PageVersion(number=1, created_at="2024-01-01T00:00:00Z"),
+    )
+
+
+def test_get_folders_discovers_from_page_parents():
+    api = _make_api(FakeHttp({
+        "/wiki/api/v2/folders/F1": {
+            "id": "F1", "title": "Folder", "parentId": "S1", "parentType": "space",
+        },
+    }))
+    pages = [_page("p1", parent_id="F1", parent_type="folder")]
+    folders = api.get_folders("S1", pages)
     assert len(folders) == 1
     assert folders[0].id == "F1"
     assert folders[0].title == "Folder"
-    assert folders[0].parent_id == "S1"
+    assert folders[0].parent_type == "space"
 
 
-def test_get_folders_multi_page():
-    f1 = _folder_row("F1")
-    f2 = _folder_row("F2")
-    responses = {
-        "/wiki/api/v2/spaces/S1/folders": {
-            "results": [f1],
-            "_links": {"next": "/wiki/api/v2/spaces/S1/folders?cursor=x"},
+def test_get_folders_recurses_folder_parents():
+    api = _make_api(FakeHttp({
+        "/wiki/api/v2/folders/F2": {
+            "id": "F2", "title": "Child", "parentId": "F1", "parentType": "folder",
         },
-        "cursor=x": {"results": [f2], "_links": {}},
-    }
-    api = _make_api(FakeHttp(responses))
-    folders = api.get_folders("S1")
-    assert len(folders) == 2
+        "/wiki/api/v2/folders/F1": {
+            "id": "F1", "title": "Parent", "parentId": "S1", "parentType": "space",
+        },
+    }))
+    pages = [_page("p1", parent_id="F2", parent_type="folder")]
+    folders = api.get_folders("S1", pages)
+    assert {f.id for f in folders} == {"F1", "F2"}
 
 
-def test_get_folders_null_results():
-    payload = {"results": None, "_links": {}}
-    api = _make_api(FakeHttp({"/wiki/api/v2/spaces/S1/folders": payload}))
-    assert api.get_folders("S1") == []
+def test_get_folders_empty_when_no_folder_parents():
+    # No page is folder-parented → no folder fetch at all (and no hit on a
+    # non-existent endpoint).
+    api = _make_api(FakeHttp({}))
+    assert api.get_folders("S1", [_page("p1")]) == []
+
+
+def test_get_folders_skips_unfetchable_folder():
+    # A folder id that 404s is skipped (best-effort), never fatal.
+    api = _make_api(FakeHttp({
+        "/wiki/api/v2/folders/F1": ApiError("not found", status=404),
+    }))
+    pages = [_page("p1", parent_id="F1", parent_type="folder")]
+    assert api.get_folders("S1", pages) == []
 
 
 # ---------------------------------------------------------------------------

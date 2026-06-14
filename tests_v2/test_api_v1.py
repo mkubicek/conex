@@ -326,7 +326,14 @@ def test_get_page_body_null_body():
 
 def test_get_folders_always_empty():
     api = _make_api(FakeHttp({}))
-    assert api.get_folders("S1") == []
+    assert api.get_folders("S1", []) == []
+
+
+def test_get_folders_warns_about_flattening(capsys):
+    api = _make_api(FakeHttp({}))
+    api.get_folders("S1", [])
+    err = capsys.readouterr().err.lower()
+    assert "folder" in err and "root" in err
 
 
 # ---------------------------------------------------------------------------

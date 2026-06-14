@@ -40,11 +40,13 @@ from conex.convert import CONVERTER_VERSION
 from conex.models import Attachment, Folder, Page, PageVersion, Space
 from conex.paths import plan_attachment_names
 from conex.store.blobs import BlobStore
+from conex.build import _get_drawio_render_version
 from conex.store.state import (
     AttachmentState,
     ExportState,
     PageState,
     Snapshot,
+    SnapshotStore,
 )
 
 
@@ -2897,3 +2899,83 @@ class TestMaterializeFailureRetry:
         assert state2.pages["p1"].fingerprint != "", (
             "a healed page must persist a real fingerprint so future runs can skip"
         )
+
+
+# ---------------------------------------------------------------------------
+# draw.io render cache: persist derived_blobs + don't re-render when cached
+# ---------------------------------------------------------------------------
+
+
+class TestDrawioRenderCache:
+    def test_fresh_render_persisted_to_snapshot(self, tmp_root, blobs):
+        """A fresh render is written into snapshot.derived_blobs AND the snapshot
+        is re-saved, so the next run can reuse it (the cache was empty before)."""
+        body = seed_blob(blobs, b"<p>x</p>")
+        xml_digest = seed_blob(blobs, b"<xml/>")
+        rendered = seed_blob(blobs, b"rendered_png")
+        xml_att = make_attachment(
+            "xml1", "diagram.drawio", version=1, created_at="2024-01-02T00:00:00Z"
+        )
+        snap = make_snapshot(
+            pages=[make_page("p1", "Doc")],
+            body_blobs={"p1": body},
+            attachments={"p1": [xml_att]},
+            attachment_blobs={"xml1@1": xml_digest},
+        )
+
+        def fake_run(snapshot, blobs_, pages, opts):
+            return {xml_digest: rendered}
+
+        with patch("conex.build._run_drawio_render", fake_run):
+            build(tmp_root, snap, blobs, None, default_opts(media=True, render_drawio=True))
+
+        persisted = SnapshotStore(tmp_root).load()
+        key = f"drawio-png:v{_get_drawio_render_version()}:{xml_digest}"
+        assert persisted is not None
+        assert persisted.derived_blobs.get(key) == rendered, (
+            "fresh drawio render must be persisted to snapshot.derived_blobs"
+        )
+
+    def test_cached_render_does_not_invoke_render_batch(self, tmp_root, blobs, monkeypatch):
+        """When the diagram is already in derived_blobs, the (slow) drawio CLI is
+        never invoked — the real _run_drawio_render skips it via the cache."""
+        body = seed_blob(blobs, b"<p>x</p>")
+        xml_digest = seed_blob(blobs, b"<xml/>")
+        rendered = seed_blob(blobs, b"rendered_png")
+        key = f"drawio-png:v{_get_drawio_render_version()}:{xml_digest}"
+        xml_att = make_attachment(
+            "xml1", "diagram.drawio", version=1, created_at="2024-01-02T00:00:00Z"
+        )
+        snap = make_snapshot(
+            pages=[make_page("p1", "Doc")],
+            body_blobs={"p1": body},
+            attachments={"p1": [xml_att]},
+            attachment_blobs={"xml1@1": xml_digest},
+            derived_blobs={key: rendered},  # already cached from a prior run
+        )
+
+        calls: list = []
+
+        def fake_render_batch(xml_blobs, blobs_):
+            calls.append(xml_blobs)
+            return {d: rendered for d in xml_blobs}
+
+        monkeypatch.setattr("conex.drawio.render_batch", fake_render_batch)
+        build(tmp_root, snap, blobs, None, default_opts(media=True, render_drawio=True))
+        assert calls == [], "cached diagram must not trigger a drawio CLI render"
+
+
+# ---------------------------------------------------------------------------
+# Markdown trailing newline (v1 parity)
+# ---------------------------------------------------------------------------
+
+
+class TestMarkdownTrailingNewline:
+    def test_md_file_ends_with_newline(self, tmp_root, blobs):
+        body = seed_blob(blobs, b"<p>hello</p>")
+        snap = make_snapshot(
+            pages=[make_page("p1", "T")], body_blobs={"p1": body}
+        )
+        build(tmp_root, snap, blobs, None, default_opts())
+        md = tmp_root / "My-Space" / "T" / "T.md"
+        assert md.read_text(encoding="utf-8").endswith("\n")

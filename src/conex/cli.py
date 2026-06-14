@@ -268,7 +268,7 @@ def _cmd_tree(args: argparse.Namespace) -> None:
         api = make_api(cfg)
         space = api.get_space(args.space_key)
         pages = api.get_pages(space.id, space.key, include_archived=False)
-        folders = api.get_folders(space.id)
+        folders = api.get_folders(space.id, pages)
     except ConexError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -281,22 +281,31 @@ def _cmd_tree(args: argparse.Namespace) -> None:
 
 
 def _print_tree(space, pages, folders, plan) -> None:
-    """Print a depth-first tree to stdout."""
-    # Build id → title map for display.
+    """Print a depth-first tree (folders AND pages) to stdout.
+
+    Folders are internal nodes (plan.folder_dirs); pages are leaves
+    (plan.dirs).  Both are merged and sorted by their on-disk path, which is a
+    valid DFS pre-order because a child's path is its parent's path + "/child".
+    """
     id_to_title: dict[str, str] = {p.id: p.title for p in pages}
+    for f in folders:
+        id_to_title[f.id] = f.title
 
-    # Depth: path has 1 slash per level above root ("Space/Page" = depth 0,
-    # "Space/Parent/Child" = depth 1).  Subtract 1 to anchor roots at 0.
-    items = []
-    for pid in plan.order:
-        title = id_to_title.get(pid, pid)
-        path_str = str(plan.dirs[pid])
+    # (path_str, is_folder, title) for every node that gets a directory.
+    nodes: list[tuple[str, bool, str]] = []
+    for pid, dpath in plan.dirs.items():
+        path_str = str(dpath)
+        nodes.append((path_str, False, id_to_title.get(pid, path_str.rsplit("/", 1)[-1])))
+    for fid, dpath in plan.folder_dirs.items():
+        path_str = str(dpath)
+        nodes.append((path_str, True, id_to_title.get(fid, path_str.rsplit("/", 1)[-1])))
+    nodes.sort(key=lambda n: n[0])
+
+    # Depth: 1 slash per level above the space root ("Space/Page" = depth 0,
+    # "Space/Folder/Child" = depth 1).  Folders get a trailing "/" marker.
+    for path_str, is_folder, title in nodes:
         depth = max(0, path_str.count("/") - 1)
-        items.append((depth, title))
-
-    for depth, title in items:
-        indent = "  " * depth
-        print(f"{indent}{title}")
+        print(f"{'  ' * depth}{title}{'/' if is_folder else ''}")
 
 
 def _cmd_find(args: argparse.Namespace) -> None:
@@ -316,7 +325,7 @@ def _cmd_find(args: argparse.Namespace) -> None:
         api = make_api(cfg)
         space = api.get_space(args.space_key)
         pages = api.get_pages(space.id, space.key, include_archived=False)
-        folders = api.get_folders(space.id)
+        folders = api.get_folders(space.id, pages)
     except ConexError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)

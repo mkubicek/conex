@@ -1360,3 +1360,32 @@ def test_keyboard_interrupt_releases_lock(tmp_path):
     with ExportLock(tmp_path):
         acquired = True
     assert acquired, "ExportLock must be released after KeyboardInterrupt"
+
+
+# ---------------------------------------------------------------------------
+# tree display: folders are shown and pages nest under them
+# ---------------------------------------------------------------------------
+
+
+def test_print_tree_shows_folders_nested(capsys):
+    from conex.cli import _print_tree
+    from conex.layout import plan_layout
+    from conex.models import Folder, Page, PageVersion, Space
+
+    space = Space(id="S1", key="SP", name="My Space")
+    folders = [Folder(id="F1", title="Docs", parent_id="", parent_type="space")]
+    ver = PageVersion(number=1, created_at="2024-01-01T00:00:00Z")
+    pages = [
+        Page(id="p1", title="Top", space_id="S1", version=ver),
+        Page(id="p2", title="Inside", space_id="S1",
+             parent_id="F1", parent_type="folder", version=ver),
+    ]
+    plan = plan_layout(space, pages, folders)
+    _print_tree(space, pages, folders, plan)
+
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+    docs = next(ln for ln in lines if ln.strip() == "Docs/")
+    inside = next(ln for ln in lines if ln.strip() == "Inside")
+    # Folder shown with a trailing marker at top level; its page nests deeper.
+    assert not docs.startswith(" ")
+    assert inside.startswith("  ")

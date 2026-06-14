@@ -112,15 +112,12 @@ def pull(
     space = api.get_space(space_key)
 
     # ------------------------------------------------------------------
-    # 3. List folders and pages (parallel)
+    # 3. List pages, then discover folders from the page set
     # ------------------------------------------------------------------
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        folders_future = executor.submit(api.get_folders, space.id)
-        pages_future = executor.submit(
-            api.get_pages, space.id, space_key, effective_archived
-        )
-        folders = folders_future.result()
-        pages = pages_future.result()
+    # Folder discovery is derived from the pages (there is no list-folders
+    # endpoint in v2), so pages must come first.
+    pages = api.get_pages(space.id, space_key, effective_archived)
+    folders = api.get_folders(space.id, pages)
 
     # ------------------------------------------------------------------
     # 4. Fetch missing page bodies in parallel
@@ -176,23 +173,32 @@ def pull(
     # ------------------------------------------------------------------
     attachments: dict[str, list[Attachment]] = {}
     listing_complete = True
-    for page in pages:
+
+    def _list_one(page: Page) -> tuple[str, list[Attachment] | None]:
+        # Best-effort: a single page's attachment listing failing must not abort
+        # the whole export.  Return None to mark the snapshot incomplete (so the
+        # build never treats the partial listing as authoritative and prunes
+        # existing media).
         try:
-            atts = api.get_attachments(page.id)
+            return page.id, api.get_attachments(page.id)
         except Exception as exc:
-            # Best-effort: a single page's attachment listing failing must not
-            # abort the whole export.  Warn, mark the snapshot incomplete (so the
-            # build never treats the partial listing as authoritative and prunes
-            # existing media), and continue.
             print(
                 f"conex: warning: failed to list attachments for page "
                 f"'{page.title}' ({page.id}): {exc}",
                 file=sys.stderr,
             )
-            listing_complete = False
-            continue
-        if atts:
-            attachments[page.id] = atts
+            return page.id, None
+
+    # Parallel listing: one round-trip per page, run through the shared worker
+    # pool (the serial version dominated wall-clock on large trees).
+    with ThreadPoolExecutor(max_workers=opts.workers) as executor:
+        futures = {executor.submit(_list_one, p): p for p in pages}
+        for future in as_completed(futures):
+            page_id, atts = future.result()
+            if atts is None:
+                listing_complete = False
+            elif atts:
+                attachments[page_id] = atts
 
     # ------------------------------------------------------------------
     # 6. Download attachment binaries

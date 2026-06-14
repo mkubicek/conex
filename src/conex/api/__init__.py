@@ -6,7 +6,8 @@ satisfy. make_api dispatches on cfg.dialect and returns the appropriate adapter.
 Contract:
 - Adapters return MODELS ONLY (conex.models); no raw dicts escape this layer.
 - download() accepts only absolute URLs; the adapter builds them.
-- get_folders() returns [] for COOKIE_V1 (v1 REST has no folder concept).
+- get_folders(space_id, pages) discovers folders from the page set (there is no
+  "list folders in a space" endpoint); returns [] for COOKIE_V1.
 - get_pages() includes body_storage when the dialect supports it in-listing
   (v2 body-format=storage); otherwise body_storage == "" and pull fetches
   them individually via get_page_body().
@@ -66,10 +67,14 @@ class ConfluenceAPI(Protocol):
         """
         ...
 
-    def get_folders(self, space_id: str) -> list[Folder]:
-        """Return all folders in the space.
+    def get_folders(self, space_id: str, pages: list[Page]) -> list[Folder]:
+        """Return the folders that appear as ancestors of *pages*.
 
-        Returns [] for COOKIE_V1 (v1 REST has no folder concept).
+        The Confluence v2 API has no "list folders in a space" endpoint, so
+        folders are discovered from the page set: any page with
+        ``parent_type == "folder"`` has a folder parent, fetched via
+        ``GET /folders/{id}`` and recursed (a folder's parent may itself be a
+        folder).  Returns [] for COOKIE_V1 (v1 REST has no folder concept).
         """
         ...
 

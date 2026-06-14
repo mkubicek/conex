@@ -3,10 +3,16 @@
 Endpoints (doc-verified):
   /wiki/api/v2/spaces?keys=<key>
   /wiki/api/v2/spaces/{id}/pages?body-format=storage   (cursor pagination)
-  /wiki/api/v2/spaces/{id}/folders                     (cursor pagination)
+  /wiki/api/v2/folders/{id}                             (single folder by id)
   /wiki/api/v2/pages/{id}/attachments                  (cursor pagination)
   /wiki/api/v2/pages/{id}?body-format=storage          (per-page body fetch)
   /wiki/rest/api/user?accountId=<id>                   (user lookup, v1 path)
+
+There is NO "list folders in a space" endpoint (a v1-rewrite assumed
+/spaces/{id}/folders, which 404s).  Folders are discovered from the page set:
+pages carry parentType/parentId, so a page with parentType == "folder" names a
+folder id; each is fetched via /folders/{id} and recursed (a folder's parent may
+itself be a folder) to build the folder closure.
 
 Pagination: all list endpoints use cursor-based pagination via _links.next.
 The shared _paginate helper guards against malformed envelopes (null results
@@ -124,11 +130,48 @@ class CloudV2API:
         storage = (body.get("storage") or {})
         return storage.get("value") or ""
 
-    def get_folders(self, space_id: str) -> list[Folder]:
-        """Return all folders in the space."""
-        path = f"/wiki/api/v2/spaces/{space_id}/folders"
-        rows = self._paginate(path, {"limit": "250"})
-        return [_folder_from_v2(r) for r in rows]
+    def get_folders(self, space_id: str, pages: list[Page]) -> list[Folder]:
+        """Discover the folder closure for *pages* (see module docstring).
+
+        Seeds from pages whose ``parent_type == "folder"``, fetches each folder
+        by id, and recurses on folder-parented folders until the closure is
+        complete.  A folder that cannot be fetched (e.g. a stale 404) is skipped
+        (best-effort) so one missing folder never aborts the export.
+        """
+        seed = {
+            p.parent_id
+            for p in pages
+            if p.parent_type == "folder" and p.parent_id
+        }
+        discovered: dict[str, dict] = {}
+        frontier = set(seed)
+        while frontier:
+            current, frontier = frontier, set()
+            for fid in current:
+                if fid in discovered:
+                    continue
+                data = self._get_folder_raw(fid)
+                if data is None:
+                    continue
+                discovered[fid] = data
+                if (data.get("parentType") or "") == "folder":
+                    parent = str(data.get("parentId") or "")
+                    if parent and parent not in discovered:
+                        frontier.add(parent)
+        return [_folder_from_v2(d) for d in discovered.values()]
+
+    def _get_folder_raw(self, folder_id: str) -> dict | None:
+        """Fetch one folder by id; return None if it cannot be retrieved.
+
+        A 404 (folder removed) is swallowed to None; AuthError propagates so a
+        real credential problem is not silently turned into a missing folder.
+        """
+        try:
+            return self._http.get_json(
+                self._base + f"/wiki/api/v2/folders/{folder_id}"
+            )
+        except ApiError:
+            return None
 
     def get_attachments(self, page_id: str) -> list[Attachment]:
         """Return all attachments for page_id."""
@@ -234,6 +277,7 @@ def _folder_from_v2(data: dict) -> Folder:
         id=str(data.get("id") or ""),
         title=data.get("title") or "",
         parent_id=str(data.get("parentId") or ""),
+        parent_type=str(data.get("parentType") or ""),
         position=data.get("position") or 0,
     )
 

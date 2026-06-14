@@ -327,7 +327,7 @@ class FakeConfluenceAPI:
             raise ApiError(f"page {page_id!r} not found", status=404)
         return fp.body
 
-    def get_folders(self, space_id: str) -> list[Folder]:
+    def get_folders(self, space_id: str, pages: list[Page]) -> list[Folder]:
         return []
 
     def get_attachments(self, page_id: str) -> list[Attachment]:

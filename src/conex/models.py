@@ -131,6 +131,7 @@ class Folder(ApiModel):
     id: str = ""
     title: str = ""
     parent_id: str = ""
+    parent_type: str = ""
     position: int = 0
 
 
