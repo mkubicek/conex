@@ -1367,6 +1367,16 @@ def test_keyboard_interrupt_releases_lock(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_version_flag(capsys):
+    from conex.cli import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--version"])
+    assert exc_info.value.code == 0
+    out = capsys.readouterr().out
+    assert out.startswith("conex 2.")
+
+
 def test_print_tree_shows_folders_nested(capsys):
     from conex.cli import _print_tree
     from conex.layout import plan_layout

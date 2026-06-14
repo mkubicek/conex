@@ -47,6 +47,7 @@ from conex.config import (
     save_local_config,
     configure as config_configure,
 )
+from conex import __version__
 from conex.errors import ConexError, GitError, LockHeldError, StateError
 from conex.store.lock import ExportLock
 
@@ -670,6 +671,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="conex",
         description="LLM-ready Confluence page tree exporter (v2)",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"conex {__version__}",
     )
 
     # Global connection/auth flags (v1 parity)

@@ -1,7 +1,7 @@
 [project]
-name = "confluence-export"
-version = "0.1.0"
-description = "LLM-ready Confluence page tree exporter"
+name = "conex"
+version = "2.0.0"
+description = "conex — LLM-ready Confluence page tree exporter (v2 rewrite; bundles the legacy confluence-export CLI)"
 requires-python = ">=3.11"
 dependencies = [
     "requests>=2.31",
