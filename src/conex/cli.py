@@ -589,7 +589,12 @@ def _run_diff(
     api = make_api(cfg)
     prev_snapshot = snapshot_store.load()
     pull_opts = PullOptions(include_archived=include_archived, fetch_media=False)
-    snapshot = pull(api, args.space_key, output_dir, blobs, prev_snapshot, pull_opts)
+    # diff is read-only: do NOT persist the snapshot (saving a fetch_media=False /
+    # include_archived snapshot would silently corrupt a later `export --cached`).
+    snapshot = pull(
+        api, args.space_key, output_dir, blobs, prev_snapshot, pull_opts,
+        persist=False,
+    )
 
     prev_state = state_store.load()
     if prev_state is None:
@@ -633,6 +638,10 @@ def _report_diff(snapshot, prev_state, args) -> None:
     changed = set()
     moved = set()
 
+    # Index once (O(n)) instead of a linear scan per common id (O(n^2) on a
+    # multi-thousand-page space for an interactive command).
+    snap_by_id = {p.id: p for p in snapshot.pages}
+
     for pid in current_ids & prev_ids:
         prev_ps = prev_state.pages[pid]
         planned_dir = str(plan.dirs[pid])
@@ -640,7 +649,7 @@ def _report_diff(snapshot, prev_state, args) -> None:
             moved.add(pid)
 
         # Check version change
-        snap_page = next((p for p in snapshot.pages if p.id == pid), None)
+        snap_page = snap_by_id.get(pid)
         if snap_page and snap_page.version.number != prev_ps.version:
             changed.add(pid)
 

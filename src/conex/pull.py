@@ -16,7 +16,8 @@ Contracts:
   opts.author_lookup is False the lookup is skipped entirely and users == {}.
 - include_archived=True with api.returns_archived==False: warn to stderr,
   record snapshot.include_archived = False (I3 depends on this truth).
-- The snapshot is saved atomically via SnapshotStore at the end.
+- The snapshot is saved atomically via SnapshotStore at the end, unless
+  persist=False (read-only callers like `diff`).
 """
 
 from __future__ import annotations
@@ -70,6 +71,8 @@ def pull(
     blobs: BlobStore,
     prev: Snapshot | None,
     opts: PullOptions,
+    *,
+    persist: bool = True,
 ) -> Snapshot:
     """Fetch space data and materialise a Snapshot.
 
@@ -87,7 +90,7 @@ def pull(
     6. Carry prev.derived_blobs forward verbatim.
     7. Prefetch author display names for unique author_ids (page + attachment
        versions) in parallel; skip when opts.author_lookup is False.
-    8. Save snapshot atomically via SnapshotStore.
+    8. Save snapshot atomically via SnapshotStore (skipped when persist=False).
 
     Returns the new Snapshot.
 
@@ -360,7 +363,10 @@ def pull(
         warnings=pull_warnings,
     )
 
-    store = SnapshotStore(root)
-    store.save(snapshot)
+    # persist=False keeps pull non-mutating (used by `diff`, which is documented
+    # read-only — saving would corrupt a later `export --cached`).
+    if persist:
+        store = SnapshotStore(root)
+        store.save(snapshot)
 
     return snapshot

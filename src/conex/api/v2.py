@@ -172,8 +172,15 @@ class CloudV2API:
             return self._http.get_json(
                 self._base + f"/wiki/api/v2/folders/{folder_id}"
             )
-        except ApiError:
-            return None
+        except ApiError as exc:
+            # ONLY a genuine 404 (folder removed) is "absent" → None. A transient
+            # 5xx / retry-exhausted 429 / network error must NOT be silently
+            # turned into a missing folder: that would collapse folder-parented
+            # pages to the space root and drive a spurious mass reorganization.
+            # Re-raise so the export aborts loudly instead.
+            if exc.status == 404:
+                return None
+            raise
 
     def get_attachments(self, page_id: str) -> list[Attachment]:
         """Return all attachments for page_id."""
@@ -214,12 +221,19 @@ class CloudV2API:
                 + f"/wiki/rest/api/content/{att.page_id}"
                 f"/child/attachment/{att.id}/download"
             )
-        # Fallback: resolve download_url against api_base_url
+        # Fallback: resolve download_url against api_base_url.
+        # download_url is API-controlled (_links.download), and the HTTP layer
+        # attaches the session's auth headers (token/cookie) to every request —
+        # so an absolute URL to a foreign host would exfiltrate the credential.
+        # Accept ONLY a same-origin https absolute URL or a site-relative path;
+        # refuse anything else (pull warns + skips the attachment).
         dl = att.download_url
         if not dl:
             return ""
         if dl.startswith("http://") or dl.startswith("https://"):
-            return dl
+            if dl.startswith("https://") and urlparse(dl).netloc == urlparse(self._base).netloc:
+                return dl
+            return ""
         if not dl.startswith("/wiki"):
             dl = "/wiki" + dl
         return self._base + dl

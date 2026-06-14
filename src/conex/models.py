@@ -21,6 +21,7 @@ Contract for ApiModel:
 
 from __future__ import annotations
 
+import types
 import typing
 from typing import Any, get_args, get_origin
 
@@ -81,7 +82,11 @@ def _is_str_field(model_cls: type[BaseModel], field_name: str) -> bool:
     if ann is str:
         return True
     origin = get_origin(ann)
-    if origin is typing.Union:
+    # typing.Union covers Optional[str]/Union[str, ...]; types.UnionType covers
+    # the PEP 604 `str | None` syntax used throughout this codebase (get_origin
+    # returns a DIFFERENT object for the two, so both must be checked or the
+    # int->str coercion silently stops firing for `str | None` fields).
+    if origin is typing.Union or origin is types.UnionType:
         return str in get_args(ann)
     return False
 

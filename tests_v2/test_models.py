@@ -526,3 +526,20 @@ def test_int_coerced_to_str(model_cls, field, int_val):
     value = getattr(instance, field)
     assert isinstance(value, str)
     assert value == str(int_val)
+
+
+# ---------------------------------------------------------------------------
+# PEP 604 union coercion (str | None must still coerce int ids to str)
+# ---------------------------------------------------------------------------
+
+
+def test_pep604_str_or_none_field_coerces_int():
+    """`str | None` (get_origin -> types.UnionType, not typing.Union) must still
+    trigger the int->str coercion, else a v1 numeric id crashes pydantic."""
+    from conex.models import NullTolerantModel
+
+    class _M(NullTolerantModel):
+        x: str | None = ""
+
+    assert _M(x=123).x == "123"
+    assert _M(x=None).x == ""  # null tolerance still applies

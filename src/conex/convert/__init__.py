@@ -116,11 +116,11 @@ def convert_page(body_storage: str, ctx: ConvertContext) -> str:
     The pipeline is the 8-pass render.preprocess_storage_xhtml + pass 8
     (markdownify + whitespace normalisation + single-H1 rule).
     """
-    from conex.convert.render import preprocess_storage_xhtml, _pass_markdownify
-    from bs4 import BeautifulSoup
+    from conex.convert.render import preprocess_to_soup, _pass_markdownify
 
-    processed_html = preprocess_storage_xhtml(body_storage, ctx)
-    soup = BeautifulSoup(processed_html, "html.parser")
+    # Hand the live soup straight to markdownify — no serialize + re-parse round
+    # trip (the dominant per-page CPU cost at 10k+ page scale).
+    soup = preprocess_to_soup(body_storage, ctx)
     return _pass_markdownify(soup, ctx.page.title)
 
 

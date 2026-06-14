@@ -166,6 +166,45 @@ def test_clear_tmp_idempotent(tmp_path):
     assert (tmp_path / ".conex" / "tmp").is_dir()
 
 
+def test_clear_tmp_preserves_blobs_and_state(tmp_path):
+    """_clear_tmp must clear ONLY .conex/tmp — never the blob store or state.json.
+    A regression that rmtree'd .conex/ would destroy the crash-safe export data."""
+    from conex.cli import _clear_tmp
+
+    conex = tmp_path / ".conex"
+    (conex / "blobs" / "aa").mkdir(parents=True)
+    (conex / "blobs" / "aa" / "deadbeef").write_bytes(b"blob")
+    (conex / "state.json").write_text('{"schema_version": 1}', encoding="utf-8")
+    (conex / "tmp").mkdir()
+    (conex / "tmp" / "stale").write_text("x", encoding="utf-8")
+
+    _clear_tmp(tmp_path)
+
+    assert (conex / "blobs" / "aa" / "deadbeef").read_bytes() == b"blob"
+    assert (conex / "state.json").exists()
+    assert not (conex / "tmp" / "stale").exists()
+    assert (conex / "tmp").is_dir()
+
+
+def test_clear_tmp_refuses_symlinked_conex(tmp_path):
+    """A planted `.conex -> elsewhere` symlink must not be rmtree'd through —
+    that would escape the export root."""
+    from conex.cli import _clear_tmp
+    from conex.errors import StateError
+
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "tmp").mkdir(parents=True)
+    victim = elsewhere / "tmp" / "precious"
+    victim.write_text("do not delete", encoding="utf-8")
+    root = tmp_path / "export"
+    root.mkdir()
+    (root / ".conex").symlink_to(elsewhere, target_is_directory=True)
+
+    with pytest.raises(StateError, match="symlink"):
+        _clear_tmp(root)
+    assert victim.exists(), "must not delete through the symlinked .conex"
+
+
 # ---------------------------------------------------------------------------
 # Test: --cached without snapshot → clean error, exit 1
 # ---------------------------------------------------------------------------
@@ -793,10 +832,12 @@ def test_export_summary_line(tmp_path, capsys):
 
     captured = capsys.readouterr()
     out = captured.out
-    # Summary must include the word "written", "skipped", "moved", "pruned"
-    assert "written" in out.lower() or "2" in out
-    assert "skipped" in out.lower() or "3" in out
-    assert "moved" in out.lower() or "1" in out
+    # The summary must report the ACTUAL counts (written=2, skipped=3, moved=1,
+    # pruned=1 from the mocked result/state above), not just the labels.
+    assert "2 written" in out
+    assert "3 skipped" in out
+    assert "1 moved" in out
+    assert "1 pruned" in out
 
 
 # ---------------------------------------------------------------------------

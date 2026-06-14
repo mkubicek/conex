@@ -526,10 +526,20 @@ def _pass_user_mentions(soup: BeautifulSoup, ctx: "ConvertContext") -> None:
 
 
 def preprocess_storage_xhtml(html: str, ctx: "ConvertContext") -> str:
-    """Run all 8 passes over storage XHTML and return the processed HTML.
+    """Run all 8 passes over storage XHTML and return the processed HTML string.
 
-    This function is the primary conversion pipeline; convert_page() calls it
-    and then applies markdownify + frontmatter assembly.
+    Kept for callers/tests that want the HTML string; convert_page() uses
+    :func:`preprocess_to_soup` directly to avoid a redundant serialize+re-parse.
+    """
+    return str(preprocess_to_soup(html, ctx))
+
+
+def preprocess_to_soup(html: str, ctx: "ConvertContext") -> BeautifulSoup:
+    """Run all 8 passes over storage XHTML and return the live BeautifulSoup.
+
+    Returning the soup (rather than ``str(soup)``) lets convert_page hand it
+    straight to markdownify — avoiding one full serialize + one full re-parse
+    per page, the dominant per-page CPU cost on a large export.
     """
     soup = BeautifulSoup(html, "html.parser")
 
@@ -571,4 +581,4 @@ def preprocess_storage_xhtml(html: str, ctx: "ConvertContext") -> str:
     # Pass 7: Inline elements + final cleanup
     _pass_inline(soup)
 
-    return str(soup)
+    return soup

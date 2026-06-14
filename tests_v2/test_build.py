@@ -1054,6 +1054,32 @@ class TestSpaceIdentityGuard:
         # Nothing was written through the symlink into the outside target.
         assert not any(outside.iterdir()), "wrote through a symlinked page dir"
 
+    def test_symlinked_media_dir_refused(self, tmp_root, blobs):
+        """A planted symlinked .media dir must abort the build (the .media guard
+        is independent of the page-dir guard — a .media symlink can be planted
+        under a clean page dir)."""
+        from conex.errors import StateError
+        from conex.layout import plan_layout
+
+        body = seed_blob(blobs, b"<p>x</p>")
+        att_blob = seed_blob(blobs, b"PNGDATA")
+        att = make_attachment("a1", "img.png", version=1)
+        snap = make_snapshot(
+            pages=[make_page()], body_blobs={"p1": body},
+            attachments={"p1": [att]}, attachment_blobs={"a1@1": att_blob},
+        )
+        plan = plan_layout(snap.space, snap.pages, snap.folders)
+        page_dir = tmp_root / str(plan.dirs["p1"])
+        page_dir.mkdir(parents=True, exist_ok=True)  # clean (real) page dir
+        outside = tmp_root.parent / "conex_media_symlink_target"
+        outside.mkdir(parents=True, exist_ok=True)
+        (page_dir / ".media").symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(StateError) as exc:
+            build(tmp_root, snap, blobs, None, default_opts(media=True))
+        assert "symlink" in str(exc.value).lower()
+        assert not any(outside.iterdir()), "wrote through a symlinked .media dir"
+
 
 # ---------------------------------------------------------------------------
 # I3 archived preservation

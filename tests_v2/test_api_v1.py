@@ -452,11 +452,25 @@ def test_attachment_download_url_fallback_missing_wiki_prefix():
     assert url == "https://wiki.example.com/wiki/download/att"
 
 
-def test_attachment_download_url_absolute():
+def test_attachment_download_url_foreign_absolute_refused():
+    # A foreign-host absolute download_url must be refused (credentials would
+    # otherwise ride to that host) — return "" so pull skips + warns.
     api = _make_api(FakeHttp({}))
     att = Attachment(id="", page_id="", download_url="https://cdn.example.com/att")
-    url = api.attachment_download_url(att)
-    assert url == "https://cdn.example.com/att"
+    assert api.attachment_download_url(att) == ""
+
+
+def test_attachment_download_url_same_origin_absolute_allowed():
+    api = _make_api(FakeHttp({}))
+    att = Attachment(id="", page_id="", download_url="https://wiki.example.com/wiki/download/x")
+    assert api.attachment_download_url(att) == "https://wiki.example.com/wiki/download/x"
+
+
+def test_attachment_download_url_http_refused():
+    # Even same-host http:// is refused — never send the credential in cleartext.
+    api = _make_api(FakeHttp({}))
+    att = Attachment(id="", page_id="", download_url="http://wiki.example.com/wiki/download/x")
+    assert api.attachment_download_url(att) == ""
 
 
 def test_attachment_download_url_empty():

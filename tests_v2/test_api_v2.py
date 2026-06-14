@@ -516,11 +516,33 @@ def test_attachment_download_url_no_page_id_fallback_missing_wiki_prefix():
     assert url == "https://example.atlassian.net/wiki/download/att/1"
 
 
-def test_attachment_download_url_absolute_fallback():
+def test_attachment_download_url_foreign_absolute_refused():
+    # A foreign-host absolute download_url is API-controlled; returning it would
+    # send the Confluence token to that host. Refuse it (return "").
     api = _make_api(FakeHttp({}))
     att = Attachment(id="", page_id="", download_url="https://other.host/att")
-    url = api.attachment_download_url(att)
-    assert url == "https://other.host/att"
+    assert api.attachment_download_url(att) == ""
+
+
+def test_attachment_download_url_same_origin_absolute_allowed():
+    api = _make_api(FakeHttp({}))
+    att = Attachment(
+        id="", page_id="",
+        download_url="https://example.atlassian.net/wiki/download/att/1",
+    )
+    assert (
+        api.attachment_download_url(att)
+        == "https://example.atlassian.net/wiki/download/att/1"
+    )
+
+
+def test_attachment_download_url_http_refused():
+    api = _make_api(FakeHttp({}))
+    att = Attachment(
+        id="", page_id="",
+        download_url="http://example.atlassian.net/wiki/download/att/1",
+    )
+    assert api.attachment_download_url(att) == ""
 
 
 def test_attachment_download_url_no_url_no_ids():
@@ -746,4 +768,15 @@ def test_get_folders_propagates_auth_error():
         "/wiki/api/v2/folders/F1": AuthError("401 Unauthorized"),
     }))
     with pytest.raises(AuthError):
+        api.get_folders("S1", [_page("p1", parent_id="F1", parent_type="folder")])
+
+
+def test_get_folders_propagates_non_404_error():
+    # A transient 5xx (or retry-exhausted 429) on a folder fetch must NOT be
+    # swallowed into a missing folder (which would collapse pages to the space
+    # root and drive a mass reorg) — it must propagate so the export aborts.
+    api = _make_api(FakeHttp({
+        "/wiki/api/v2/folders/F1": ApiError("server error", status=500),
+    }))
+    with pytest.raises(ApiError):
         api.get_folders("S1", [_page("p1", parent_id="F1", parent_type="folder")])

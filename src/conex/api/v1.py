@@ -194,11 +194,17 @@ class CookieV1API:
                 + f"/wiki/rest/api/content/{att.page_id}"
                 f"/child/attachment/{att.id}/download"
             )
+        # download_url is API-controlled and the HTTP layer attaches the session
+        # cookie/credential to every request, so an absolute URL to a foreign
+        # host would exfiltrate it. Accept ONLY a same-origin https absolute URL
+        # or a site-relative path; refuse anything else (pull warns + skips).
         dl = att.download_url
         if not dl:
             return ""
         if dl.startswith("http://") or dl.startswith("https://"):
-            return dl
+            if dl.startswith("https://") and urlparse(dl).netloc == urlparse(self._base).netloc:
+                return dl
+            return ""
         if not dl.startswith("/wiki"):
             dl = "/wiki" + dl
         return self._base + dl
