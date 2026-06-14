@@ -7,8 +7,8 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [2.0.0] — 2026-06-14
 
 First tagged release. `conex` is the second-generation, ground-up rewrite of the
-Confluence exporter. The distribution is now named **`conex`** and installs the
-`conex` CLI; the original `confluence-export` CLI is still bundled and unchanged.
+Confluence exporter, shipping as the `conex` CLI. (The v1 `confluence-export`
+package — never released — has been removed; this distribution is conex-only.)
 
 Validated against a live Confluence Cloud portfolio (~16 spaces, ~3,500-page
 spaces, ~61k files / 25 GB): **~7× faster** than v1, **exact page parity**, **zero
@@ -70,5 +70,4 @@ prose lost**, **zero broken media links**, clean exit on ~1,500 upstream 404s.
   unmodified.
 
 ### Tests
-2,035 passing (1,095 `tests_v2/` for conex + 940 `tests/` for the bundled
-confluence-export); ~91% line coverage on `src/conex`.
+1,082 passing (`tests_v2/`); ~91% line coverage on `src/conex`.

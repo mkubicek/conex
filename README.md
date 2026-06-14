@@ -4,8 +4,7 @@
 [![codecov](https://codecov.io/gh/mkubicek/conex/branch/main/graph/badge.svg)](https://codecov.io/gh/mkubicek/conex)
 
 Export Confluence Cloud spaces as LLM-ready markdown — fast, read-only, and
-git-versioned. `conex` is the v2 exporter; the original `confluence-export` CLI
-is still installed from the same package for backward compatibility.
+git-versioned.
 
 ```bash
 conex export SPACEKEY -o ./output

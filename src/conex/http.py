@@ -1,8 +1,5 @@
 """HTTP session wrapper with exponential backoff and cross-thread 429 coordination.
 
-PORT: retry/backoff/429-window semantics from confluence_export/client.py
-(_get, _get_raw, _await_rate_limit, _note_rate_limit, _backoff, _on_request_error).
-
 Invariants:
 - A 429 on any thread extends a shared window; all threads wait before the
   next request so one rate-limit response backs off the whole pool.
