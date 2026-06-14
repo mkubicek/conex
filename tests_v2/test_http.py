@@ -124,7 +124,7 @@ class TestGetJsonSuccess:
 
         assert result == {"key": "value"}
         mock_get.assert_called_once_with(
-            "https://example.com/api", params={"q": "1"}, timeout=30.0
+            "https://example.com/api", params={"q": "1"}, timeout=(10.0, 30.0)
         )
 
     def test_increments_request_counter(self) -> None:
@@ -151,7 +151,7 @@ class TestGetJsonSuccess:
 
         assert result == []
         mock_get.assert_called_once_with(
-            "https://example.com/api", params=None, timeout=30.0
+            "https://example.com/api", params=None, timeout=(10.0, 30.0)
         )
 
 
@@ -513,7 +513,7 @@ class TestGetStreamSuccess:
 
         assert result is mock_resp
         mock_get.assert_called_once_with(
-            "https://example.com/file", stream=True, timeout=30.0
+            "https://example.com/file", stream=True, timeout=(10.0, 30.0)
         )
 
     def test_increments_request_counter(self) -> None:

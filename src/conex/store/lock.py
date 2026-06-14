@@ -15,7 +15,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Type
 
-from conex.errors import LockHeldError
+from conex.errors import LockHeldError, StateError
 
 
 class ExportLock:
@@ -41,7 +41,17 @@ class ExportLock:
     # ------------------------------------------------------------------
 
     def __enter__(self) -> "ExportLock":
-        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # Refuse to lock through a symlinked .conex: opening the lock file via a
+        # planted symlink would create the lock on a different inode, so it would
+        # not protect the intended export root (and would follow the symlink off
+        # the root).  Abort before creating or opening anything.
+        conex_dir = self._lock_path.parent
+        if conex_dir.is_symlink():
+            raise StateError(
+                f"{conex_dir} is a symlink; refusing to lock through it "
+                "(it would redirect conex's state outside the export root)"
+            )
+        conex_dir.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(self._lock_path), os.O_CREAT | os.O_WRONLY, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -49,7 +59,8 @@ class ExportLock:
             os.close(fd)
             raise LockHeldError(
                 f"another conex run holds {self._lock_path}; "
-                "wait for it to finish or remove the lock file if it is stale"
+                "wait for it to finish (the lock releases automatically when "
+                "that run exits — do not delete the lock file)"
             ) from None
         self._fd = fd
         return self

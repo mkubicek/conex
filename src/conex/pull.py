@@ -36,6 +36,15 @@ from conex.store.state import Snapshot, SnapshotStore
 if TYPE_CHECKING:
     pass
 
+# Download size ceiling.  An attachment stream is capped at twice its declared
+# size (with a floor for tiny/zero declarations); when the size is unknown an
+# absolute ceiling applies.  This bounds an endpoint that streams without a
+# truthful Content-Length so a buggy or hostile server cannot fill the disk
+# while the export lock is held — the over-cap download is treated as a normal
+# (best-effort) download failure.
+_DOWNLOAD_CAP_FLOOR = 256 * 1024 * 1024  # 256 MiB
+_DOWNLOAD_CAP_ABSOLUTE = 8 * 1024 * 1024 * 1024  # 8 GiB when size is unknown
+
 
 @dataclass
 class PullOptions:
@@ -227,7 +236,13 @@ def pull(
                     # resp.iter_content() behaviour (PORT v1 media._download_one).
                     if hasattr(resp.raw, "decode_content"):
                         resp.raw.decode_content = True
-                    digest, _size = blobs.add_stream(resp.raw)
+                    declared = att.file_size or 0
+                    cap = (
+                        max(declared * 2, _DOWNLOAD_CAP_FLOOR)
+                        if declared
+                        else _DOWNLOAD_CAP_ABSOLUTE
+                    )
+                    digest, _size = blobs.add_stream(resp.raw, max_bytes=cap)
                 finally:
                     resp.close()
                 return att_key, digest

@@ -22,6 +22,7 @@ from conex.paths import (
     MAX_FILENAME_LEN,
     AttachmentNamePlan,
     _with_suffix_token,
+    assert_within,
     is_safe_component,
     nfc,
     nfc_casefold,
@@ -32,6 +33,40 @@ from conex.paths import (
     sanitize_filename,
     truncate_with_suffix,
 )
+
+
+# ---------------------------------------------------------------------------
+# assert_within — full-path containment assert
+# ---------------------------------------------------------------------------
+
+
+class TestAssertWithin:
+    def test_path_inside_root_returns_resolved(self, tmp_path: Path) -> None:
+        target = tmp_path / "a" / "b.txt"
+        assert assert_within(tmp_path, target) == target.resolve()
+
+    def test_nonexistent_path_inside_root_ok(self, tmp_path: Path) -> None:
+        # resolve() must not require the path to exist.
+        assert_within(tmp_path, tmp_path / "does" / "not" / "exist.md")
+
+    def test_absolute_path_outside_root_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="escapes root"):
+            assert_within(tmp_path, Path("/etc/passwd"))
+
+    def test_dotdot_traversal_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="escapes root"):
+            assert_within(tmp_path / "sub", tmp_path / "sub" / ".." / ".." / "x")
+
+    def test_symlink_escaping_root_rejected(self, tmp_path: Path) -> None:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        root = tmp_path / "root"
+        root.mkdir()
+        link = root / "link"
+        link.symlink_to(outside)
+        # A target reached through the escaping symlink resolves outside root.
+        with pytest.raises(ValueError, match="escapes root"):
+            assert_within(root, link / "loot.txt")
 
 
 # ---------------------------------------------------------------------------

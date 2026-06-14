@@ -10,7 +10,11 @@ a filesystem path.  This module owns:
   separators, control characters, leading dots, traversal tokens.  Used ONLY for
   attachment files.
 - :func:`plan_attachment_names` — per-page collision-safe :class:`AttachmentNamePlan`.
-- :func:`resolve_within` — defence-in-depth containment assert (S1 posture).
+- :func:`resolve_within` — single-component containment assert (S1 posture).
+- :func:`assert_within` — full-path containment assert; the choke point used
+  before destructive filesystem operations (deletes).
+- :func:`durable_replace` / :func:`fsync_file` / :func:`fsync_dir` —
+  crash-durable atomic writes (fsync around ``os.replace``).
 - :func:`nfc` / :func:`nfc_casefold` — canonical Unicode folds.
 - :func:`truncate_with_suffix` — append a suffix without exceeding MAX_FILENAME_LEN.
 
@@ -21,6 +25,7 @@ attachment files ALWAYS go through :func:`safe_attachment_name` /
 
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -197,7 +202,7 @@ def resolve_within(base: Path, component: str) -> Path:
     Rejects any component carrying a path separator, a ``.``/``..`` token, or a
     name that does not round-trip through :class:`Path` — then asserts the
     resolved path is still inside ``base``.  Refuses to follow a symlinked
-    component.  The single write-site choke point (I7).
+    component.  For full multi-component paths use :func:`assert_within`.
     """
     component = str(component)
     if not is_safe_component(component):
@@ -212,6 +217,71 @@ def resolve_within(base: Path, component: str) -> Path:
     except ValueError as exc:  # pragma: no cover
         raise ValueError(f"path component escapes base directory: {component!r}") from exc
     return candidate
+
+
+# ---------------------------------------------------------------------------
+# assert_within — containment assert for full (multi-component) paths
+# ---------------------------------------------------------------------------
+
+def assert_within(root: Path, path: Path) -> Path:
+    """Resolve *path* and assert it stays inside *root*; return the resolved path.
+
+    Unlike :func:`resolve_within` (which takes a single safe component), *path*
+    may be a full multi-component path.  This is the containment choke point for
+    destructive operations: a target that resolves outside *root* — via an
+    absolute value, a ``..`` token, or a symlinked ancestor — raises
+    ``ValueError`` and is never operated on.  A symlinked *path* whose target
+    escapes the root is likewise rejected, because ``resolve`` follows it.
+    """
+    root_real = root.resolve()
+    candidate = path.resolve()
+    try:
+        candidate.relative_to(root_real)
+    except ValueError as exc:
+        raise ValueError(f"path {str(path)!r} escapes root {str(root)!r}") from exc
+    return candidate
+
+
+# ---------------------------------------------------------------------------
+# Crash-durable atomic write helpers
+# ---------------------------------------------------------------------------
+
+def fsync_file(path: Path) -> None:
+    """Flush *path*'s contents to stable storage."""
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def fsync_dir(path: Path) -> None:
+    """Flush *path* directory entry to stable storage (best effort).
+
+    A successful ``os.replace`` is only crash-durable once the containing
+    directory's metadata is fsynced.  Some platforms reject fsync on a
+    directory fd; those failures are swallowed.
+    """
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def durable_replace(tmp: Path, dest: Path) -> None:
+    """``os.replace`` *tmp* onto *dest*, crash-durably.
+
+    fsyncs *tmp* before the rename and *dest*'s parent directory after it.
+    Plain ``os.replace`` guarantees atomicity only for concurrent observers,
+    not that the bytes survive power loss; the fsyncs close that gap so the
+    documented "a crash leaves a complete file" invariant actually holds.
+    """
+    fsync_file(tmp)
+    os.replace(tmp, dest)
+    fsync_dir(dest.parent)
 
 
 # ---------------------------------------------------------------------------

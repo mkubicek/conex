@@ -201,7 +201,8 @@ def test_lock_held_exits_cleanly(tmp_path, capsys):
          patch("conex.store.lock.ExportLock.__enter__",
                side_effect=LockHeldError(
                    f"another conex run holds {tmp_path}/.conex/lock; "
-                   "wait for it to finish or remove the lock file if it is stale"
+                   "wait for it to finish (the lock releases automatically when "
+                   "that run exits — do not delete the lock file)"
                )):
         mock_cfg.return_value = _make_mock_cfg()
 

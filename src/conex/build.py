@@ -128,7 +128,7 @@ from conex.convert import (
 from conex.errors import StateError
 from conex.layout import plan_layout
 from conex.models import Attachment, Page
-from conex.paths import plan_attachment_names, safe_attachment_name
+from conex.paths import assert_within, plan_attachment_names, safe_attachment_name
 from conex.store.blobs import BlobStore
 from conex.store.state import (
     AttachmentState,
@@ -273,15 +273,27 @@ def _rmdir_empty_parents(path: Path, stop_at: Path) -> None:
 
 
 def _guarded_delete_file(
-    p: Path, keep: set[str], result: BuildResult
+    p: Path, keep: set[str], result: BuildResult, root: Path
 ) -> None:
     """Unlink *p* only when its casefold is not in *keep*; record in result.deleted.
 
     The *keep* set contains the casefolded absolute paths of every file written,
     materialised, renamed-in, or carried during this build run.  Any path in
     *keep* must never be deleted, regardless of which deletion call site triggers.
+
+    Containment guard: *p* must resolve inside *root*.  Deletion targets are
+    derived from prior ``state.json`` (``ps.dir``/``ps.file``/``att.file``); a
+    tampered or corrupt state with an absolute or ``..`` path — or a symlink
+    that escapes — must never let conex unlink a file outside the export root.
     """
     if str(p).casefold() in keep:
+        return
+    try:
+        assert_within(root, p)
+    except ValueError:
+        msg = f"refusing to delete {p} — it escapes the export root"
+        result.warnings.append(msg)
+        warnings.warn(msg, stacklevel=2)
         return
     if p.exists() and p.is_file():
         p.unlink()
@@ -289,7 +301,7 @@ def _guarded_delete_file(
 
 
 def _guarded_delete_dir_tree(
-    d: Path, keep: set[str], result: BuildResult
+    d: Path, keep: set[str], result: BuildResult, root: Path
 ) -> None:
     """Remove files under *d* that are not in *keep*; rmdir iff the tree becomes empty.
 
@@ -302,7 +314,7 @@ def _guarded_delete_dir_tree(
         return
     for child in sorted(d.rglob("*")):
         if child.is_file():
-            _guarded_delete_file(child, keep, result)
+            _guarded_delete_file(child, keep, result, root)
     # Remove the now-possibly-empty directory and any empty ancestors.
     # _rmdir_empty_parents stops at the first non-empty dir.
 
@@ -557,7 +569,7 @@ def _reconcile_deletions(
     for pid, ps in prev.pages.items():
         # Delete recorded prev artifacts the new state no longer owns.
         for p in _page_owned_paths(root, ps):
-            _guarded_delete_file(p, desired, result)
+            _guarded_delete_file(p, desired, result, root)
 
         page_dir = root / ps.dir
         if pid not in new_pages:
@@ -566,7 +578,7 @@ def _reconcile_deletions(
             # the same path survives.  Leave a non-empty .workspace + warn.
             media_dir = page_dir / ".media"
             if media_dir.exists():
-                _guarded_delete_dir_tree(media_dir, desired, result)
+                _guarded_delete_dir_tree(media_dir, desired, result, root)
             ws = page_dir / ".workspace"
             if ws.exists() and any(ws.iterdir()):
                 msg = (
@@ -624,7 +636,9 @@ def build(
     - I3: prev archived pages not in snapshot.include_archived are preserved.
     - I4: all temp files under .conex/tmp/.
     - I6: state written atomically, once, at end of successful run.
-    - I7: all paths through sanitization + resolve_within before FS ops.
+    - I7: write targets go through name sanitization; every destructive FS op
+      is containment-checked against root (assert_within / materialize) so a
+      tampered state or symlinked component can never escape the export root.
 
     Parameters:
         root:     Export root directory.
@@ -762,6 +776,12 @@ def build(
         planned_dir_abs = root / str(planned_dir_rel)
         planned_file_abs = root / str(planned_file_rel)
 
+        # Set when any media file for this page fails to materialise to disk.
+        # Such a page must NOT be skippable next run (its recorded state would
+        # otherwise look complete while a file is missing), so we persist a
+        # sentinel fingerprint below to force a re-attempt.
+        page_media_incomplete = False
+
         # S1: refuse a symlinked/escaping page dir before the FIRST write into
         # it (the media phase below may mkdir(parents=True) through it).
         _assert_writable_dir(root_real, planned_dir_abs)
@@ -859,6 +879,10 @@ def build(
                         msg = f"failed to materialise attachment {att.title!r}: {exc}"
                         result.warnings.append(msg)
                         warnings.warn(msg, stacklevel=2)
+                        # Disk write failed (e.g. ENOSPC): the file is NOT on
+                        # disk, so force a re-attempt next run rather than let
+                        # the page skip with a complete-looking state.
+                        page_media_incomplete = True
                         att_states[att.id] = AttachmentState(
                             version=att.version.number,
                             file=planned_name,
@@ -897,6 +921,8 @@ def build(
                     msg = f"failed to materialise rendered drawio PNG {png_filename!r}: {exc}"
                     result.warnings.append(msg)
                     warnings.warn(msg, stacklevel=2)
+                    # PNG never reached disk → force a re-attempt next run.
+                    page_media_incomplete = True
 
             # Handle attachments_complete=False: carry prev media, never delete.
             if not snapshot.attachments_complete and prev is not None and pid in prev.pages:
@@ -927,6 +953,12 @@ def build(
                 for prev_att_state in prev.pages[pid].attachments.values():
                     if prev_att_state.file and prev_att_state.file not in current_files:
                         stale = media_dir / prev_att_state.file
+                        # Containment guard (I7): a tampered prev-state filename
+                        # must not let this inline cleanup unlink outside root.
+                        try:
+                            assert_within(root, stale)
+                        except ValueError:
+                            continue
                         if stale.exists() and stale.is_file():
                             stale.unlink()
                             result.deleted.append(stale)
@@ -1072,6 +1104,10 @@ def build(
         # Build PageState.  rendered_media records the batch-rendered drawio PNGs
         # (not attachments, so they have no id) so they are part of the page's
         # owned-path set and the reconciliation deletes the old copy on a move.
+        # A page with a failed media write persists an empty fingerprint, which
+        # never equals a real (sha256-hex) fingerprint, so the skip check next
+        # run is forced to re-write the page and re-attempt the missing media.
+        page_fingerprint = "" if page_media_incomplete else fingerprints[pid]
         new_page_states[pid] = PageState(
             dir=str(planned_dir_rel),
             file=str(planned_file_rel),
@@ -1079,7 +1115,7 @@ def build(
             title=page.title,
             version=page.version.number,
             status=page.status,
-            fingerprint=fingerprints[pid],
+            fingerprint=page_fingerprint,
             attachments=att_states,
             rendered_media=sorted(rendered_png_digests_to_materialize.keys()),
         )

@@ -193,3 +193,26 @@ class TestErrorMessage:
                 assert "wait" in msg or "remove" in msg, (
                     f"LockHeldError should suggest a remedy; got: {str(exc)!r}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# Symlink guard on .conex (H2)
+# ---------------------------------------------------------------------------
+
+
+class TestSymlinkGuard:
+    def test_refuses_symlinked_conex_dir(self, tmp_path: Path) -> None:
+        """A planted `.conex -> elsewhere` symlink must not be locked through —
+        it would create the lock on a different inode (not protecting the real
+        root) and could redirect state writes off the export tree."""
+        from conex.errors import StateError
+
+        root = tmp_path / "export"
+        root.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (root / ".conex").symlink_to(elsewhere, target_is_directory=True)
+
+        with pytest.raises(StateError, match="symlink"):
+            with ExportLock(root):
+                pass

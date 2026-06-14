@@ -47,7 +47,7 @@ from conex.config import (
     save_local_config,
     configure as config_configure,
 )
-from conex.errors import ConexError, GitError, LockHeldError
+from conex.errors import ConexError, GitError, LockHeldError, StateError
 from conex.store.lock import ExportLock
 
 
@@ -105,8 +105,22 @@ def _clear_tmp(root: Path) -> None:
 
     Called EXACTLY ONCE per locked command, immediately after acquiring the lock.
     Stores must never clear tmp themselves (I4).
+
+    Refuses to operate when ``.conex`` (or ``tmp``) is a symlink: a planted
+    ``.conex -> /`` would otherwise make ``rmtree`` recurse outside the export
+    root.  Aborts before the destructive op so nothing outside is touched.
     """
-    tmp = root / ".conex" / "tmp"
+    conex_dir = root / ".conex"
+    if conex_dir.is_symlink():
+        raise StateError(
+            f"{conex_dir} is a symlink; refusing to operate on it "
+            "(it would redirect conex's state outside the export root)"
+        )
+    tmp = conex_dir / "tmp"
+    if tmp.is_symlink():
+        raise StateError(
+            f"{tmp} is a symlink; refusing to remove it"
+        )
     if tmp.exists():
         shutil.rmtree(tmp)
     tmp.mkdir(parents=True, exist_ok=True)

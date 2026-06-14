@@ -24,9 +24,8 @@ import warnings
 from pathlib import Path
 from typing import Any
 
-from pydantic import ValidationError
-
 from conex.models import Attachment, Folder, NullTolerantModel, Page, Space
+from conex.paths import durable_replace
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +150,10 @@ def _atomic_save(path: Path, data: Any) -> None:
     tmp_path = tmp_dir / (path.name + ".tmp")
     payload = json.dumps(data, indent=2, ensure_ascii=False)
     tmp_path.write_text(payload, encoding="utf-8")
-    os.replace(tmp_path, path)
+    # Crash-durable: fsync the temp file and the parent dir around os.replace
+    # so the I6 "a crash leaves the previous file intact" invariant holds even
+    # across power loss, not just against concurrent observers.
+    durable_replace(tmp_path, path)
 
 
 def _load_json(path: Path) -> dict | None:
@@ -207,7 +209,10 @@ class StateStore:
             return None
         try:
             return ExportState.model_validate(raw)
-        except (ValidationError, Exception) as exc:
+        # Intentionally broad: ANY load error is treated as "absent", which
+        # triggers a full re-export (the data-safe direction).  ValidationError
+        # is a subclass of Exception, so the single clause covers it.
+        except Exception as exc:
             print(
                 f"conex: invalid state in {self._path}: {exc} — treating as absent",
                 file=sys.stderr,
@@ -235,7 +240,9 @@ class SnapshotStore:
             return None
         try:
             return Snapshot.model_validate(raw)
-        except (ValidationError, Exception) as exc:
+        # Intentionally broad: ANY load error is treated as "absent" (data-safe
+        # re-export).  ValidationError is a subclass of Exception.
+        except Exception as exc:
             print(
                 f"conex: invalid snapshot in {self._path}: {exc} — treating as absent",
                 file=sys.stderr,

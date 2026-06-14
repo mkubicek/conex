@@ -75,10 +75,15 @@ class Http:
         *,
         auth_headers: dict[str, str],
         timeout: float = 30.0,
+        connect_timeout: float = 10.0,
         max_retries: int = 3,
         cookie_host: str = "",
     ) -> None:
         self._timeout = timeout
+        # (connect, read): a stuck TCP/TLS handshake fails fast instead of
+        # hanging for the full read budget; requests applies the read timeout
+        # per socket read, bounding a server that stops sending mid-response.
+        self._request_timeout: tuple[float, float] = (connect_timeout, timeout)
         self._max_retries = max_retries
 
         self._session = requests.Session()
@@ -253,7 +258,7 @@ class Http:
             try:
                 with self._lock:
                     self.stats.requests += 1
-                resp = self._session.get(url, params=params, timeout=self._timeout)
+                resp = self._session.get(url, params=params, timeout=self._request_timeout)
                 resp.raise_for_status()
                 return resp.json()
             except requests.exceptions.RequestException as exc:
@@ -276,7 +281,7 @@ class Http:
             try:
                 with self._lock:
                     self.stats.requests += 1
-                resp = self._session.get(url, stream=True, timeout=self._timeout)
+                resp = self._session.get(url, stream=True, timeout=self._request_timeout)
                 resp.raise_for_status()
                 return resp
             except requests.exceptions.RequestException as exc:

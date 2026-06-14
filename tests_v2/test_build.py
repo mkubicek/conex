@@ -28,7 +28,14 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from conex.build import BuildOptions, BuildResult, _fingerprint, _parse_mtime, build
+from conex.build import (
+    BuildOptions,
+    BuildResult,
+    _fingerprint,
+    _guarded_delete_file,
+    _parse_mtime,
+    build,
+)
 from conex.convert import CONVERTER_VERSION
 from conex.models import Attachment, Folder, Page, PageVersion, Space
 from conex.paths import plan_attachment_names
@@ -2807,3 +2814,86 @@ class TestPruneSafetyAndMediaFalseMove:
         # The media is carried to the new dir (asserted above); the old path's
         # removal is the git-rename half of the move, so the move is tracked.
         assert result2.moved, "the page move must be recorded in result.moved"
+
+
+# ---------------------------------------------------------------------------
+# H3 — deletion-path containment (tampered/corrupt state cannot escape root)
+# ---------------------------------------------------------------------------
+
+
+class TestDeletionContainment:
+    def test_guarded_delete_refuses_path_outside_root(self, tmp_path: Path) -> None:
+        root = tmp_path / "export"
+        root.mkdir()
+        outside = tmp_path / "victim.txt"
+        outside.write_text("precious")
+        result = BuildResult()
+        # A tampered prev-state path that resolves outside the export root.
+        _guarded_delete_file(outside, set(), result, root)
+        assert outside.exists(), "must not delete a file outside the export root"
+        assert any("escapes" in w for w in result.warnings)
+        assert outside not in result.deleted
+
+    def test_guarded_delete_removes_path_inside_root(self, tmp_path: Path) -> None:
+        root = tmp_path / "export"
+        (root / "sub").mkdir(parents=True)
+        target = root / "sub" / "old.md"
+        target.write_text("stale")
+        result = BuildResult()
+        _guarded_delete_file(target, set(), result, root)
+        assert not target.exists()
+        assert target in result.deleted
+
+    def test_guarded_delete_respects_keep_set(self, tmp_path: Path) -> None:
+        root = tmp_path / "export"
+        root.mkdir()
+        keep_me = root / "keep.md"
+        keep_me.write_text("alive")
+        result = BuildResult()
+        _guarded_delete_file(keep_me, {str(keep_me).casefold()}, result, root)
+        assert keep_me.exists()
+        assert keep_me not in result.deleted
+
+
+# ---------------------------------------------------------------------------
+# M1 — a failed media materialize forces a re-attempt next run
+# ---------------------------------------------------------------------------
+
+
+class TestMaterializeFailureRetry:
+    def test_failed_materialize_forces_reattempt_and_heals(self, tmp_root, blobs):
+        """A page whose attachment fails to materialize (blob absent on disk)
+        must NOT be skippable next run: it persists a sentinel (empty)
+        fingerprint that forces a re-attempt, which self-heals once the blob
+        lands.  Without the sentinel the page would skip (its .md exists) and
+        the missing media would never be retried."""
+        body = seed_blob(blobs, b"<p>x</p>")
+        att = make_attachment("a1", "doc.png", version=1)
+        # Declared blob digest is NOT in the store → materialize fails.
+        snap1 = make_snapshot(
+            pages=[make_page("p1", "Doc")],
+            body_blobs={"p1": body},
+            attachments={"p1": [att]},
+            attachment_blobs={"a1@1": "0" * 64},
+        )
+        _, state1 = build(tmp_root, snap1, blobs, None, default_opts(media=True))
+        assert state1.pages["p1"].fingerprint == "", (
+            "a failed media write must persist a sentinel fingerprint"
+        )
+
+        # Blob now lands.  _fingerprint is computed from attachment metadata
+        # (not the blob digest), so the computed fingerprint is unchanged — only
+        # the sentinel forces the re-attempt.
+        real = seed_blob(blobs, b"PNGBYTES")
+        snap2 = make_snapshot(
+            pages=[make_page("p1", "Doc")],
+            body_blobs={"p1": body},
+            attachments={"p1": [att]},
+            attachment_blobs={"a1@1": real},
+        )
+        _, state2 = build(tmp_root, snap2, blobs, state1, default_opts(media=True))
+        media = tmp_root / state2.pages["p1"].dir / ".media" / "doc.png"
+        assert media.exists(), "re-attempt must materialize the previously-missing media"
+        assert state2.pages["p1"].fingerprint != "", (
+            "a healed page must persist a real fingerprint so future runs can skip"
+        )

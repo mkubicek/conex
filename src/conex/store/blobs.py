@@ -13,7 +13,7 @@ Invariants:
 - Blobs are immutable after promotion: the same digest always maps to the
   same bytes.  A digest that already exists in the store is a no-op dedup.
 - Dest paths passed to :meth:`materialize` are checked with
-  ``resolve_within`` before any filesystem operation (I7).
+  ``assert_within`` for root containment before any filesystem operation (I7).
 - The store creates ``<root>/.conex/blobs/`` and ``<root>/.conex/tmp/``
   lazily on first use, but NEVER clears ``.conex/tmp/`` — the CLI owns that
   lifecycle (I4 / M6).
@@ -26,8 +26,11 @@ import io
 import os
 import shutil
 import uuid
+import warnings
 from pathlib import Path
 from typing import BinaryIO
+
+from conex.paths import assert_within, durable_replace
 
 
 class BlobStore:
@@ -71,11 +74,16 @@ class BlobStore:
     # Write path
     # ------------------------------------------------------------------
 
-    def add_stream(self, fp: BinaryIO) -> tuple[str, int]:
+    def add_stream(self, fp: BinaryIO, max_bytes: int | None = None) -> tuple[str, int]:
         """Read *fp* to a staging file, compute the SHA-256 digest, and promote.
 
         Returns ``(digest, size)`` where *size* is the total byte count read.
         The stream is consumed fully; the caller is responsible for closing it.
+
+        If *max_bytes* is given and the stream exceeds it, the partial staging
+        file is removed and ``ValueError`` is raised.  This bounds an endpoint
+        that streams without a ``Content-Length`` (or lies about it) so a buggy
+        or hostile server cannot fill the disk while the export lock is held.
 
         Invariant: if the digest already exists the staging file is removed
         without being promoted, so the store never has duplicate entries.
@@ -87,16 +95,20 @@ class BlobStore:
         try:
             with stage.open("wb") as out:
                 for chunk in iter(lambda: fp.read(65536), b""):
+                    size += len(chunk)
+                    if max_bytes is not None and size > max_bytes:
+                        raise ValueError(
+                            f"stream exceeds {max_bytes} byte cap (read {size}+)"
+                        )
                     h.update(chunk)
                     out.write(chunk)
-                    size += len(chunk)
             digest = h.hexdigest()
             dest = self._blob_path(digest)
             if dest.exists():
                 stage.unlink(missing_ok=True)
             else:
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(stage, dest)
+                durable_replace(stage, dest)
         except Exception:
             stage.unlink(missing_ok=True)
             raise
@@ -148,8 +160,8 @@ class BlobStore:
     ) -> None:
         """Copy the blob for *digest* to *dest* via ``.conex/tmp`` + ``os.replace``.
 
-        *dest* is containment-checked against the export root before any
-        filesystem operation (equivalent to a ``resolve_within`` guard).
+        *dest* is containment-checked against the export root via
+        :func:`~conex.paths.assert_within` before any filesystem operation.
         The parent directory of *dest* must already exist.
 
         If *mtime* is given, ``os.utime`` is called on *dest* after promotion
@@ -160,15 +172,9 @@ class BlobStore:
         """
         src = self.path(digest)  # raises KeyError if absent
 
-        # Defence-in-depth containment check: dest must be inside the export root.
-        # We do not use resolve_within's single-component assumption here because
-        # dest is a full path; instead we verify containment directly.
-        try:
-            dest.resolve().relative_to(self._root.resolve())
-        except ValueError:
-            raise ValueError(
-                f"materialize dest {dest!r} escapes export root {self._root!r}"
-            ) from None
+        # Defence-in-depth containment: dest (a full path) must resolve inside
+        # the export root, rejecting absolute/.. paths and symlinked ancestors.
+        assert_within(self._root, dest)
 
         self._ensure_dirs()
         stage = self._stage_path()
@@ -177,7 +183,7 @@ class BlobStore:
             if mtime is not None:
                 os.utime(stage, (mtime, mtime))
             dest.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(stage, dest)
+            durable_replace(stage, dest)
         except Exception:
             stage.unlink(missing_ok=True)
             raise
@@ -194,9 +200,24 @@ class BlobStore:
         that do not exist in the store are silently ignored.
 
         Invariant: never removes a blob in *keep*, even if the caller
-        passes an incomplete set.
+        passes an incomplete set.  An empty *keep* set is refused when the
+        store holds blobs: that almost always means the caller's state failed
+        to load (and was treated as absent), and wiping every blob would
+        destroy the only crash-safe copy of the export's content.
         """
         if not self._blobs_dir.exists():
+            return 0
+
+        if not keep and any(
+            f.is_file()
+            for d in self._blobs_dir.iterdir() if d.is_dir()
+            for f in d.iterdir()
+        ):
+            warnings.warn(
+                "conex: refusing blob GC with an empty keep set while blobs "
+                "exist (likely unreadable state) — keeping all blobs",
+                stacklevel=2,
+            )
             return 0
 
         removed = 0

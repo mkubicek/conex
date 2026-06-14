@@ -178,6 +178,23 @@ class TestAtomicPromote:
             leftover = [f for f in tmp_dir.iterdir() if f.name.startswith("blob-")]
             assert leftover == []
 
+    def test_add_stream_within_max_bytes_ok(self, store: BlobStore) -> None:
+        data = b"x" * 100
+        digest, size = store.add_stream(io.BytesIO(data), max_bytes=1000)
+        assert size == 100
+        assert store.has(digest)
+
+    def test_add_stream_exceeding_max_bytes_raises_and_cleans_up(
+        self, store: BlobStore, export_root: Path
+    ) -> None:
+        data = b"x" * 5000
+        with pytest.raises(ValueError, match="byte cap"):
+            store.add_stream(io.BytesIO(data), max_bytes=1024)
+        tmp_dir = export_root / ".conex" / "tmp"
+        if tmp_dir.exists():
+            leftover = [f for f in tmp_dir.iterdir() if f.name.startswith("blob-")]
+            assert leftover == []
+
 
 # ---------------------------------------------------------------------------
 # has() / path() / KeyError
@@ -258,7 +275,7 @@ class TestMaterialize:
         digest = store.add_bytes(data)
         # export_root is tmp_path/root; tmp_path itself is outside it.
         outside = tmp_path / "escape.txt"
-        with pytest.raises(ValueError, match="escapes export root"):
+        with pytest.raises(ValueError, match="escapes root"):
             store.materialize(digest, outside)
 
     def test_materialize_via_tmp_then_replace(
@@ -340,11 +357,16 @@ class TestGarbageCollection:
         assert store.has(d1)
         assert store.has(d2)
 
-    def test_gc_removes_all_when_keep_empty(self, store: BlobStore) -> None:
-        store.add_bytes(b"one")
-        store.add_bytes(b"two")
-        removed = store.gc(keep=set())
-        assert removed == 2
+    def test_gc_refuses_empty_keep_when_blobs_exist(self, store: BlobStore) -> None:
+        """An empty keep set almost always means state failed to load; refuse to
+        wipe every blob (the only crash-safe copy of the export content)."""
+        d1 = store.add_bytes(b"one")
+        d2 = store.add_bytes(b"two")
+        with pytest.warns(UserWarning, match="empty keep set"):
+            removed = store.gc(keep=set())
+        assert removed == 0
+        assert store.has(d1)
+        assert store.has(d2)
 
     def test_gc_empty_store_returns_zero(self, store: BlobStore) -> None:
         assert store.gc(keep=set()) == 0
@@ -355,7 +377,9 @@ class TestGarbageCollection:
         digest = store.add_bytes(b"ephemeral")
         fanout = export_root / ".conex" / "blobs" / digest[:2]
         assert fanout.exists()
-        store.gc(keep=set())
+        # Non-empty keep that does not cover this blob → it is GC'd and the
+        # now-empty fan-out directory is removed.
+        store.gc(keep={"0" * 64})
         assert not fanout.exists()
 
     def test_gc_keep_set_with_absent_digest_is_no_op(
