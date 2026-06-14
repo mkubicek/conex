@@ -113,8 +113,10 @@ class CloudV2API:
     ) -> list[Page]:
         """Return all pages in space_id, bodies included inline.
 
-        include_archived is accepted but ignored: v2 listings always include
-        both current and archived pages.
+        include_archived is accepted but ignored at this layer: the v2 listing
+        always returns both current and archived pages. pull() drops archived
+        pages when include_archived is False (current-only by default, v1
+        parity), so the caller does not see them.
         """
         path = f"/wiki/api/v2/spaces/{space_id}/pages"
         rows = self._paginate(path, {"limit": "250", "body-format": "storage"})

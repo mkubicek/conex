@@ -118,6 +118,14 @@ def pull(
     # Folder discovery is derived from the pages (there is no list-folders
     # endpoint in v2), so pages must come first.
     pages = api.get_pages(space.id, space_key, effective_archived)
+    if not effective_archived:
+        # v2 listings return archived pages regardless of the request, so a
+        # plain export would otherwise include them (under _archived/) — a
+        # divergence from v1, which is current-only by default. Drop them here
+        # so the snapshot is current-only. A prior --include-archived export's
+        # _archived/ tree is still preserved: build's I3 guard reads PREV state,
+        # not this filtered set, and carries those pages forward unpruned.
+        pages = [p for p in pages if p.status != "archived"]
     folders = api.get_folders(space.id, pages)
 
     # ------------------------------------------------------------------

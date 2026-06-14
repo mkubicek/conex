@@ -1407,3 +1407,36 @@ class TestListingFailure:
         captured = capsys.readouterr()
         assert "warning" in captured.err.lower()
         assert "Broken Listing" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Archived pages: current-only by default (v1 parity); included on request
+# ---------------------------------------------------------------------------
+
+
+class TestArchivedDefault:
+    def _api(self) -> "FakeAPI":
+        # A v2-style API (returns_archived=True) that returns archived pages
+        # regardless of the request — pull must filter them when not requested.
+        return FakeAPI(
+            returns_archived=True,
+            pages=[
+                Page(id="p1", title="Live", space_id="S1", body_storage="<p>live</p>"),
+                Page(id="p2", title="Old", space_id="S1", status="archived",
+                     body_storage="<p>old</p>"),
+            ],
+        )
+
+    def test_archived_excluded_by_default(self, tmp_root: Path, blobs: BlobStore) -> None:
+        snap = pull(self._api(), "TEST", tmp_root, blobs, None,
+                    _default_opts(include_archived=False))
+        ids = {p.id for p in snap.pages}
+        assert ids == {"p1"}, "a plain export must be current-only (no archived)"
+        assert snap.include_archived is False
+
+    def test_archived_included_when_requested(self, tmp_root: Path, blobs: BlobStore) -> None:
+        snap = pull(self._api(), "TEST", tmp_root, blobs, None,
+                    _default_opts(include_archived=True))
+        ids = {p.id for p in snap.pages}
+        assert ids == {"p1", "p2"}, "--include-archived must keep archived pages"
+        assert snap.include_archived is True
