@@ -694,3 +694,56 @@ def test_protocol_compliance():
     assert hasattr(api, "get_attachments")
     assert hasattr(api, "get_user_display_name")
     assert hasattr(api, "download")
+
+
+# ---------------------------------------------------------------------------
+# get_folders — closure termination + auth propagation
+# ---------------------------------------------------------------------------
+
+
+class _BoundedHttp(FakeHttp):
+    """FakeHttp that aborts after max_folder_calls /folders/ fetches so a
+    non-terminating folder-closure loop fails fast instead of hanging."""
+
+    def __init__(self, responses: dict, max_folder_calls: int = 10) -> None:
+        super().__init__(responses)
+        self._max_folder_calls = max_folder_calls
+        self._folder_calls = 0
+
+    def get_json(self, url: str, params: dict | None = None) -> object:
+        if "/folders/" in url:
+            self._folder_calls += 1
+            if self._folder_calls > self._max_folder_calls:
+                raise AssertionError(
+                    f"get_folders did not terminate: >{self._max_folder_calls} fetches"
+                )
+        return super().get_json(url, params)
+
+
+def test_get_folders_terminates_on_folder_cycle():
+    # Two folders that name each other as folder-parents (F1<->F2). The
+    # `discovered` guard must break the loop and fetch each exactly once.
+    http = _BoundedHttp({
+        "/wiki/api/v2/folders/F1": {
+            "id": "F1", "title": "Loop A", "parentId": "F2", "parentType": "folder",
+        },
+        "/wiki/api/v2/folders/F2": {
+            "id": "F2", "title": "Loop B", "parentId": "F1", "parentType": "folder",
+        },
+    })
+    api = _make_api(http)
+    folders = api.get_folders("S1", [_page("p1", parent_id="F1", parent_type="folder")])
+    assert {f.id for f in folders} == {"F1", "F2"}
+    assert http._folder_calls == 2
+
+
+def test_get_folders_propagates_auth_error():
+    # A 404 is swallowed to None (skip), but an AuthError is a credential
+    # problem and MUST propagate — never silently degraded into a missing folder.
+    from conex.errors import AuthError
+
+    api = _make_api(FakeHttp({
+        "/wiki/api/v2/folders/F1": AuthError("401 Unauthorized"),
+    }))
+    with pytest.raises(AuthError):
+        api.get_folders("S1", [_page("p1", parent_id="F1", parent_type="folder")])

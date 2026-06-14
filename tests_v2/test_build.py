@@ -2964,6 +2964,44 @@ class TestDrawioRenderCache:
         build(tmp_root, snap, blobs, None, default_opts(media=True, render_drawio=True))
         assert calls == [], "cached diagram must not trigger a drawio CLI render"
 
+    def test_cached_render_is_materialized_and_referenced(self, tmp_root, blobs, monkeypatch):
+        """A render cached in derived_blobs must still be MATERIALIZED to .media/
+        and recorded as page-owned — the cache must never be worse than no cache.
+
+        Regression for drawio-cache-not-materialized: a cached render was skipped
+        in _run_drawio_render (not in drawio_results), and the per-page loop only
+        handled fresh renders, so the PNG silently vanished from a rewritten page.
+        """
+        body = seed_blob(blobs, b"<p>x</p>")
+        xml_digest = seed_blob(blobs, b"<xml/>")
+        rendered = seed_blob(blobs, b"PNGDATA")
+        key = f"drawio-png:v{_get_drawio_render_version()}:{xml_digest}"
+        xml_att = make_attachment(
+            "xml1", "diagram.drawio", version=1, created_at="2024-01-02T00:00:00Z"
+        )
+        snap = make_snapshot(
+            pages=[make_page("p1", "Doc")],
+            body_blobs={"p1": body},
+            attachments={"p1": [xml_att]},
+            attachment_blobs={"xml1@1": xml_digest},
+            derived_blobs={key: rendered},  # cached from a prior run
+        )
+
+        calls: list = []
+        monkeypatch.setattr(
+            "conex.drawio.render_batch",
+            lambda xml_blobs, blobs_: calls.append(xml_blobs) or {},
+        )
+        _, state = build(tmp_root, snap, blobs, None, default_opts(media=True, render_drawio=True))
+
+        assert calls == [], "cache hit must not invoke the drawio CLI"
+        png = tmp_root / state.pages["p1"].dir / ".media" / "diagram.png"
+        assert png.exists(), "cached render must be materialized to .media/"
+        assert png.read_bytes() == b"PNGDATA"
+        assert "diagram.png" in state.pages["p1"].rendered_media, (
+            "cached render must be recorded as a page-owned artifact"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Markdown trailing newline (v1 parity)

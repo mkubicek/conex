@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 
 from conex.api import ConfluenceAPI
 from conex.models import Attachment, Page
+from conex.paths import is_noise_attachment_title
 from conex.store.blobs import BlobStore
 from conex.store.state import Snapshot, SnapshotStore
 
@@ -197,7 +198,11 @@ def pull(
             page_id, atts = future.result()
             if atts is None:
                 listing_complete = False
-            elif atts:
+                continue
+            # Drop editor cruft (Office lock files, draw.io autosave .tmp) so it
+            # is never downloaded, materialized, or surfaced as a link.
+            atts = [a for a in atts if not is_noise_attachment_title(a.title)]
+            if atts:
                 attachments[page_id] = atts
 
     # ------------------------------------------------------------------

@@ -832,6 +832,9 @@ def build(
         except ImportError:
             pairs = []
 
+        # rendered_png_digests_to_materialize: maps filename → blob digest for
+        # rendered PNGs that need materialisation during the media phase.
+        rendered_png_digests_to_materialize: dict[str, str] = {}
         for pair in pairs:
             xml_att = _pair_xml(pair)
             png_att = _pair_png(pair)
@@ -848,32 +851,38 @@ def build(
                 png_digest = snapshot.attachment_blobs.get(png_key)
                 if png_digest:
                     rendered_drawio[xml_att.title] = np.by_id.get(png_att.id, png_att.title)
-            elif xml_digest and xml_digest in drawio_results:
-                # Batch-rendered result (keyed by content digest, BL-3): derive a
-                # collision-checked filename for the rendered PNG.  It is not an
-                # attachment, so use the SANITIZED xml stem + ".png" (BL-4: the
-                # raw title may contain path separators / '..'), appending
-                # "-rendered" to avoid colliding with a real attachment name.
-                stem = xml_att.title.rsplit(".", 1)[0]
-                rendered_png_filename = safe_attachment_name(f"{stem}.png")
-                if any(
-                    rendered_png_filename == np.by_id.get(a.id, a.title)
-                    for a in atts
-                    if a.id != getattr(_pair_png(pair) if pair else None, "id", None)
-                ):
-                    rendered_png_filename = safe_attachment_name(f"{stem}-rendered.png")
-                rendered_drawio[xml_att.title] = rendered_png_filename
+                continue
 
-        # Determine media availability.
-        # rendered_png_digests_to_materialize: maps filename → blob digest for
-        # batch-rendered PNGs that need materialisation during the media phase.
-        rendered_png_digests_to_materialize: dict[str, str] = {}
-        for pair in pairs:
-            xml_att = _pair_xml(pair)
-            xml_digest = snapshot.attachment_blobs.get(f"{xml_att.id}@{xml_att.version.number}")
-            if xml_digest and xml_digest in drawio_results and xml_att.title in rendered_drawio:
-                fname = rendered_drawio[xml_att.title]
-                rendered_png_digests_to_materialize[fname] = drawio_results[xml_digest]
+            if not xml_digest:
+                continue
+            # Rendered PNG digest: a fresh batch render this run, OR a render
+            # cached in snapshot.derived_blobs from a prior run.  Both must be
+            # referenced and materialised — a cached render skipped here would
+            # silently drop the diagram from any page that gets rewritten (the
+            # render cache must not be worse than no cache).
+            rendered_digest = drawio_results.get(xml_digest)
+            if not rendered_digest:
+                derived_key = f"drawio-png:v{_get_drawio_render_version()}:{xml_digest}"
+                cached = snapshot.derived_blobs.get(derived_key)
+                if cached and blobs.has(cached):
+                    rendered_digest = cached
+            if not rendered_digest:
+                continue
+
+            # Collision-checked filename for the rendered PNG (keyed by content
+            # digest, BL-3): SANITIZED xml stem + ".png" (BL-4: the raw title may
+            # contain path separators / '..'), appending "-rendered" to avoid
+            # colliding with a real attachment name.
+            stem = xml_att.title.rsplit(".", 1)[0]
+            rendered_png_filename = safe_attachment_name(f"{stem}.png")
+            if any(
+                rendered_png_filename == np.by_id.get(a.id, a.title)
+                for a in atts
+                if a.id != getattr(_pair_png(pair) if pair else None, "id", None)
+            ):
+                rendered_png_filename = safe_attachment_name(f"{stem}-rendered.png")
+            rendered_drawio[xml_att.title] = rendered_png_filename
+            rendered_png_digests_to_materialize[rendered_png_filename] = rendered_digest
 
         media_available: set[str] = set()
         att_states: dict[str, AttachmentState] = {}

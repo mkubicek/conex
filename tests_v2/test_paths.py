@@ -94,6 +94,22 @@ class TestCloneOrCopy:
         dst.write_bytes(b"mutated")
         assert src.read_bytes() == original
 
+    def test_copy_fallback_when_reflink_unavailable(self, tmp_path: Path, monkeypatch) -> None:
+        # On ext4/NTFS/cross-device _reflink returns False; clone_or_copy must
+        # fall through to shutil.copyfile. The dev/CI APFS box always reflinks,
+        # so force the fallback explicitly to cover that branch.
+        import conex.paths as _paths
+
+        monkeypatch.setattr(_paths, "_reflink", lambda src, dst: False)
+        src = tmp_path / "src.bin"
+        payload = b"fallback-content " * 500
+        src.write_bytes(payload)
+        dst = tmp_path / "dst.bin"
+        clone_or_copy(src, dst)
+        assert dst.read_bytes() == payload
+        dst.write_bytes(b"mutated")
+        assert src.read_bytes() == payload
+
 
 # ---------------------------------------------------------------------------
 # sanitize_filename

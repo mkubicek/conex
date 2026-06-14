@@ -287,6 +287,30 @@ def durable_replace(tmp: Path, dest: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Noise (editor-cruft) attachment titles
+# ---------------------------------------------------------------------------
+
+def is_noise_attachment_title(title: str) -> bool:
+    """True for well-known editor cruft uploaded as Confluence attachments.
+
+    These should not be downloaded, materialized, or surfaced as user-facing
+    links/frontmatter — they are transient artifacts, not content:
+
+    - ``~$report.xlsx`` etc. — Microsoft Office lock/owner files.
+    - ``~name.drawio.tmp`` — draw.io desktop autosave/temp files.
+
+    Deliberately conservative (specific prefixes/suffixes) so a genuine
+    attachment is never dropped.
+    """
+    t = title.strip()
+    if t.startswith("~$"):
+        return True
+    if t.startswith("~") and t.endswith(".tmp"):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Copy-on-write clone (reflink) with copy fallback
 # ---------------------------------------------------------------------------
 

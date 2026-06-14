@@ -1321,3 +1321,89 @@ class TestContentEncodingDecode:
         assert stored[:2] != b"\x1f\x8b", (
             "stored blob must NOT start with gzip magic bytes — it was stored compressed"
         )
+
+
+# ---------------------------------------------------------------------------
+# W2: editor-cruft (temp/lock) attachments filtered during pull
+# ---------------------------------------------------------------------------
+
+
+class TestNoiseAttachmentFilter:
+    def test_temp_and_lock_attachments_filtered(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """Office lock (~$x.xlsx) and draw.io autosave (~x.drawio.tmp) titles are
+        editor cruft: pull must drop them so they are never downloaded,
+        materialized, or surfaced — while a genuine sibling attachment survives."""
+        good = Attachment(
+            id="ok", title="good.png", page_id="p1",
+            download_url="http://fake/good.png", version=PageVersion(number=1),
+        )
+        lock = Attachment(
+            id="lk", title="~$report.xlsx", page_id="p1",
+            download_url="http://fake/lock", version=PageVersion(number=1),
+        )
+        autosave = Attachment(
+            id="tm", title="~mydiagram.drawio.tmp", page_id="p1",
+            download_url="http://fake/tmp", version=PageVersion(number=1),
+        )
+        api = FakeAPI(
+            pages=[Page(id="p1", title="P", space_id="S1", body_storage="x")],
+            attachments={"p1": [good, lock, autosave]},
+            download_data={"http://fake/good.png": b"g"},
+        )
+        snap = pull(api, "TEST", tmp_root, blobs, None, _default_opts(fetch_media=True))
+
+        titles = {a.title for a in snap.attachments.get("p1", [])}
+        assert titles == {"good.png"}, "only the genuine attachment must survive"
+        assert "ok@1" in snap.attachment_blobs
+        assert "lk@1" not in snap.attachment_blobs
+        assert "tm@1" not in snap.attachment_blobs
+
+
+# ---------------------------------------------------------------------------
+# Attachment-LISTING failure marks the snapshot incomplete (best-effort)
+# ---------------------------------------------------------------------------
+
+
+class TestListingFailure:
+    class _ListingFailAPI(FakeAPI):
+        def __init__(self, *args: Any, fail_page_id: str, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._fail_page_id = fail_page_id
+
+        def get_attachments(self, page_id: str) -> list[Attachment]:
+            self.get_attachments_calls.append(page_id)
+            if page_id == self._fail_page_id:
+                raise RuntimeError("listing blew up")
+            return list(self._attachments.get(page_id, []))
+
+    def test_listing_failure_marks_incomplete_and_keeps_page(
+        self, tmp_root: Path, blobs: BlobStore, capsys: pytest.CaptureFixture
+    ) -> None:
+        good_att = Attachment(
+            id="ok", title="good.png", page_id="p2",
+            download_url="http://fake/good.png", version=PageVersion(number=1),
+        )
+        api = self._ListingFailAPI(
+            pages=[
+                Page(id="p1", title="Broken Listing", space_id="S1", body_storage="x"),
+                Page(id="p2", title="Fine", space_id="S1", body_storage="y"),
+            ],
+            attachments={"p2": [good_att]},
+            download_data={"http://fake/good.png": b"ok-bytes"},
+            fail_page_id="p1",
+        )
+        snap = pull(api, "TEST", tmp_root, blobs, None, _default_opts(fetch_media=True))
+
+        # A failed listing must mark the snapshot incomplete so a later build
+        # never prunes existing media on a partial listing.
+        assert snap.attachments_complete is False
+        # Best-effort: both pages still exported; the healthy page's attachment
+        # still downloaded (no whole-export abort).
+        assert {p.id for p in snap.pages} == {"p1", "p2"}
+        assert "ok@1" in snap.attachment_blobs
+        assert blobs.read_bytes(snap.attachment_blobs["ok@1"]) == b"ok-bytes"
+        captured = capsys.readouterr()
+        assert "warning" in captured.err.lower()
+        assert "Broken Listing" in captured.err
