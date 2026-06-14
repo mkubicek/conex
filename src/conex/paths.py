@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -282,6 +284,74 @@ def durable_replace(tmp: Path, dest: Path) -> None:
     fsync_file(tmp)
     os.replace(tmp, dest)
     fsync_dir(dest.parent)
+
+
+# ---------------------------------------------------------------------------
+# Copy-on-write clone (reflink) with copy fallback
+# ---------------------------------------------------------------------------
+
+def clone_or_copy(src: Path, dst: Path) -> None:
+    """Copy *src* to *dst*, preferring a copy-on-write clone (reflink).
+
+    A reflink makes *dst* share *src*'s storage blocks until one of them is
+    modified, so the two files cost ~1x on disk instead of 2x.  This lets the
+    content-addressed blob and its materialized ``.media`` copy coexist without
+    duplicating the bytes.  Used where the filesystem supports it:
+
+    - macOS / APFS via ``clonefile``
+    - Linux btrfs / XFS / ZFS via the ``FICLONE`` ioctl
+
+    Falls back to a full byte copy on any platform or filesystem that can't
+    clone (ext4, NTFS, a cross-device pair).  *dst* must not already exist
+    (the clone primitives refuse an existing target).
+    """
+    if _reflink(src, dst):
+        return
+    shutil.copyfile(src, dst)
+
+
+def _reflink(src: Path, dst: Path) -> bool:
+    """Attempt a CoW clone of *src* to *dst*; return True on success."""
+    if sys.platform == "darwin":
+        return _clonefile_darwin(src, dst)
+    if sys.platform.startswith("linux"):
+        return _ficlone_linux(src, dst)
+    return False
+
+
+def _clonefile_darwin(src: Path, dst: Path) -> bool:
+    """APFS clonefile(2). Returns False (caller falls back to copy) on any error."""
+    import ctypes
+    import ctypes.util
+
+    libname = ctypes.util.find_library("System")
+    if not libname:
+        return False
+    try:
+        libc = ctypes.CDLL(libname, use_errno=True)
+        clonefile = libc.clonefile
+    except (OSError, AttributeError):
+        return False
+    clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    clonefile.restype = ctypes.c_int
+    rc = clonefile(os.fsencode(str(src)), os.fsencode(str(dst)), 0)
+    return rc == 0
+
+
+def _ficlone_linux(src: Path, dst: Path) -> bool:
+    """Linux FICLONE ioctl. Returns False (caller falls back to copy) on any error."""
+    import fcntl  # lazy: keep this module importable on platforms without fcntl
+
+    _FICLONE = 0x40049409  # _IOW(0x94, 9, int)
+    try:
+        with open(src, "rb") as s, open(dst, "wb") as d:
+            fcntl.ioctl(d.fileno(), _FICLONE, s.fileno())
+        return True
+    except OSError:
+        # A failed clone may leave an empty dst; remove it so the copy fallback
+        # starts from a clean (non-existent) target.
+        dst.unlink(missing_ok=True)
+        return False
 
 
 # ---------------------------------------------------------------------------

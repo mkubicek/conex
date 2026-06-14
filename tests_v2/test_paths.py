@@ -23,6 +23,7 @@ from conex.paths import (
     AttachmentNamePlan,
     _with_suffix_token,
     assert_within,
+    clone_or_copy,
     is_safe_component,
     nfc,
     nfc_casefold,
@@ -67,6 +68,31 @@ class TestAssertWithin:
         # A target reached through the escaping symlink resolves outside root.
         with pytest.raises(ValueError, match="escapes root"):
             assert_within(root, link / "loot.txt")
+
+
+# ---------------------------------------------------------------------------
+# clone_or_copy — reflink with copy fallback
+# ---------------------------------------------------------------------------
+
+
+class TestCloneOrCopy:
+    def test_produces_identical_bytes(self, tmp_path: Path) -> None:
+        src = tmp_path / "src.bin"
+        src.write_bytes(b"hello world " * 1000)
+        dst = tmp_path / "dst.bin"
+        clone_or_copy(src, dst)
+        assert dst.read_bytes() == src.read_bytes()
+
+    def test_dst_is_independent_on_write(self, tmp_path: Path) -> None:
+        # Whether reflinked (CoW) or plain-copied, writing dst must not change
+        # src — the blob (src) is conex's immutable source of truth.
+        src = tmp_path / "src.bin"
+        original = b"original-content" * 100
+        src.write_bytes(original)
+        dst = tmp_path / "dst.bin"
+        clone_or_copy(src, dst)
+        dst.write_bytes(b"mutated")
+        assert src.read_bytes() == original
 
 
 # ---------------------------------------------------------------------------

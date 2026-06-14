@@ -70,6 +70,40 @@ One caveat for `--no-media`: a normal export re-downloads a moved page's `.media
 uv pip install -e .   # or: pip install -e .
 ```
 
+## Platform support
+
+**macOS is the only currently supported platform** — it's what conex is
+developed and tested on. On macOS (APFS), a materialized attachment and its
+content-addressed cache entry share storage via copy-on-write clones, so the
+two copies cost ~1x on disk instead of 2x.
+
+**Linux** is expected to work — the run-lock (`fcntl.flock`) and copy-on-write
+dedup (`FICLONE` on btrfs/XFS/ZFS) are native there — but is currently untested
+and unsupported. On a filesystem without reflink (e.g. ext4) attachment storage
+falls back to a plain copy (~2x); correctness is unaffected.
+
+**Windows is not supported.** The blockers below are tracked so support is
+possible later — none is fundamental, but all must be addressed:
+
+- **Run-lock uses `fcntl`** (`src/conex/store/lock.py`). The import runs at
+  module load and `conex.store` imports the lock unconditionally, so
+  `import conex.store` fails outright on Windows. A port needs a guarded import
+  plus `msvcrt.locking` (or a portable `filelock`).
+- **Reserved filenames.** Name sanitization (`src/conex/paths.py`) does not
+  reject Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`,
+  `LPT1`–`LPT9`) or strip trailing dots/spaces, which Windows forbids or
+  silently rewrites — either would corrupt the on-disk layout and the
+  `state.json` path mapping.
+- **`MAX_PATH` (260 chars).** Filenames are capped at 100 chars, but a deep page
+  tree can still produce a full path over Windows' default limit; a port should
+  opt into long paths (the `\\?\` prefix / a manifest opt-in).
+- **No reflink on NTFS.** Copy-on-write dedup works only on ReFS / Windows 11
+  Dev Drives; on default NTFS attachment storage falls back to a full copy (no
+  on-disk dedup).
+- **Directory fsync.** Atomic-write durability fsyncs the containing directory
+  (`src/conex/paths.py`), which behaves differently on Windows; it degrades
+  silently today but the durability story would need revisiting.
+
 ## Setup
 
 ```bash

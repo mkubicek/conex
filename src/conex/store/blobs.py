@@ -24,13 +24,12 @@ from __future__ import annotations
 import hashlib
 import io
 import os
-import shutil
 import uuid
 import warnings
 from pathlib import Path
 from typing import BinaryIO
 
-from conex.paths import assert_within, durable_replace
+from conex.paths import assert_within, clone_or_copy, durable_replace
 
 
 class BlobStore:
@@ -179,9 +178,17 @@ class BlobStore:
         self._ensure_dirs()
         stage = self._stage_path()
         try:
-            shutil.copyfile(src, stage)
+            # Reflink the blob into the staging file where the filesystem allows
+            # it (APFS/btrfs/XFS), so the materialized .media copy shares storage
+            # with the blob (~1x on disk) instead of duplicating the bytes.
+            clone_or_copy(src, stage)
             if mtime is not None:
                 os.utime(stage, (mtime, mtime))
+            else:
+                # A CoW clone (clonefile) copies the blob's mtime; reset to "now"
+                # so a stale blob's mtime never leaks onto the materialized file
+                # (regression guard against the old copy2 age-gate bug).
+                os.utime(stage, None)
             dest.parent.mkdir(parents=True, exist_ok=True)
             durable_replace(stage, dest)
         except Exception:
