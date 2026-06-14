@@ -162,8 +162,12 @@ def default_handler(macro: Macro, ctx: "ConvertContext") -> Replacement:
     3. Otherwise → emit a visible ``[Confluence dynamic content: name]``
        placeholder (v1 parity).
     """
-    # Branch 1: has own body with content
-    if macro.rich_body is not None and macro.rich_body.get_text(strip=True):
+    # Branch 1: has own body with content. "Content" includes a void element
+    # (e.g. a resolved <img>) that carries no text — a get_text-only check would
+    # drop an image-only body into the placeholder, silently losing the image.
+    if macro.rich_body is not None and (
+        macro.rich_body.get_text(strip=True) or macro.rich_body.find(True) is not None
+    ):
         return macro.rich_body
     if macro.plain_body is not None and macro.plain_body.strip():
         return macro.plain_body

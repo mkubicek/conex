@@ -59,6 +59,41 @@ def _markdown_label(text: str) -> str:
     return re.sub(r"[\[\]()\r\n]", "", str(text))
 
 
+_SAFE_URL_SCHEMES = ("http://", "https://", "mailto:")
+
+
+def _safe_external_url(url: str) -> str:
+    """Sanitise a user-controlled URL for an href/src; "" means drop it.
+
+    Allows only http/https/mailto absolute schemes (blocks javascript:, data:,
+    file:, ...), leaves relative URLs untouched, and percent-encodes spaces and
+    parentheses that would corrupt a markdown link/image target while keeping
+    URL-significant characters intact.
+    """
+    u = (url or "").strip()
+    if not u:
+        return ""
+    head = u.split("/", 1)[0]
+    if ":" in head and not u.lower().startswith(_SAFE_URL_SCHEMES):
+        return ""
+    return urllib.parse.quote(u, safe=":/?#[]@!$&'*+,;=~.-_%")
+
+
+def _sanitize_heading_text(title: str) -> str:
+    """Flatten a page title to a single safe markdown H1 text run.
+
+    The title is interpolated raw into ``# {title}`` AFTER markdownify, so it
+    bypasses all escaping.  Collapse newlines (which would start injected
+    markdown blocks) and escape the structural chars that would otherwise inject
+    a heading / link / image / code span / raw HTML.
+    """
+    t = " ".join(str(title).split())
+    t = t.replace("\\", "\\\\")
+    for ch in ("`", "#", "[", "]"):
+        t = t.replace(ch, "\\" + ch)
+    return t.replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _is_detached(node: Tag, soup: BeautifulSoup) -> bool:
     """True if node is no longer reachable from soup (extracted/decomposed).
 
@@ -185,7 +220,15 @@ def _pass_adf_lists(soup: BeautifulSoup) -> None:
                 is_done = status and status.get_text().strip() == "complete"
                 checkbox = "[x] " if is_done else "[ ] "
                 li = soup.new_tag("li")
-                li.string = checkbox + (body.get_text().strip() if body else "")
+                if body is not None and body.find(True) is not None:
+                    # Body has inline markup (e.g. a hyperlink) — preserve its
+                    # live children so markdownify keeps it; get_text() would
+                    # flatten an <a> to plain text and drop its URL.
+                    li.append(checkbox)
+                    for child in list(body.contents):
+                        li.append(child)
+                else:
+                    li.string = checkbox + (body.get_text().strip() if body else "")
                 for u in nested_uls:
                     li.append(u)
                 ul.append(li)
@@ -284,6 +327,17 @@ def _replace_ac_link(soup: BeautifulSoup, tag: Tag, ctx: "ConvertContext") -> No
             tag.replace_with(a)
             return
 
+    ri_url = tag.find("ri:url")
+    if ri_url:
+        url = _safe_external_url(str(ri_url.get("ri:value", "") or ""))
+        if url:
+            label_tag = tag.find("ac:plain-text-link-body") or tag.find("ac:link-body")
+            label = label_tag.get_text().strip() if label_tag else url
+            a = soup.new_tag("a", href=url)
+            a.string = _markdown_label(label or url)
+            tag.replace_with(a)
+            return
+
     ri_page = tag.find("ri:page")
     if ri_page:
         title = str(ri_page.get("ri:content-title", "") or "Link")
@@ -349,7 +403,7 @@ def _replace_ac_image(soup: BeautifulSoup, tag: Tag, ctx: "ConvertContext") -> N
 
     ri_url = tag.find("ri:url")
     if ri_url:
-        url = str(ri_url.get("ri:value", "") or "")
+        url = _safe_external_url(str(ri_url.get("ri:value", "") or ""))
         if url:
             img = soup.new_tag("img", src=url, alt="")
             tag.replace_with(img)
@@ -390,6 +444,12 @@ def _substitute_emoticon(soup: BeautifulSoup, tag: Tag) -> None:
     if not emoji:
         shortname = str(tag.get("ac:emoji-shortname", "") or "").strip(":")
         emoji = EMOTICON_MAP.get(shortname, "")
+    if not emoji:
+        # Last resort: the literal Unicode char Confluence stores as a fallback
+        # for emoji outside the 22-entry map — use it rather than dropping it.
+        fallback = str(tag.get("ac:emoji-fallback", "") or "").strip()
+        if fallback and not (fallback.startswith(":") and fallback.endswith(":")):
+            emoji = fallback
     if emoji:
         tag.replace_with(emoji)
     else:
@@ -478,9 +538,11 @@ def _pass_markdownify(soup: BeautifulSoup, page_title: str) -> str:
     markdown = re.sub(r"\n{3,}", "\n\n", markdown)
     markdown = markdown.strip()
 
-    # Ensure single H1 title
-    if not markdown.startswith(f"# {page_title}"):
-        markdown = f"# {page_title}\n\n{markdown}"
+    # Ensure single H1 title (sanitised: the raw title bypasses markdownify, so
+    # newlines/HTML/markdown in it would inject structure into the document).
+    h1 = _sanitize_heading_text(page_title)
+    if not markdown.startswith(f"# {h1}"):
+        markdown = f"# {h1}\n\n{markdown}"
 
     return markdown
 

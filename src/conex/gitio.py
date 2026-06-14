@@ -282,5 +282,12 @@ def commit_export(root: Path, result: Any, message: str) -> bool:
     if check_result.returncode == 0:
         return False  # empty delta
 
-    _run_git(root, "commit", "-m", message)
+    try:
+        _run_git(root, "commit", "-m", message)
+    except GitError:
+        # A failed commit must leave a CLEAN index. Otherwise the export delta
+        # stays staged and the next run's commit_user_changes commits it under
+        # the misleading "Local changes before export" message.
+        _run_git(root, "reset", "-q", "HEAD", "--", check=False)
+        raise
     return True

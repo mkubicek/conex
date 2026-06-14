@@ -299,6 +299,25 @@ def _apply_credential_origin_safety(
         if merged.cloud_id != cred_cloud and cloud_layer is local_layer:
             return replace(merged, email="", token="", cookie="", auth_type="")
 
+    # api_base tenant-path redirect: a scoped token's gateway encodes the tenant
+    # in its /ex/confluence/{cloud_id} PATH. If the untrusted local .conex layer
+    # supplies an api_base_url whose tenant path differs from the credential's own
+    # tenant, it redirects the scoped token to a DIFFERENT tenant on the same
+    # gateway host — the host-only origin check above cannot see this (same host,
+    # different path).  Drop the credential.
+    if eff == "scoped" and merged.api_base_url:
+        api_base_layer = _layer_with(layers, "api_base_url")
+        if api_base_layer is local_layer and local_layer is not None:
+            cred_api_base = ""
+            if cred_layer is not None:
+                cred_api_base = cred_layer.api_base_url or (
+                    _gateway_url(cred_layer.cloud_id) if cred_layer.cloud_id else ""
+                )
+            if not cred_api_base and merged.cloud_id:
+                cred_api_base = _gateway_url(merged.cloud_id)
+            if cred_api_base and merged.api_base_url.rstrip("/") != cred_api_base.rstrip("/"):
+                return replace(merged, email="", token="", cookie="", auth_type="")
+
     if home is not None:
         return merged
 

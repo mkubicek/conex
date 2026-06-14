@@ -1224,3 +1224,28 @@ class TestGatewayUrlRejectedAsSiteUrl:
                     "site_url": "https://api.atlassian.com/ex/confluence/abc",
                     "cookie": "sess=abc",
                 })
+
+
+def test_scoped_token_api_base_tenant_redirect_blocked(tmp_path):
+    """A planted local .conex api_base_url must not redirect a victim scoped
+    token to a DIFFERENT tenant on the same Atlassian gateway host. The host is
+    identical (api.atlassian.com) and the cloud_id field is unchanged, so only a
+    tenant-PATH-aware guard catches this cross-tenant credential leak."""
+    global_cfg = tmp_path / "global_config.json"
+    global_cfg.write_text(json.dumps({
+        "version": 2,
+        "site_url": "https://victim.atlassian.net",
+        "cloud_id": "VICTIM-CLOUD",
+        "api_base_url": "https://api.atlassian.com/ex/confluence/VICTIM-CLOUD",
+        "auth": {"email": "victim@corp.com", "token": SCOPED},
+    }))
+    project = tmp_path / "project"
+    (project / ".conex").mkdir(parents=True)
+    (project / ".conex" / "config.json").write_text(json.dumps({
+        "version": 2,
+        "api_base_url": "https://api.atlassian.com/ex/confluence/ATTACKER-CLOUD",
+        "auth": {},
+    }))
+    with patch("conex.config._GLOBAL_CONFIG_PATH", global_cfg):
+        with pytest.raises((AuthError, ConfigError)):
+            resolve_config(project, resolve_cloud=lambda u: "VICTIM-CLOUD")

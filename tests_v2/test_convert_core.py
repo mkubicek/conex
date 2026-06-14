@@ -1313,3 +1313,88 @@ class TestAdfExtensionUnwrap:
         )
         assert "macro: unnamed" not in md
         assert "macro: " not in md
+
+
+# ---------------------------------------------------------------------------
+# Blind-spot review: conversion injection + data-loss (TDD)
+# ---------------------------------------------------------------------------
+
+
+class TestConversionInjection:
+    def test_widget_url_must_not_inject_javascript_scheme(self):
+        html = (
+            '<ac:structured-macro ac:name="widget">'
+            '<ac:parameter ac:name="url">javascript:alert(document.cookie)</ac:parameter>'
+            "</ac:structured-macro>"
+        )
+        out = convert_page(html, _make_ctx(page=_make_page(title="T")))
+        # No active markdown link with a javascript: target (a visible
+        # placeholder echoing the param text is fine — it is not a clickable sink).
+        assert "](javascript:" not in out, out
+
+    def test_page_title_newlines_must_not_inject_markdown(self):
+        title = "Innocent\n\n## Injected H2\n\n[evil](javascript:alert(1))"
+        out = convert_page("<p>body</p>", _make_ctx(page=_make_page(title=title)))
+        assert "## Injected H2" not in out, out      # no injected heading (# escaped)
+        assert "[evil](javascript:" not in out, out  # injected link neutralised ([ escaped)
+
+    def test_ri_url_image_src_must_not_corrupt_markdown(self):
+        html = '<ac:image><ri:url ri:value="http://h/a)x(y"/></ac:image>'
+        out = convert_page(html, _make_ctx(page=_make_page(title="T")))
+        assert "![](http://h/a)x(y)" not in out, out
+
+
+class TestConversionDataLoss:
+    def test_malformed_panel_body_not_mangled_into_title(self):
+        html = (
+            '<ac:structured-macro ac:name="panel">'
+            '<ac:parameter ac:name="title">Status'
+            "<ac:rich-text-body><p>Important paragraph that must survive</p>"
+            "</ac:rich-text-body>"
+            "</ac:structured-macro>"
+        )
+        md = convert_page(html, _make_ctx(page=_make_page(title="T")))
+        assert "StatusImportant" not in md, f"body fused into title: {md!r}"
+        assert "Important paragraph that must survive" in md
+
+    def test_unknown_macro_image_only_body_preserved(self):
+        att = Attachment(id="a1", title="pic.png", media_type="image/png")
+        html = (
+            '<ac:structured-macro ac:name="some-future-macro"><ac:rich-text-body>'
+            '<ac:image><ri:attachment ri:filename="pic.png"/></ac:image>'
+            "</ac:rich-text-body></ac:structured-macro>"
+        )
+        md = convert_page(
+            html,
+            _make_ctx(page=_make_page(title="T"), attachments=[att],
+                      media_available={"pic.png"}),
+        )
+        assert ".media/pic.png" in md, f"image silently dropped: {md!r}"
+        assert "Confluence dynamic content" not in md
+
+    def test_ac_link_ri_url_preserves_destination(self):
+        html = (
+            "<p>visit <ac:link><ri:url ri:value=\"https://external.example.com/page\"/>"
+            "<ac:plain-text-link-body>External Site</ac:plain-text-link-body>"
+            "</ac:link></p>"
+        )
+        md = convert_page(html, _make_ctx(page=_make_page(title="T")))
+        assert "https://external.example.com/page" in md, f"external URL lost: {md!r}"
+
+    def test_emoticon_emoji_fallback_used(self):
+        html = (
+            '<p>party <ac:emoticon ac:name="party-popper" '
+            'ac:emoji-fallback="\U0001F389"/> time</p>'
+        )
+        md = convert_page(html, _make_ctx(page=_make_page(title="T")))
+        assert "\U0001F389" in md, f"emoji fallback char dropped: {md!r}"
+
+    def test_task_body_link_url_preserved(self):
+        html = (
+            "<ac:task-list><ac:task>"
+            "<ac:task-status>incomplete</ac:task-status>"
+            '<ac:task-body>See <a href="https://docs.example.com/x">the docs</a>'
+            "</ac:task-body></ac:task></ac:task-list>"
+        )
+        md = convert_page(html, _make_ctx(page=_make_page(title="T")))
+        assert "https://docs.example.com/x" in md, f"task link URL lost: {md!r}"

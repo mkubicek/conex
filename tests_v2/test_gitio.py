@@ -605,3 +605,32 @@ class TestRoundTrip:
         assert msgs[0] == "Export: update"
         assert msgs[1] == "Local changes before export"
         assert msgs[2] == "Export: initial"
+
+
+def test_failed_export_commit_does_not_leak_staged_index(tmp_path: Path) -> None:
+    """A failed commit in commit_export must leave a CLEAN index, else the next
+    run's commit_user_changes commits the export under the wrong message."""
+    root = tmp_path / "export"
+    root.mkdir()
+    _init_repo(root)
+    (root / "seed.txt").write_text("seed", encoding="utf-8")
+    _git(root, "add", "seed.txt")
+    _git(root, "commit", "-m", "initial")
+
+    page = root / "Page.md"
+    page.write_text("# Page", encoding="utf-8")
+    result = _BuildResult(written=[page])
+
+    real_run = gitio._run_git
+
+    def failing_run(repo_dir, *args, **kwargs):
+        if args and args[0] == "commit":
+            raise GitError("simulated mid-way commit failure")
+        return real_run(repo_dir, *args, **kwargs)
+
+    with mock.patch("conex.gitio._run_git", side_effect=failing_run):
+        with pytest.raises(GitError):
+            gitio.commit_export(root, result, "conex export TEST")
+
+    staged = _git(root, "diff", "--cached", "--name-only").stdout.split()
+    assert "Page.md" not in staged, f"failed commit leaked staged paths: {staged}"

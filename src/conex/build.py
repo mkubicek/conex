@@ -110,6 +110,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import os
+import re
 import shutil
 import sys
 import warnings
@@ -170,6 +171,14 @@ class BuildOptions:
     subtree: str | None = None
     no_children: bool = False
     site_url: str = ""
+    allow_mass_delete: bool = False  # bypass the H4 large-deletion safety valve
+
+
+# Large-deletion safety valve (H4): on a full export, refuse to prune more than
+# this fraction of a non-trivial prior export in one run (a likely-truncated
+# listing) unless allow_mass_delete is set.
+_MASS_DELETE_MIN_PREV: int = 10
+_MASS_DELETE_FRAC: float = 0.5
 
 
 @dataclass
@@ -203,6 +212,7 @@ def _fingerprint(
     name_plan: "AttachmentNamePlan",  # type: ignore[name-defined]
     derived_png_digests: list[str],
     opts: BuildOptions,
+    author_resolution: list[tuple[str, str]] | None = None,
 ) -> str:
     """Compute the build fingerprint for a single page.
 
@@ -237,6 +247,12 @@ def _fingerprint(
 
     _add(body_blob_digest)
     _add(sorted(derived_png_digests))
+
+    # Author resolution (mentions + frontmatter): the (account_id, resolved_name)
+    # pairs this page references, plus the lookup flag. A change here must rewrite
+    # the page so a now-resolvable @mention is no longer frozen as the raw id.
+    _add(opts.author_lookup)
+    _add(author_resolution or [])
 
     return h.hexdigest()
 
@@ -742,6 +758,22 @@ def build(
 
         body_digest = snapshot.body_blobs.get(page.id, "")
 
+        # Author resolution affects rendered output (user mentions + frontmatter),
+        # so the skip fingerprint must change when a referenced author's resolved
+        # name — or the author_lookup flag — changes; otherwise a page stale-skips
+        # and a now-resolvable @mention stays frozen as the raw account id. Read
+        # the body only when author_lookup is on (when off, mentions always render
+        # as raw ids, so resolution cannot change the output).
+        author_resolution: list[tuple[str, str]] = []
+        if opts.author_lookup:
+            ids: set[str] = set()
+            if page.version.author_id:
+                ids.add(page.version.author_id)
+            if body_digest and blobs.has(body_digest):
+                for m in re.findall(rb'account-id="([^"]+)"', blobs.read_bytes(body_digest)):
+                    ids.add(m.decode("utf-8", "replace"))
+            author_resolution = sorted((aid, snapshot.users.get(aid, "")) for aid in ids)
+
         # Collect derived png digests that are ACTUALLY used for this page.
         used_png_digests: list[str] = []
         for xml_att in atts:
@@ -756,7 +788,8 @@ def build(
                     used_png_digests.append(d)
 
         fingerprints[page.id] = _fingerprint(
-            page, body_digest, atts, np, used_png_digests, opts
+            page, body_digest, atts, np, used_png_digests, opts,
+            author_resolution=author_resolution,
         )
 
     # -----------------------------------------------------------------------
@@ -1196,6 +1229,34 @@ def build(
         result.warnings.append(msg)
         warnings.warn(msg, stacklevel=2)
         return result, prev
+
+    # H4 large-deletion safety valve — FULL-SPACE only. A truncated-but-200 page
+    # listing (results present, _links.next dropped) is non-empty, so the I2
+    # guard above does not fire, yet it would prune most of a prior export. Refuse
+    # to prune a large fraction of a non-trivial prior export in one run unless
+    # explicitly confirmed. (Archived pages preserved by I3 are not "pruned".)
+    if (
+        opts.subtree is None
+        and not opts.allow_mass_delete
+        and prev is not None
+        and len(prev.pages) >= _MASS_DELETE_MIN_PREV
+    ):
+        prune_ids = [
+            pid
+            for pid, ps in prev.pages.items()
+            if pid not in plan.dirs
+            and not (ps.status == "archived" and not snapshot.include_archived)
+        ]
+        if len(prune_ids) > _MASS_DELETE_FRAC * len(prev.pages):
+            msg = (
+                f"build: refusing to prune {len(prune_ids)}/{len(prev.pages)} pages "
+                f"in one run (> {int(_MASS_DELETE_FRAC * 100)}% — a likely-truncated "
+                f"page listing); re-run with allow_mass_delete to confirm a genuine "
+                f"large deletion"
+            )
+            result.warnings.append(msg)
+            warnings.warn(msg, stacklevel=2)
+            return result, prev
 
     # Defense-in-depth: a subtree was requested but its planned dir could not be
     # resolved (a truly-missing/typo'd --path).  Without a subtree_dir the

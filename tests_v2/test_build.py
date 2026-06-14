@@ -3091,3 +3091,59 @@ class TestDerivedBlobGc:
         )
         build(tmp_root, snap, blobs, None, default_opts(render_drawio=False))
         assert blobs.has(rendered), "a live current-version derived blob must be kept"
+
+
+# ---------------------------------------------------------------------------
+# Blind-spot: H4 large-deletion safety valve + fingerprint author resolution
+# ---------------------------------------------------------------------------
+
+
+class TestMassDeleteValve:
+    def test_truncated_listing_does_not_mass_prune(self, tmp_root, blobs):
+        opts = default_opts()
+        pages_full = [make_page(f"p{i}", f"Page {i}") for i in range(50)]
+        body_full = {f"p{i}": seed_blob(blobs, f"<p>{i}</p>".encode()) for i in range(50)}
+        _, state1 = build(tmp_root, make_snapshot(pages=pages_full, body_blobs=body_full),
+                          blobs, None, opts)
+        assert len(state1.pages) == 50
+
+        # A truncated-but-200 listing arrives with only 2 of the 50 pages.
+        snap_trunc = make_snapshot(
+            pages=[make_page("p0", "Page 0"), make_page("p1", "Page 1")],
+            body_blobs={"p0": body_full["p0"], "p1": body_full["p1"]},
+        )
+        result2, state2 = build(tmp_root, snap_trunc, blobs, state1, opts)
+        pruned = len(state1.pages) - len(state2.pages)
+        assert pruned < 25, f"mass-prune not blocked: pruned={pruned}, del={len(result2.deleted)}"
+        assert any("refusing to prune" in w for w in result2.warnings)
+
+    def test_allow_mass_delete_bypasses_valve(self, tmp_root, blobs):
+        opts = default_opts()
+        pages_full = [make_page(f"p{i}", f"Page {i}") for i in range(50)]
+        body_full = {f"p{i}": seed_blob(blobs, f"<p>{i}</p>".encode()) for i in range(50)}
+        _, state1 = build(tmp_root, make_snapshot(pages=pages_full, body_blobs=body_full),
+                          blobs, None, opts)
+        snap_small = make_snapshot(
+            pages=[make_page("p0", "Page 0")], body_blobs={"p0": body_full["p0"]},
+        )
+        _, state2 = build(tmp_root, snap_small, blobs, state1, default_opts(allow_mass_delete=True))
+        assert len(state2.pages) == 1, "allow_mass_delete must permit the large prune"
+
+
+class TestFingerprintAuthorResolution:
+    def test_mention_rewrites_when_user_becomes_resolvable(self, tmp_root, blobs):
+        body = b'<p>Hi <ri:user ri:account-id="acc9"/></p>'
+        body_d = seed_blob(blobs, body)
+        page = make_page("p1", "Page")
+        opts = default_opts()  # author_lookup True by default
+
+        snap1 = make_snapshot(pages=[page], body_blobs={"p1": body_d}, users={})
+        _, state1 = build(tmp_root, snap1, blobs, None, opts, api=None)
+        md1 = (tmp_root / state1.pages["p1"].file).read_text()
+        assert "acc9" in md1
+
+        snap2 = make_snapshot(pages=[page], body_blobs={"p1": body_d},
+                              users={"acc9": "Bob Builder"})
+        result2, state2 = build(tmp_root, snap2, blobs, state1, opts, api=None)
+        md2 = (tmp_root / state2.pages["p1"].file).read_text()
+        assert "Bob Builder" in md2, f"stale skip — mention not re-resolved: {md2!r}"

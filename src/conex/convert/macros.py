@@ -77,6 +77,26 @@ def _media_url(name: str) -> str:
     return f".media/{urllib.parse.quote(name, safe='')}"
 
 
+_SAFE_URL_SCHEMES = ("http://", "https://", "mailto:")
+
+
+def _safe_external_url(url: str) -> str:
+    """Sanitise a user-controlled URL for an href; "" means drop it.
+
+    Allows only http/https/mailto absolute schemes (blocks javascript:, data:,
+    ...), leaves relative URLs untouched, and percent-encodes spaces/parens that
+    would corrupt a markdown link target.  (Duplicated from render.py — macros
+    cannot import render without a circular import.)
+    """
+    u = (url or "").strip()
+    if not u:
+        return ""
+    head = u.split("/", 1)[0]
+    if ":" in head and not u.lower().startswith(_SAFE_URL_SCHEMES):
+        return ""
+    return urllib.parse.quote(u, safe=":/?#[]@!$&'*+,;=~.-_%")
+
+
 def _media_available(name: str, ctx: "ConvertContext") -> bool:
     """Return True when the file is confirmed present for this page this run."""
     if not ctx.media_enabled:
@@ -113,10 +133,32 @@ def _own_title_and_body_children(
 
     PORT: v1 ``_own_title_and_body_children`` semantics.
     """
-    title_text = macro.params.get("title", "").strip()
+    rich_body = macro.rich_body
 
-    if macro.rich_body is not None:
-        children = [el.extract() for el in list(macro.rich_body.children)]
+    # Malformed-storage recovery: an unclosed <ac:parameter ac:name="title">
+    # swallows the following <ac:rich-text-body>, so parse_macro sees no DIRECT
+    # rich body and the param's get_text() FUSES the body text into the title
+    # (e.g. "Status" + "Important paragraph" -> "StatusImportant..."), losing the
+    # body. Detect the nested body, recover it, and read the title from the param
+    # after detaching it. Well-formed macros have no nested body, so title/body
+    # stay byte-identical.
+    title_param = None
+    for p in macro.element.find_all("ac:parameter", recursive=False):
+        if str(p.get("ac:name", "")) == "title":
+            title_param = p
+            break
+    if rich_body is None and title_param is not None:
+        nested = title_param.find("ac:rich-text-body")
+        if nested is not None:
+            rich_body = nested.extract()
+
+    if title_param is not None:
+        title_text = title_param.get_text().strip()
+    else:
+        title_text = macro.params.get("title", "").strip()
+
+    if rich_body is not None:
+        children = [el.extract() for el in list(rich_body.children)]
     else:
         children = [
             el.extract()
@@ -687,7 +729,7 @@ def handle_widget(macro: Macro, ctx: "ConvertContext") -> Replacement:
 
     Falls back to a comment placeholder when no URL is available.
     """
-    url = macro.params.get("url", "").strip()
+    url = _safe_external_url(macro.params.get("url", "").strip())
     if not url:
         return dynamic_macro_placeholder(macro)
 
