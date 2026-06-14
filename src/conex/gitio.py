@@ -216,10 +216,10 @@ def commit_user_changes(root: Path) -> bool:
 def commit_export(root: Path, result: Any, message: str) -> bool:
     """Stage exactly the build's written + deleted paths and commit.
 
-    Invariant I8: stages ONLY result.written (additions/updates) and
-    result.deleted (removals). Never uses git add -A or -u.  Paths are
-    chunked to respect argv limits.  .conex/ paths are unstaged after
-    staging (belt-and-suspenders).
+    Invariant I8: stages ONLY result.written (additions/updates),
+    result.deleted (removals), and the conex-managed root .gitignore. Never
+    uses git add -A or -u.  Paths are chunked to respect argv limits.  .conex/
+    paths are unstaged after staging (belt-and-suspenders).
 
     Returns True iff a commit was created (empty delta → False).
     Raises GitError on subprocess failure.
@@ -267,6 +267,13 @@ def commit_export(root: Path, result: Any, message: str) -> bool:
     all_deleted_strs = deleted_strs + written_vanished
     for batch in _chunked_paths(all_deleted_strs):
         _run_git(root, "rm", "--cached", "--ignore-unmatch", "--", *batch)
+
+    # Stage the conex-managed .gitignore (it carries the `.conex/` ignore rule)
+    # so the working tree is clean after an export instead of leaving it
+    # untracked forever.  A no-op when already tracked-and-unchanged; a tracked
+    # file with user edits was already committed by commit_user_changes.
+    if (root / ".gitignore").exists():
+        _run_git(root, "add", "--", ".gitignore")
 
     _unstage_conex_paths(root)
 

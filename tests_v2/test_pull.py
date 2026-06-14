@@ -1440,3 +1440,32 @@ class TestArchivedDefault:
         ids = {p.id for p in snap.pages}
         assert ids == {"p1", "p2"}, "--include-archived must keep archived pages"
         assert snap.include_archived is True
+
+
+# ---------------------------------------------------------------------------
+# Bug 2: pull-stage failures are recorded on the snapshot (surfaced by the CLI)
+# ---------------------------------------------------------------------------
+
+
+class TestPullWarningsRecorded:
+    def test_download_failure_recorded_in_snapshot_warnings(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        att = Attachment(
+            id="bad", title="broken.png", page_id="p1",
+            download_url="http://fake/broken.png", version=PageVersion(number=1),
+        )
+        api = FakeAPI(
+            pages=[Page(id="p1", title="P1", space_id="S1", body_storage="x")],
+            attachments={"p1": [att]},
+            download_error={"http://fake/broken.png": RuntimeError("timeout")},
+        )
+        snap = pull(api, "TEST", tmp_root, blobs, None, _default_opts(fetch_media=True))
+        assert any("broken.png" in w for w in snap.warnings), snap.warnings
+
+    def test_clean_run_has_no_warnings(self, tmp_root: Path, blobs: BlobStore) -> None:
+        api = FakeAPI(
+            pages=[Page(id="p1", title="P1", space_id="S1", body_storage="x")],
+        )
+        snap = pull(api, "TEST", tmp_root, blobs, None, _default_opts(fetch_media=True))
+        assert snap.warnings == []

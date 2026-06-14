@@ -109,6 +109,9 @@ class Snapshot(NullTolerantModel):
       delete existing media files for that run.
     - include_archived records what was ACTUALLY fetched (False when the
       API dialect cannot return archived pages), not what was requested.
+    - warnings records human-readable pull-stage failures (a body, attachment
+      listing, or download that failed) so the CLI summary/recap can surface
+      partial-fetch loss that would otherwise only appear inline on stderr.
     - space defaults to Space() so that a completely empty dict round-trips
       without error.
     """
@@ -125,6 +128,7 @@ class Snapshot(NullTolerantModel):
     attachment_blobs: dict[str, str] = {}
     derived_blobs: dict[str, str] = {}
     users: dict[str, str] = {}
+    warnings: list[str] = []
 
 
 # ---------------------------------------------------------------------------

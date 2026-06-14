@@ -1399,3 +1399,63 @@ def test_print_tree_shows_folders_nested(capsys):
     # Folder shown with a trailing marker at top level; its page nests deeper.
     assert not docs.startswith(" ")
     assert inside.startswith("  ")
+
+
+# ---------------------------------------------------------------------------
+# Bug 1: tree/find exclude archived pages (mirror plain export's default)
+# ---------------------------------------------------------------------------
+
+
+def test_tree_excludes_archived_pages(tmp_path, capsys):
+    from conex.cli import main
+    from conex.models import Page, Space
+
+    space = Space(id="S1", key="TS", name="Test Space")
+    mock_api = MagicMock()
+    mock_api.get_space.return_value = space
+    mock_api.get_pages.return_value = [
+        Page(id="P1", title="LivePage", space_id="S1"),
+        Page(id="P2", title="ArchivedPage", space_id="S1", status="archived"),
+    ]
+    mock_api.get_folders.return_value = []
+
+    with patch("conex.cli.resolve_config", return_value=_make_mock_cfg()), \
+         patch("conex.api.make_api", return_value=mock_api):
+        try:
+            main(["tree", "TS"])
+        except SystemExit as e:
+            if e.code not in (0, None):
+                raise
+
+    out = capsys.readouterr().out
+    assert "LivePage" in out
+    assert "ArchivedPage" not in out, "tree must not list archived pages"
+    assert "1 pages" in out, "page count must exclude archived"
+
+
+def test_find_excludes_archived_pages(tmp_path, capsys):
+    from conex.cli import main
+    from conex.models import Page, Space
+
+    space = Space(id="S1", key="TS", name="Test Space")
+    mock_api = MagicMock()
+    mock_api.get_space.return_value = space
+    mock_api.get_pages.return_value = [
+        Page(id="P1", title="Report Live", space_id="S1"),
+        Page(id="P2", title="Report Archived", space_id="S1", status="archived"),
+    ]
+    mock_api.get_folders.return_value = []
+
+    with patch("conex.cli.resolve_config", return_value=_make_mock_cfg()), \
+         patch("conex.api.make_api", return_value=mock_api):
+        try:
+            main(["find", "TS", "Report"])
+        except SystemExit as e:
+            if e.code not in (0, None):
+                raise
+
+    # find prints "<id>  <sanitized-path>"; the live page is listed, the
+    # archived one (P2) must be absent.
+    out = capsys.readouterr().out
+    assert "P1" in out and "Report-Live" in out
+    assert "P2" not in out and "Archived" not in out, "find must not match archived pages"

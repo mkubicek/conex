@@ -269,6 +269,9 @@ def _cmd_tree(args: argparse.Namespace) -> None:
         api = make_api(cfg)
         space = api.get_space(args.space_key)
         pages = api.get_pages(space.id, space.key, include_archived=False)
+        # v2 listings include archived pages regardless of the flag; exclude them
+        # so `tree` mirrors what a plain `export` writes (current-only).
+        pages = [p for p in pages if p.status != "archived"]
         folders = api.get_folders(space.id, pages)
     except ConexError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -326,6 +329,9 @@ def _cmd_find(args: argparse.Namespace) -> None:
         api = make_api(cfg)
         space = api.get_space(args.space_key)
         pages = api.get_pages(space.id, space.key, include_archived=False)
+        # v2 listings include archived pages regardless of the flag; exclude them
+        # so `find` mirrors what a plain `export` writes (current-only).
+        pages = [p for p in pages if p.status != "archived"]
         folders = api.get_folders(space.id, pages)
     except ConexError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -474,17 +480,25 @@ def _run_export(args: argparse.Namespace, cfg: ResolvedConfig, output_dir: Path)
         new_ids = set(new_state.pages.keys())
         pruned = len(prev_ids - new_ids)
 
-    print(
+    # Surface BOTH pull-stage warnings (failed body/listing/download — recorded
+    # on the snapshot) and build-stage warnings, so the summary reflects
+    # partial-fetch loss instead of a misleading clean "exit 0".
+    all_warnings = list(snapshot.warnings) + list(result.warnings)
+
+    summary = (
         f"Export complete: "
         f"{len(result.written)} written, "
         f"{result.skipped} skipped, "
         f"{len(result.moved)} moved, "
         f"{pruned} pruned"
     )
+    if all_warnings:
+        summary += f", {len(all_warnings)} warnings"
+    print(summary)
 
-    if result.warnings:
-        print(f"Warnings ({len(result.warnings)}):", file=sys.stderr)
-        for w in result.warnings:
+    if all_warnings:
+        print(f"Warnings ({len(all_warnings)}):", file=sys.stderr)
+        for w in all_warnings:
             print(f"  {w}", file=sys.stderr)
 
 

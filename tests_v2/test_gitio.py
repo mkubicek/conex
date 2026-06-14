@@ -299,6 +299,22 @@ class TestCommitExport:
         assert committed is True
         assert "Page.md" in _git(root, "ls-files").stdout
 
+    def test_export_commits_the_gitignore(self, tmp_path: Path) -> None:
+        """The conex-managed .gitignore is committed by the export, so the
+        working tree is clean afterwards (not left perpetually untracked)."""
+        root = tmp_path / "export"
+        root.mkdir()
+        _init_repo(root)
+        gitio.ensure_repo(root)  # creates the .gitignore with .conex/
+        assert ".gitignore" not in _git(root, "ls-files").stdout  # untracked pre-export
+        page = root / "Page.md"
+        page.write_text("# Page", encoding="utf-8")
+        committed = gitio.commit_export(root, _BuildResult(written=[page]), "Export")
+        assert committed is True
+        assert ".gitignore" in _git(root, "ls-files").stdout, ".gitignore must be committed"
+        # Working tree is clean (nothing left untracked/modified).
+        assert _git(root, "status", "--porcelain").stdout.strip() == ""
+
     def test_export_root_under_dotconex_ancestor_still_stages(self, tmp_path: Path) -> None:
         """Regression: an export rooted under an ancestor dir named .conex (e.g.
         ~/.conex/myspace) must still stage its files — the .conex exclusion is

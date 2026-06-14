@@ -95,15 +95,23 @@ def pull(
     (these are not best-effort).  Never raises for individual attachment
     download failures.
     """
+    # Pull-stage warnings: printed inline for live feedback AND collected so the
+    # CLI summary/recap (and any automation reading it) can see partial-fetch
+    # loss — a failed body/listing/download — not just exit 0.
+    pull_warnings: list[str] = []
+
+    def _record_warning(message: str) -> None:
+        print(message, file=sys.stderr)
+        pull_warnings.append(message)
+
     # ------------------------------------------------------------------
     # 1. Archived-mode compatibility check
     # ------------------------------------------------------------------
     effective_archived = opts.include_archived
     if opts.include_archived and not api.returns_archived:
-        print(
+        _record_warning(
             "conex: warning: include_archived=True requested but this auth mode "
-            "cannot list archived pages; fetching current pages only.",
-            file=sys.stderr,
+            "cannot list archived pages; fetching current pages only."
         )
         effective_archived = False
 
@@ -151,10 +159,9 @@ def pull(
             try:
                 body = api.get_page_body(page.id)
             except Exception as exc:
-                print(
+                _record_warning(
                     f"conex: warning: failed to fetch body for page "
-                    f"'{page.title}' ({page.id}): {exc}",
-                    file=sys.stderr,
+                    f"'{page.title}' ({page.id}): {exc}"
                 )
                 prev_digest = prev.body_blobs.get(page.id) if prev is not None else None
                 if prev_digest and blobs.has(prev_digest):
@@ -191,10 +198,9 @@ def pull(
         try:
             return page.id, api.get_attachments(page.id)
         except Exception as exc:
-            print(
+            _record_warning(
                 f"conex: warning: failed to list attachments for page "
-                f"'{page.title}' ({page.id}): {exc}",
-                file=sys.stderr,
+                f"'{page.title}' ({page.id}): {exc}"
             )
             return page.id, None
 
@@ -239,9 +245,8 @@ def pull(
             # Resolve absolute URL via the adapter (adapter owns URL construction).
             url = api.attachment_download_url(att)
             if not url:
-                print(
-                    f"conex: warning: no download URL for attachment '{att.title}'",
-                    file=sys.stderr,
+                _record_warning(
+                    f"conex: warning: no download URL for attachment '{att.title}'"
                 )
                 return att_key, None
             # Download
@@ -266,10 +271,9 @@ def pull(
                     resp.close()
                 return att_key, digest
             except Exception as exc:
-                print(
+                _record_warning(
                     f"conex: warning: failed to download attachment "
-                    f"'{att.title}': {exc}",
-                    file=sys.stderr,
+                    f"'{att.title}': {exc}"
                 )
                 return att_key, None
 
@@ -353,6 +357,7 @@ def pull(
         attachment_blobs=dict(sorted(attachment_blobs.items())),
         derived_blobs=dict(sorted(derived_blobs.items())),
         users=dict(sorted(users.items())),
+        warnings=pull_warnings,
     )
 
     store = SnapshotStore(root)
