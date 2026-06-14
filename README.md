@@ -1,12 +1,14 @@
-# confluence-export
+# conex
 
 [![CI](https://github.com/mkubicek/conex/actions/workflows/ci.yml/badge.svg)](https://github.com/mkubicek/conex/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/mkubicek/conex/branch/main/graph/badge.svg)](https://codecov.io/gh/mkubicek/conex)
 
-Export Confluence Cloud spaces as LLM-ready markdown.
+Export Confluence Cloud spaces as LLM-ready markdown — fast, read-only, and
+git-versioned. `conex` is the v2 exporter; the original `confluence-export` CLI
+is still installed from the same package for backward compatibility.
 
 ```bash
-confluence-export export SPACEKEY -o ./output
+conex export SPACEKEY -o ./output
 ```
 
 ```
@@ -107,7 +109,7 @@ possible later — none is fundamental, but all must be addressed:
 ## Setup
 
 ```bash
-confluence-export configure
+conex configure
 ```
 
 Stores your site URL and credentials to `~/.config/confluence-export/config.json`. You can also use env vars (`CONFLUENCE_SITE_URL`, `CONFLUENCE_BASE_URL`, `CONFLUENCE_API_BASE_URL`, `CONFLUENCE_CLOUD_ID`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`, `CONFLUENCE_PAT`, `CONFLUENCE_COOKIE`, `CONFLUENCE_AUTH_TYPE`) or CLI flags (`--site-url`, `--base-url`, `--api-base-url`, `--cloud-id`, `--email`, `--api-token`, `--cookie`, `--auth-type`, `-v`/`--verbose`).
@@ -115,7 +117,7 @@ Stores your site URL and credentials to `~/.config/confluence-export/config.json
 Use a local config when an export directory should override the global default:
 
 ```bash
-confluence-export configure --local ./docs
+conex configure --local ./docs
 ```
 
 Local configs are discovered from the output directory upward as `.conex/config.json`. Export git commits never stage files under `.conex/`.
@@ -123,7 +125,7 @@ Local configs are discovered from the output directory upward as `.conex/config.
 If you don't have an API token, you can authenticate with a browser cookie instead. Copy the `Cookie` header from DevTools (F12 > Network tab > any `/wiki/` request) and pass it with `--cookie`:
 
 ```bash
-confluence-export --base-url https://example.atlassian.net --cookie 'tenant.session.token=...' export SPACEKEY -o ./output
+conex --base-url https://example.atlassian.net --cookie 'tenant.session.token=...' export SPACEKEY -o ./output
 ```
 
 Cookie authentication uses Confluence's legacy REST read endpoints because Confluence Cloud REST v2 rejects browser session cookies. Use the normal site URL (`https://example.atlassian.net`), not the OAuth gateway URL. Cookie auth is an explicit mode and reports `API mode: Confluence REST v1 compatibility`.
@@ -148,27 +150,27 @@ Scoped tokens must be addressed via the OAuth gateway URL (`https://api.atlassia
 
 Before export, the tool prints the resolved config source, auth mode, API mode, site URL, output directory, and preflight checks. If auth, gateway routing, space resolution, page listing, attachment listing, or output writability fails, export stops before writing output.
 
-In non-interactive runs, commands never prompt for credentials. Run `confluence-export configure` or pass explicit flags/env vars before invoking export from automation.
+In non-interactive runs, commands never prompt for credentials. Run `conex configure` or pass explicit flags/env vars before invoking export from automation.
 
 ## Commands
 
 ```bash
-confluence-export spaces                              # list accessible spaces
-confluence-export tree SPACEKEY                       # show page hierarchy
-confluence-export find SPACEKEY "query"               # search pages by title
-confluence-export export SPACEKEY -o ./output         # export full space (refreshes from Confluence)
-confluence-export export SPACEKEY --path /Sub/Tree    # export a subtree
-confluence-export export SPACEKEY --no-children       # export a single page only
-confluence-export export SPACEKEY --include-archived  # also export archived pages (under _archived/)
-confluence-export export SPACEKEY --cached            # reuse the last cache, skip the refresh
-confluence-export export SPACEKEY --include-html      # save raw HTML next to the markdown
-confluence-export export SPACEKEY --no-media          # skip attachments
-confluence-export export SPACEKEY --no-drawio-render  # skip draw.io -> PNG rendering
-confluence-export export SPACEKEY --no-git            # skip git versioning
-confluence-export export SPACEKEY --no-author-lookup  # skip Confluence user lookup
-confluence-export diff SPACEKEY ./output              # compare export vs. live (read-only)
-confluence-export diff SPACEKEY ./output --path /Sub  # diff a subtree
-confluence-export refresh SPACEKEY                    # force-refresh cache
+conex spaces                              # list accessible spaces
+conex tree SPACEKEY                       # show page hierarchy
+conex find SPACEKEY "query"               # search pages by title
+conex export SPACEKEY -o ./output         # export full space (refreshes from Confluence)
+conex export SPACEKEY --path /Sub/Tree    # export a subtree
+conex export SPACEKEY --no-children       # export a single page only
+conex export SPACEKEY --include-archived  # also export archived pages (under _archived/)
+conex export SPACEKEY --cached            # reuse the last cache, skip the refresh
+conex export SPACEKEY --include-html      # save raw HTML next to the markdown
+conex export SPACEKEY --no-media          # skip attachments
+conex export SPACEKEY --no-drawio-render  # skip draw.io -> PNG rendering
+conex export SPACEKEY --no-git            # skip git versioning
+conex export SPACEKEY --no-author-lookup  # skip Confluence user lookup
+conex diff SPACEKEY ./output              # compare export vs. live (read-only)
+conex diff SPACEKEY ./output --path /Sub  # diff a subtree
+conex refresh SPACEKEY                    # force-refresh cache
 ```
 
 By default, `export` and `diff` **refresh from Confluence**. Pass `--cached` to `export` (or run `refresh` first) to reuse the last fetched cache without hitting the API.
