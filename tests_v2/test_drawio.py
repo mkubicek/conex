@@ -752,3 +752,138 @@ class TestRenderBatchFolderUnmappableFallback:
         assert len(argvs) >= 2, "per-file fallback should have been invoked"
         # Result must be populated (per-file succeeded)
         assert "diagram.drawio" in result, "per-file fallback must produce the result"
+
+
+# ---------------------------------------------------------------------------
+# Auto-scale by font size (_compute_render_scale)
+# ---------------------------------------------------------------------------
+
+
+class TestComputeRenderScale:
+    def _model(self, font: str | None, w: int, h: int) -> bytes:
+        style = f'style="fontSize={font};"' if font is not None else ""
+        return (
+            f'<mxGraphModel><root><mxCell {style}>'
+            f'<mxGeometry width="{w}" height="{h}"/></mxCell></root></mxGraphModel>'
+        ).encode()
+
+    def test_normal_font_stays_1x(self):
+        import conex.drawio as m
+        assert m._compute_render_scale(self._model("12", 400, 300)) == 1
+
+    def test_missing_font_defaults_to_1x(self):
+        import conex.drawio as m
+        assert m._compute_render_scale(self._model(None, 400, 300)) == 1
+
+    def test_tiny_font_scales_up(self):
+        import conex.drawio as m
+        # round(14/7) = 2
+        assert m._compute_render_scale(self._model("7", 400, 300)) == 2
+
+    def test_very_tiny_font_clamped_to_3(self):
+        import conex.drawio as m
+        # round(14/3) = 5, clamped to 3
+        assert m._compute_render_scale(self._model("3", 400, 300)) == 3
+
+    def test_large_diagram_caps_scale(self):
+        import conex.drawio as m
+        # font 4 wants 3x, but long edge 5000 caps at floor(12000/5000)=2
+        assert m._compute_render_scale(self._model("4", 5000, 1000)) == 2
+
+    def test_already_huge_diagram_never_below_1(self):
+        import conex.drawio as m
+        # long edge 20000 -> cap floor=0 -> clamped back to 1 (no upscale into
+        # the blank-PNG zone)
+        assert m._compute_render_scale(self._model("4", 20000, 1000)) == 1
+
+    def test_compressed_diagram_is_decoded(self):
+        import base64
+        import urllib.parse
+        import zlib
+
+        import conex.drawio as m
+
+        model = (
+            '<mxGraphModel><root><mxCell style="fontSize=6;">'
+            '<mxGeometry width="300" height="200"/></mxCell></root></mxGraphModel>'
+        )
+        payload = urllib.parse.quote(model)
+        comp = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+        raw = comp.compress(payload.encode()) + comp.flush()
+        b64 = base64.b64encode(raw).decode()
+        drawio_file = f'<mxfile><diagram id="d1">{b64}</diagram></mxfile>'.encode()
+        # font 6 -> round(14/6) = 2
+        assert m._compute_render_scale(drawio_file) == 2
+
+    def test_garbage_falls_back_to_1(self):
+        import conex.drawio as m
+        assert m._compute_render_scale(b"\x00\x01not xml") == 1
+
+
+# ---------------------------------------------------------------------------
+# render_batch passes --scale for tiny-font (hi-res) diagrams
+# ---------------------------------------------------------------------------
+
+
+class TestRenderScaleWiring:
+    def _reset_cache(self):
+        import conex.drawio as m
+        m._DRAWIO_CLI = None
+
+    def test_hires_diagram_renders_with_scale_flag(self, tmp_path):
+        self._reset_cache()
+        import conex.drawio as m
+
+        blobs = BlobStore(tmp_path)
+        # tiny font -> scale 2
+        xml = (
+            b'<mxGraphModel><root><mxCell style="fontSize=7;">'
+            b'<mxGeometry width="400" height="300"/></mxCell></root></mxGraphModel>'
+        )
+        digest = blobs.add_bytes(xml)
+
+        argvs: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            argvs.append(list(argv))
+            out_idx = argv.index("--output") + 1
+            Path(argv[out_idx]).write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+            return MagicMock(returncode=0)
+
+        with patch("conex.drawio.shutil.which", return_value="/usr/bin/drawio"):
+            with patch("conex.drawio.subprocess.run", side_effect=fake_run):
+                result = m.render_batch({"tiny.drawio": digest}, blobs)
+
+        assert "tiny.drawio" in result
+        # A hi-res diagram skips folder-mode and renders per-file WITH --scale 2.
+        assert any("--scale" in a and "2" in a for a in argvs), argvs
+
+    def test_normal_diagram_has_no_scale_flag(self, tmp_path):
+        self._reset_cache()
+        import conex.drawio as m
+
+        blobs = BlobStore(tmp_path)
+        xml = (
+            b'<mxGraphModel><root><mxCell style="fontSize=14;">'
+            b'<mxGeometry width="400" height="300"/></mxCell></root></mxGraphModel>'
+        )
+        digest = blobs.add_bytes(xml)
+
+        argvs: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            argvs.append(list(argv))
+            out_dir = Path(argv[argv.index("--output") + 1])
+            in_dir = Path(argv[-1])
+            for xml_file in in_dir.glob("drawio-src-*"):
+                (out_dir / (xml_file.name + ".png")).write_bytes(
+                    b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+                )
+            return MagicMock(returncode=0)
+
+        with patch("conex.drawio.shutil.which", return_value="/usr/bin/drawio"):
+            with patch("conex.drawio.subprocess.run", side_effect=fake_run):
+                result = m.render_batch({"normal.drawio": digest}, blobs)
+
+        assert "normal.drawio" in result
+        assert all("--scale" not in a for a in argvs), argvs

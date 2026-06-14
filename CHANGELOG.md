@@ -19,6 +19,12 @@ Confluence exporter. It ships as the `conex` CLI; the original
   content-addressed blob store with `.conex/state.json` + `snapshot.json`.
 - Folder hierarchy support on the v2 API (discovered from the page set), an
   exclusive run lock, crash-durable atomic writes (fsync), and a blob GC.
+- draw.io diagrams that conex renders itself (no fresh Confluence preview) are
+  rendered via the draw.io desktop CLI at a **readability-driven scale**:
+  `scale = clamp(round(14 / smallest_font_px), 1, 3)`, hard-capped so output
+  stays under ~12k px (draw.io's blank-PNG threshold). Tiny-font diagrams come
+  out legible; normal ones stay 1x. The render cache is keyed by render version,
+  and stale renders are reclaimed by GC.
 - `conex --version`.
 
 ### Notes

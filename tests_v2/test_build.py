@@ -3017,3 +3017,51 @@ class TestMarkdownTrailingNewline:
         build(tmp_root, snap, blobs, None, default_opts())
         md = tmp_root / "My-Space" / "T" / "T.md"
         assert md.read_text(encoding="utf-8").endswith("\n")
+
+
+# ---------------------------------------------------------------------------
+# derived_blobs GC: stale-version / orphaned renders are reclaimed
+# ---------------------------------------------------------------------------
+
+
+class TestDerivedBlobGc:
+    def test_stale_render_version_derived_blob_is_gced(self, tmp_root, blobs):
+        body = seed_blob(blobs, b"<p>x</p>")
+        stale = seed_blob(blobs, b"OLD-RENDER")
+        old_key = f"drawio-png:v{_get_drawio_render_version() - 1}:deadbeef"
+        snap = make_snapshot(
+            pages=[make_page("p1", "P")],
+            body_blobs={"p1": body},
+            derived_blobs={old_key: stale},
+        )
+        build(tmp_root, snap, blobs, None, default_opts(render_drawio=False))
+        assert not blobs.has(stale), "stale render-version derived blob must be GC'd"
+
+    def test_orphaned_diagram_derived_blob_is_gced(self, tmp_root, blobs):
+        body = seed_blob(blobs, b"<p>x</p>")
+        orphan = seed_blob(blobs, b"ORPHAN-RENDER")
+        # Current version, but its source xml digest is no longer an attachment.
+        key = f"drawio-png:v{_get_drawio_render_version()}:nolongerpresent"
+        snap = make_snapshot(
+            pages=[make_page("p1", "P")],
+            body_blobs={"p1": body},
+            derived_blobs={key: orphan},
+        )
+        build(tmp_root, snap, blobs, None, default_opts(render_drawio=False))
+        assert not blobs.has(orphan), "derived blob of a deleted diagram must be GC'd"
+
+    def test_live_current_version_derived_blob_is_kept(self, tmp_root, blobs):
+        body = seed_blob(blobs, b"<p>x</p>")
+        xml_digest = seed_blob(blobs, b"<mxGraphModel/>")
+        rendered = seed_blob(blobs, b"LIVE-RENDER")
+        key = f"drawio-png:v{_get_drawio_render_version()}:{xml_digest}"
+        att = make_attachment("a1", "d.drawio", version=1)
+        snap = make_snapshot(
+            pages=[make_page("p1", "P")],
+            body_blobs={"p1": body},
+            attachments={"p1": [att]},
+            attachment_blobs={"a1@1": xml_digest},
+            derived_blobs={key: rendered},
+        )
+        build(tmp_root, snap, blobs, None, default_opts(render_drawio=False))
+        assert blobs.has(rendered), "a live current-version derived blob must be kept"

@@ -1296,7 +1296,19 @@ def build(
     keep: set[str] = set()
     keep.update(snapshot.body_blobs.values())
     keep.update(snapshot.attachment_blobs.values())
-    keep.update(snapshot.derived_blobs.values())
+    # Derived (drawio) renders: keep ONLY entries for the CURRENT render version
+    # whose source xml is still a current attachment.  Stale-version renders (a
+    # DRAWIO_RENDER_VERSION bump) and renders of deleted diagrams are dropped
+    # from the keep-set so GC reclaims their blobs instead of pinning them
+    # forever (derived_blobs is carried forward verbatim by pull).
+    _current_prefix = f"drawio-png:v{_get_drawio_render_version()}:"
+    _live_xml_digests = set(snapshot.attachment_blobs.values())
+    for derived_key, derived_digest in snapshot.derived_blobs.items():
+        if not derived_key.startswith(_current_prefix):
+            continue
+        xml_digest = derived_key[len(_current_prefix):]
+        if xml_digest in _live_xml_digests:
+            keep.add(derived_digest)
     # Freshly-rendered drawio PNGs are not yet in snapshot.derived_blobs;
     # include them explicitly so GC does not delete them on the same build.
     keep.update(freshly_rendered_digests)
