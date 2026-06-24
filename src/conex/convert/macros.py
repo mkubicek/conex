@@ -439,6 +439,43 @@ def _match_drawio_attachment(diagram_name: str, ctx: "ConvertContext"):
     return None
 
 
+_DRAWIO_PREVIEW_RE = re.compile(r"\.drawio-[0-9a-f]+\.png$", re.IGNORECASE)
+
+
+def _match_drawio_preview_png(diagram_name: str, ctx: "ConvertContext"):
+    """Return the plugin-authored PNG preview :class:`Attachment`, or ``None``.
+
+    The Confluence draw.io plugin keeps the editable diagram in its own storage
+    and exposes only an auto-generated PNG preview attachment named
+    ``<diagramName>.drawio-<sha1>.png`` (``image/png``) — there is no
+    downloadable ``.drawio`` source to render.  When conex rendered nothing and
+    no source attachment exists, this preview is the only usable image, so we
+    fall back to it instead of emitting a dead placeholder (issue #51).
+
+    Matching is anchored on the macro's ``diagramName`` (case/whitespace
+    tolerant) and is sha-agnostic, so it keeps tracking the preview across
+    edits even if the plugin re-uploads under a new hash.  When several
+    revisions match, the most recent (by ``version.created_at``) wins.
+    """
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", s.strip()).casefold().removesuffix(".drawio")
+
+    target = _norm(diagram_name)
+    candidates = []
+    for att in ctx.attachments:
+        if att.media_type.casefold() != "image/png":
+            continue
+        m = _DRAWIO_PREVIEW_RE.search(att.title)
+        if m is None:
+            continue
+        # att.title is "<stem>.drawio-<sha1>.png"; the stem must name the diagram.
+        if _norm(att.title[: m.start()]) == target:
+            candidates.append(att)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda a: a.version.created_at)
+
+
 def _match_drawio_attachment_local_name(
     diagram_name: str, ctx: "ConvertContext"
 ) -> str | None:
@@ -486,6 +523,17 @@ def _emit_drawio(macro: Macro, ctx: "ConvertContext", diagram_name: str) -> Repl
         if key in ctx.rendered_drawio:
             png_name = ctx.rendered_drawio[key]
             break
+
+    # Issue #51: source-less plugin diagram — conex rendered nothing and there
+    # is no .drawio source attachment, but the plugin's own PNG preview is
+    # already downloaded into .media/.  Reference it (verbatim name) instead of
+    # the dead placeholder.  Only when no render and no source exist.
+    if png_name is None and matched is None:
+        preview = _match_drawio_preview_png(diagram_name, ctx)
+        if preview is not None:
+            preview_local = ctx.media.filename_for_title(preview.title)
+            if ctx.media_enabled and preview_local in ctx.media_available:
+                png_name = preview_local
 
     source_tracked = ctx.media_enabled and source_local_name in ctx.media_available
 
