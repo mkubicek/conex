@@ -558,6 +558,71 @@ class TestDrawioMacro:
         out = _run(xml, ctx)
         assert "Draw.io source" in out
 
+    def test_plugin_preview_png_fallback_emits_img(self) -> None:
+        """Issue #51: a diagram authored with the draw.io Confluence plugin has
+        no .drawio source — only an auto-generated ``<name>.drawio-<sha1>.png``
+        preview attachment.  conex must reference that PNG instead of the
+        'not rendered' placeholder."""
+        att = _make_att(
+            id="p1",
+            title="mydiagram.drawio-ab12cd9.png",
+            media_type="image/png",
+        )
+        local = MediaRefs.from_attachments([att]).filename_for_title(att.title)
+        ctx = _make_ctx(
+            attachments=[att],
+            rendered_drawio={},  # conex rendered nothing (no source to render)
+            media_available={local},  # preview PNG is on disk
+        )
+        out = _run(
+            '<ac:structured-macro ac:name="drawio">'
+            '<ac:parameter ac:name="diagramName">mydiagram</ac:parameter>'
+            "</ac:structured-macro>",
+            ctx,
+        )
+        assert "not rendered" not in out.lower()
+        assert local in out
+        assert "Draw.io source" not in out  # no source exists, so no source link
+
+    def test_plugin_preview_png_not_used_when_media_disabled(self) -> None:
+        """--no-media runs have nothing on disk, so the placeholder stands."""
+        att = _make_att(
+            id="p1",
+            title="mydiagram.drawio-ab12cd9.png",
+            media_type="image/png",
+        )
+        ctx = _make_ctx(
+            attachments=[att],
+            rendered_drawio={},
+            media_enabled=False,
+            media_available=set(),
+        )
+        out = _run(
+            '<ac:structured-macro ac:name="drawio">'
+            '<ac:parameter ac:name="diagramName">mydiagram</ac:parameter>'
+            "</ac:structured-macro>",
+            ctx,
+        )
+        assert "not rendered" in out.lower()
+
+    def test_unrelated_png_does_not_trigger_preview_fallback(self) -> None:
+        """A PNG that is not a ``<diagramName>.drawio-<sha1>.png`` preview must
+        not be mistaken for the diagram — the placeholder stands."""
+        att = _make_att(id="p1", title="mydiagram.png", media_type="image/png")
+        local = MediaRefs.from_attachments([att]).filename_for_title(att.title)
+        ctx = _make_ctx(
+            attachments=[att],
+            rendered_drawio={},
+            media_available={local},
+        )
+        out = _run(
+            '<ac:structured-macro ac:name="drawio">'
+            '<ac:parameter ac:name="diagramName">mydiagram</ac:parameter>'
+            "</ac:structured-macro>",
+            ctx,
+        )
+        assert "not rendered" in out.lower()
+
 
 # ---------------------------------------------------------------------------
 # drawio-sketch
