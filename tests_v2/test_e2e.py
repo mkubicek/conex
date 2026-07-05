@@ -282,6 +282,66 @@ def test_idempotent_rerun(tmp_path):
     assert len(state1.pages) == 2
 
 
+def test_idempotent_rerun_hard_content(tmp_path):
+    """Idempotency over the render-fixture corpus, not just trivial pages.
+
+    Exports every page class from tests_v2/fixtures/render/ (macros, complex
+    tables, layouts, ADF decision/task lists, links, images) plus a real
+    attachment, then re-runs with identical API state and asserts zero writes
+    across ALL exported files — .md and .media alike — and no new commit.
+    This makes SPEC-V2's determinism claim executable over hard content.
+    """
+    fixtures = sorted((Path(__file__).parent / "fixtures" / "render").glob("*/input.html"))
+    assert len(fixtures) >= 6, "render fixture corpus missing"
+
+    root = tmp_path / "export"
+    root.mkdir()
+    _init_git_repo(root)
+
+    api = FakeConfluenceAPI(space_key="TS", space_id="SP1", space_name="Test Space")
+    api.add_page("home", "Home", parent_id="", body="<p>Home</p>", version=1)
+    for f in fixtures:
+        name = f.parent.name
+        api.add_page(
+            f"pg-{name}",
+            name.replace("-", " ").title(),
+            parent_id="home",
+            body=f.read_text(encoding="utf-8"),
+            version=1,
+        )
+    # diagram.png is referenced by the images-emoticons fixture, so the .media
+    # path participates in the idempotency check.
+    api.add_attachment(
+        att_id="a1", title="diagram.png", page_id="pg-images-emoticons",
+        media_type="image/png", version=1,
+        content=b"\x89PNG\r\n\x1a\n fake png data",
+    )
+
+    _run_export(api, "TS", root)
+    assert _git_log_count(root) == 1
+
+    mtimes = {
+        p: p.stat().st_mtime
+        for p in root.rglob("*")
+        if p.is_file() and ".conex" not in p.parts and ".git" not in p.parts
+    }
+    assert any(p.name == "diagram.png" for p in mtimes), "attachment missing from export"
+
+    time.sleep(0.05)
+
+    # Second run — identical API state.
+    _run_export(api, "TS", root)
+
+    assert _git_log_count(root) == 1
+    for p, old_mtime in mtimes.items():
+        assert p.stat().st_mtime == old_mtime, f"rewritten on no-change rerun: {p}"
+    now = {
+        p for p in root.rglob("*")
+        if p.is_file() and ".conex" not in p.parts and ".git" not in p.parts
+    }
+    assert now == set(mtimes), "file set changed on no-change rerun"
+
+
 # ---------------------------------------------------------------------------
 # Scenario 3: Title change → move with non-empty .workspace carried
 # ---------------------------------------------------------------------------

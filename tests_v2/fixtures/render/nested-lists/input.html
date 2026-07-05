@@ -1,0 +1,25 @@
+<h2>Plain nested lists</h2>
+<ul>
+<li>alpha<ul>
+<li>alpha.1<ul>
+<li>alpha.1.a</li>
+</ul></li>
+<li>alpha.2</li>
+</ul></li>
+<li>beta</li>
+</ul>
+<ol>
+<li>first</li>
+<li>second<ol>
+<li>second.a</li>
+</ol></li>
+</ol>
+<h2>Decisions</h2>
+<ac:adf-node type="decisionList"><ac:adf-node type="decisionItem" state="DECIDED"><p>Ship it</p></ac:adf-node><ac:adf-node type="decisionItem" state="UNDECIDED"><p>Maybe later</p></ac:adf-node></ac:adf-node>
+<h2>Tasks</h2>
+<ac:task-list>
+<ac:task><ac:task-status>complete</ac:task-status><ac:task-body>Write the spec</ac:task-body></ac:task>
+<ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>Review <a href="https://example.com/pr/1">PR 1</a></ac:task-body><ac:task-list>
+<ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>Nested subtask</ac:task-body></ac:task>
+</ac:task-list></ac:task>
+</ac:task-list>
