@@ -164,6 +164,10 @@ class FakeConfluenceAPI:
         self._attachments: dict[str, FakeAttachment] = {}  # att_id -> record
         self._users: dict[str, str] = {}
         self._fail_download: set[str] = set()  # att_ids that should fail
+        # page_ids silently dropped from get_pages() while still resolvable
+        # via get_page() — simulates the intermittent cursor-listing omission
+        # of issue #56.
+        self._omit_from_listing: set[str] = set()
 
     # ------------------------------------------------------------------
     # Mutation helpers (called by tests to set up state)
@@ -297,6 +301,20 @@ class FakeConfluenceAPI:
         self._fail_download.add(att_id)
         return self
 
+    def omit_page_from_listing(self, page_id: str) -> "FakeConfluenceAPI":
+        """Drop a page from get_pages() while get_page() still returns it.
+
+        Simulates the transient cursor-listing omission of issue #56; returns
+        self for chaining.
+        """
+        self._omit_from_listing.add(page_id)
+        return self
+
+    def restore_page_to_listing(self, page_id: str) -> "FakeConfluenceAPI":
+        """Undo omit_page_from_listing for a page; returns self."""
+        self._omit_from_listing.discard(page_id)
+        return self
+
     # ------------------------------------------------------------------
     # ConfluenceAPI protocol
     # ------------------------------------------------------------------
@@ -315,10 +333,18 @@ class FakeConfluenceAPI:
     ) -> list[Page]:
         pages = []
         for fp in self._pages.values():
+            if fp.page_id in self._omit_from_listing:
+                continue
             if not include_archived and fp.status == "archived":
                 continue
             pages.append(fp.to_model())
         return pages
+
+    def get_page(self, page_id: str) -> Page | None:
+        fp = self._pages.get(page_id)
+        if fp is None:
+            return None
+        return fp.to_model()
 
     def get_page_body(self, page_id: str) -> str:
         fp = self._pages.get(page_id)

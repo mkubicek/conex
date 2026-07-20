@@ -30,7 +30,7 @@ is needed beyond cfg.api_base_url already pointing to the right host.
 
 from __future__ import annotations
 
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 
@@ -121,6 +121,26 @@ class CloudV2API:
         path = f"/wiki/api/v2/spaces/{space_id}/pages"
         rows = self._paginate(path, {"limit": "250", "body-format": "storage"})
         return [_page_from_v2(r) for r in rows]
+
+    def get_page(self, page_id: str) -> Page | None:
+        """Fetch one page by id; None ONLY on a definitive 404.
+
+        Mirrors _get_folder_raw's error split: a transient 5xx / retry-
+        exhausted 429 / network error propagates, so the caller (pull's
+        page-set completeness floor) never mistakes "unknown" for "gone".
+        page_id is quoted: it comes from the on-disk prev snapshot, not the
+        API, so it must not be able to rewrite the request path.
+        """
+        try:
+            data = self._http.get_json(
+                self._base + f"/wiki/api/v2/pages/{quote(page_id, safe='')}",
+                {"body-format": "storage"},
+            )
+        except ApiError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        return _page_from_v2(data)
 
     def get_page_body(self, page_id: str) -> str:
         """Fetch the storage-format XHTML body for one page."""

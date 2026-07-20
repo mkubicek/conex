@@ -9,6 +9,16 @@ Contracts:
   failures.
 - Incremental skip: an (att_id, version) already in prev.attachment_blobs
   AND whose digest is present in blobs is not re-downloaded.
+- Page-set completeness floor: the cursor-paginated space listing can
+  transiently omit a live page.  A page present in prev.pages but absent from
+  the fresh listing is re-verified via api.get_page(): still current in this
+  space -> recovered into the page set (with a warning); definitively gone
+  (404 / moved space / trashed) -> the listing stands and the page prunes;
+  transient verify failure (ApiError) -> the prev page is carried forward
+  with its prev body blob (ambiguity never deletes); AuthError aborts.
+  Mirrors the attachment-listing and body floors.  The floor cannot protect
+  a page never captured in a prior snapshot (first export, or created since
+  the last run); build's H4 valve remains the backstop for gross truncation.
 - derived_blobs from prev are carried forward verbatim (content-digest-keyed;
   they cannot go stale because their key encodes the source digest).
 - Author prefetch: page and attachment version author_ids are resolved in
@@ -30,7 +40,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from conex.api import ConfluenceAPI
-from conex.models import Attachment, Page
+from conex.errors import ApiError
+from conex.models import Attachment, Page, Space
 from conex.paths import is_noise_attachment_title
 from conex.store.blobs import BlobStore
 from conex.store.state import Snapshot, SnapshotStore
@@ -78,7 +89,8 @@ def pull(
 
     Algorithm:
     1. Resolve the space via api.get_space(space_key).
-    2. List folders and pages in parallel.
+    2. List pages; re-verify and recover any page present in prev but absent
+       from the listing (page-set completeness floor); then discover folders.
     3. Fetch missing page bodies (body_storage == "") in parallel; store each
        body as a blob in body_blobs keyed by page_id.
     4. Fetch attachment lists per page sequentially (network-light; listing
@@ -129,6 +141,14 @@ def pull(
     # Folder discovery is derived from the pages (there is no list-folders
     # endpoint in v2), so pages must come first.
     pages = api.get_pages(space.id, space_key, effective_archived)
+    # Page-set completeness floor (issue #56): recover pages the listing
+    # transiently omitted.  Runs on the UNFILTERED listing so pages that were
+    # listed-but-archived are not treated as missing, and BEFORE get_folders so
+    # a recovered folder-parented page still seeds folder discovery.
+    pages, carried_page_ids = _recover_missing_pages(
+        api, space, pages, prev, effective_archived, _record_warning,
+        opts.workers,
+    )
     if not effective_archived:
         # v2 listings return archived pages regardless of the request, so a
         # plain export would otherwise include them (under _archived/) — a
@@ -143,7 +163,25 @@ def pull(
     # 4. Fetch missing page bodies in parallel
     # ------------------------------------------------------------------
     body_blobs: dict[str, str] = {}
-    pages_needing_body = [p for p in pages if p.body_storage == ""]
+
+    # Carried-forward pages (verify failed transiently) keep their prev body
+    # blob outright: the carried Page holds the PREV version metadata, so a
+    # fresh body fetch could pair a newer body with stale version/frontmatter
+    # (and `diff`, which compares version numbers, would miss the change) —
+    # and during the same outage the fetch would only burn its retry budget
+    # before falling back to the same blob anyway.  A carried page with no
+    # usable prev blob falls through to the normal fetch below.
+    carried_seeded: set[str] = set()
+    if prev is not None:
+        for pid in carried_page_ids:
+            prev_digest = prev.body_blobs.get(pid)
+            if prev_digest and blobs.has(prev_digest):
+                body_blobs[pid] = prev_digest
+                carried_seeded.add(pid)
+
+    pages_needing_body = [
+        p for p in pages if p.body_storage == "" and p.id not in carried_seeded
+    ]
     pages_with_body = [p for p in pages if p.body_storage != ""]
 
     # Store bodies that came inline
@@ -370,3 +408,116 @@ def pull(
         store.save(snapshot)
 
     return snapshot
+
+
+def _recover_missing_pages(
+    api: ConfluenceAPI,
+    space: Space,
+    pages: list[Page],
+    prev: Snapshot | None,
+    effective_archived: bool,
+    record_warning,
+    workers: int,
+) -> tuple[list[Page], set[str]]:
+    """Page-set completeness floor: prev.pages is a floor for the listing.
+
+    The cursor-paginated space listing can transiently omit a page that is
+    still live (observed in the wild: 105 of 106 pages returned, no error —
+    issue #56).  Without a cross-check the omitted page silently prunes from
+    the export.  For each page present in prev.pages but absent from *pages*,
+    re-verify with a direct by-id fetch:
+
+    - fetch returns the page, in THIS space, with an accepted status
+      -> transient listing gap: recover the page into the set + warn;
+    - fetch returns None (404), a page in another space, or an unaccepted
+      status (trashed/draft; archived when not requested)
+      -> definitively out of scope: the listing stands and build prunes it;
+    - fetch raises ApiError (retry-exhausted 5xx/429, network error)
+      -> ambiguous: carry the prev page forward + warn.  Ambiguity must never
+      delete.  AuthError propagates (a credential failure must abort loudly,
+      exactly as it does for get_pages), as does any non-API exception (a
+      parser bug must surface, not masquerade as API weather forever).
+
+    Accepted statuses are "current", plus "archived" when effective_archived —
+    matching the post-listing archived filter in pull(), so a recovered page
+    never re-introduces a status that filter would drop.  Prev pages with
+    other statuses — or recorded under another space — are not candidates.
+
+    Verification runs through a worker pool (like every other network phase in
+    pull) but results are assembled in prev order, so the output is
+    deterministic.  Steady-state cost is zero requests; a genuinely deleted
+    page costs one verify fetch on the single run where it leaves the listing
+    (it is gone from the next run's prev).
+
+    Returns (pages incl. recovered, ids carried forward on verify failure) —
+    the caller seeds prev body blobs for carried ids so their version metadata
+    and body stay mutually consistent.
+
+    Limit: the floor can only protect pages captured in a prior snapshot; a
+    page created since the last run (or any page on a first export) has no
+    floor against the same listing omission.
+    """
+    if prev is None:
+        return pages, set()
+    # A prev snapshot of a DIFFERENT space cannot floor this listing; don't
+    # verify foreign pages.  Id-first with key fallback, mirroring
+    # build._space_mismatch (a legacy snapshot may carry an empty id).
+    prev_sid, cur_sid = prev.space.id.strip(), space.id.strip()
+    prev_key, cur_key = prev.space.key.strip(), space.key.strip()
+    if prev_sid and cur_sid:
+        if prev_sid != cur_sid:
+            return pages, set()
+    elif prev_key and cur_key and prev_key != cur_key:
+        return pages, set()
+
+    accepted = {"current"} | ({"archived"} if effective_archived else set())
+    listed = {p.id for p in pages}
+    candidates: list[Page] = []
+    for prev_page in prev.pages:
+        if prev_page.id in listed or prev_page.status not in accepted:
+            continue
+        # A prev page recorded under another space must never be verified or
+        # carried into this space's snapshot (the carry path below has no
+        # fetched space_id to check, so gate on the recorded one here).
+        if prev_page.space_id and cur_sid and prev_page.space_id != cur_sid:
+            continue
+        listed.add(prev_page.id)  # dedupe: a duplicated prev id verifies once
+        candidates.append(prev_page)
+    if not candidates:
+        return pages, set()
+
+    def _verify(prev_page: Page) -> tuple[Page | None, ApiError | None]:
+        try:
+            return api.get_page(prev_page.id), None
+        except ApiError as exc:
+            return None, exc
+
+    results: dict[str, tuple[Page | None, ApiError | None]] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_verify, c): c for c in candidates}
+        for future in as_completed(futures):
+            page, exc = future.result()
+            results[futures[future].id] = (page, exc)
+
+    recovered: list[Page] = []
+    carried: set[str] = set()
+    for prev_page in candidates:  # prev order -> deterministic output
+        page, exc = results[prev_page.id]
+        if exc is not None:
+            record_warning(
+                f"conex: warning: page '{prev_page.title}' ({prev_page.id}) is "
+                f"missing from the space listing and could not be re-verified "
+                f"({exc}); carrying it forward from the previous snapshot"
+            )
+            recovered.append(prev_page)
+            carried.add(prev_page.id)
+            continue
+        if page is None or page.space_id != space.id or page.status not in accepted:
+            continue
+        record_warning(
+            f"conex: warning: page '{page.title}' ({page.id}) was missing from "
+            f"the space listing but is still {page.status}; recovered via "
+            f"direct fetch (incomplete listing)"
+        )
+        recovered.append(page)
+    return pages + recovered, carried

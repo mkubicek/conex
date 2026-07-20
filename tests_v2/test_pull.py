@@ -59,6 +59,9 @@ class FakeAPI:
         download_data: dict[str, bytes] | None = None,
         download_error: dict[str, Exception] | None = None,
         returns_archived: bool = True,
+        pages_missing_from_listing: set[str] | None = None,
+        get_page_returns: dict[str, Page | None] | None = None,
+        get_page_error: dict[str, Exception] | None = None,
     ) -> None:
         self.returns_archived = returns_archived
         self._space = space or Space(id="S1", key="TEST", name="Test Space")
@@ -68,6 +71,16 @@ class FakeAPI:
         self._users = users or {}
         self._download_data = download_data or {}
         self._download_error = download_error or {}
+        # pages_missing_from_listing: page ids dropped from get_pages() while
+        # get_page() still resolves them (simulates the issue-#56 transient
+        # cursor-listing omission).
+        self._pages_missing_from_listing = pages_missing_from_listing or set()
+        # get_page_returns: page_id -> explicit get_page() result (a Page, or
+        # None for a definitive 404).  Falls back to the page list when unset.
+        self._get_page_returns = get_page_returns or {}
+        # get_page_error: page_id -> exception raised by get_page() (simulates
+        # a transient verify failure).
+        self._get_page_error = get_page_error or {}
 
         # body_overrides: page_id -> body returned by get_page_body
         # (used to simulate COOKIE_V1 dialect where bodies are fetched separately)
@@ -77,6 +90,7 @@ class FakeAPI:
         self.get_space_calls: list[str] = []
         self.get_pages_calls: list[tuple[str, str, bool]] = []
         self.get_folders_calls: list[str] = []
+        self.get_page_calls: list[str] = []
         self.get_page_body_calls: list[str] = []
         self.get_attachments_calls: list[str] = []
         self.get_user_display_name_calls: list[str] = []
@@ -93,7 +107,21 @@ class FakeAPI:
         include_archived: bool,
     ) -> list[Page]:
         self.get_pages_calls.append((space_id, space_key, include_archived))
-        return list(self._pages)
+        return [
+            p for p in self._pages
+            if p.id not in self._pages_missing_from_listing
+        ]
+
+    def get_page(self, page_id: str) -> Page | None:
+        self.get_page_calls.append(page_id)
+        if page_id in self._get_page_error:
+            raise self._get_page_error[page_id]
+        if page_id in self._get_page_returns:
+            return self._get_page_returns[page_id]
+        for page in self._pages:
+            if page.id == page_id:
+                return page
+        return None
 
     def get_page_body(self, page_id: str) -> str:
         self.get_page_body_calls.append(page_id)
@@ -1469,3 +1497,226 @@ class TestPullWarningsRecorded:
         )
         snap = pull(api, "TEST", tmp_root, blobs, None, _default_opts(fetch_media=True))
         assert snap.warnings == []
+
+
+# ---------------------------------------------------------------------------
+# Page-set completeness floor (issue #56)
+# ---------------------------------------------------------------------------
+
+
+def _prev_snapshot(*pages: Page, space: Space | None = None, **kwargs: Any) -> Snapshot:
+    """Build a prev Snapshot honouring the body_storage=='' invariant."""
+    return Snapshot(
+        space=space or Space(id="S1", key="TEST", name="Test Space"),
+        pages=[p.model_copy(update={"body_storage": ""}) for p in pages],
+        **kwargs,
+    )
+
+
+_P1 = Page(id="p1", title="One", space_id="S1", body_storage="<p>one</p>")
+_P2 = Page(id="p2", title="Two", space_id="S1", body_storage="<p>two</p>")
+
+
+class TestPageSetCompletenessFloor:
+    def test_missing_current_page_recovered(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A prev page omitted from the listing but still current is recovered."""
+        api = FakeAPI(
+            pages=[_P1, _P2],
+            pages_missing_from_listing={"p2"},
+        )
+        prev = _prev_snapshot(_P1, _P2)
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert {p.id for p in snap.pages} == {"p1", "p2"}
+        assert api.get_page_calls == ["p2"]
+        assert any("p2" in w and "missing from the space listing" in w
+                   for w in snap.warnings), snap.warnings
+
+    def test_recovered_page_body_and_attachments_fetched(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A recovered page flows through body storage and attachment listing."""
+        att = Attachment(
+            id="a1", title="pic.png", page_id="p2",
+            download_url="http://fake/pic.png", version=PageVersion(number=1),
+        )
+        api = FakeAPI(
+            pages=[_P1, _P2],
+            attachments={"p2": [att]},
+            download_data={"http://fake/pic.png": b"png-bytes"},
+            pages_missing_from_listing={"p2"},
+        )
+        prev = _prev_snapshot(_P1, _P2)
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts(fetch_media=True))
+        assert blobs.read_bytes(snap.body_blobs["p2"]) == b"<p>two</p>"
+        assert "p2" in api.get_attachments_calls
+        assert "a1@1" in snap.attachment_blobs
+
+    def test_deleted_page_not_recovered(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A page that 404s on re-verify is genuinely gone: listing stands."""
+        api = FakeAPI(pages=[_P1])  # p2 unknown -> get_page returns None
+        prev = _prev_snapshot(_P1, _P2)
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert {p.id for p in snap.pages} == {"p1"}
+        assert api.get_page_calls == ["p2"]
+        assert snap.warnings == []
+
+    def test_trashed_page_not_recovered(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A 200 with a non-current status (trashed) must NOT resurrect."""
+        trashed = _P2.model_copy(update={"status": "trashed"})
+        api = FakeAPI(pages=[_P1], get_page_returns={"p2": trashed})
+        prev = _prev_snapshot(_P1, _P2)
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert {p.id for p in snap.pages} == {"p1"}
+
+    def test_cross_space_page_not_recovered(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A page moved to another space is out of scope: listing stands."""
+        moved = _P2.model_copy(update={"space_id": "OTHER"})
+        api = FakeAPI(pages=[_P1], get_page_returns={"p2": moved})
+        prev = _prev_snapshot(_P1, _P2)
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert {p.id for p in snap.pages} == {"p1"}
+
+    def test_transient_verify_failure_carries_prev_forward(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """Ambiguity (verify raises) never deletes: prev page carried + warn."""
+        from conex.errors import ApiError
+        api = FakeAPI(
+            pages=[_P1],
+            get_page_error={"p2": ApiError("boom", status=500)},
+        )
+        api._body_overrides = {"p2": "<p>two</p>"}
+        prev = _prev_snapshot(_P1, _P2)
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert {p.id for p in snap.pages} == {"p1", "p2"}
+        assert any("could not be re-verified" in w for w in snap.warnings), (
+            snap.warnings
+        )
+        # The carried page has no inline body -> fetched via get_page_body.
+        assert blobs.read_bytes(snap.body_blobs["p2"]) == b"<p>two</p>"
+
+    def test_carried_page_reuses_prev_body_blob(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A carried page keeps its prev body blob: no fetch, no metadata skew."""
+        from conex.errors import ApiError
+        prev_digest = blobs.add_bytes(b"<p>prev body</p>")
+        api = FakeAPI(
+            pages=[_P1],
+            get_page_error={"p2": ApiError("boom", status=500)},
+        )
+        prev = _prev_snapshot(_P1, _P2, body_blobs={"p2": prev_digest})
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert "p2" not in api.get_page_body_calls
+        assert snap.body_blobs["p2"] == prev_digest
+
+    def test_auth_error_during_verify_aborts(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A credential failure must abort loudly, not degrade to carry-forward."""
+        from conex.errors import AuthError
+        api = FakeAPI(
+            pages=[_P1],
+            get_page_error={"p2": AuthError("session expired")},
+        )
+        prev = _prev_snapshot(_P1, _P2)
+        with pytest.raises(AuthError):
+            pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+
+    def test_duplicate_prev_ids_verified_once(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A duplicated prev page id yields one verify call and one entry."""
+        api = FakeAPI(pages=[_P1, _P2], pages_missing_from_listing={"p2"})
+        prev = _prev_snapshot(_P1, _P2, _P2)
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert api.get_page_calls == ["p2"]
+        assert [p.id for p in snap.pages].count("p2") == 1
+
+    def test_foreign_space_prev_page_never_carried(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A prev page recorded under another space is not verified or carried."""
+        from conex.errors import ApiError
+        foreign = _P2.model_copy(update={"space_id": "S9"})
+        api = FakeAPI(
+            pages=[_P1],
+            get_page_error={"p2": ApiError("boom", status=500)},
+        )
+        prev = _prev_snapshot(_P1, foreign)
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert api.get_page_calls == []
+        assert {p.id for p in snap.pages} == {"p1"}
+
+    def test_prev_space_key_mismatch_skips_floor(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """Key fallback: a prev snapshot with empty id but another key is foreign."""
+        other = Space(id="", key="OTHER", name="Other")
+        api = FakeAPI(pages=[_P1])
+        prev = _prev_snapshot(_P2, space=other)
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert api.get_page_calls == []
+        assert {p.id for p in snap.pages} == {"p1"}
+
+    def test_archived_prev_page_not_reverified_by_default(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """Prev archived pages are not candidates when archived not requested."""
+        archived = _P2.model_copy(update={"status": "archived"})
+        api = FakeAPI(pages=[_P1])
+        prev = _prev_snapshot(_P1, archived, include_archived=True)
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert api.get_page_calls == []
+        assert {p.id for p in snap.pages} == {"p1"}
+
+    def test_archived_prev_page_recovered_when_archived_requested(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """With include_archived, an omitted archived page is recovered."""
+        archived = _P2.model_copy(update={"status": "archived"})
+        api = FakeAPI(
+            pages=[_P1, archived],
+            pages_missing_from_listing={"p2"},
+        )
+        prev = _prev_snapshot(_P1, archived, include_archived=True)
+        snap = pull(
+            api, "TEST", tmp_root, blobs, prev,
+            _default_opts(include_archived=True),
+        )
+        assert {p.id for p in snap.pages} == {"p1", "p2"}
+
+    def test_no_prev_no_verify_calls(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        api = FakeAPI(pages=[_P1])
+        pull(api, "TEST", tmp_root, blobs, None, _default_opts())
+        assert api.get_page_calls == []
+
+    def test_prev_of_other_space_not_verified(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A prev snapshot of a different space cannot floor this listing."""
+        other = Space(id="S9", key="OTHER", name="Other")
+        api = FakeAPI(pages=[_P1])
+        prev = _prev_snapshot(_P2, space=other)
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert api.get_page_calls == []
+        assert {p.id for p in snap.pages} == {"p1"}
+
+    def test_fully_listed_run_makes_no_verify_calls(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """Steady state: every prev page listed -> zero verify requests."""
+        api = FakeAPI(pages=[_P1, _P2])
+        prev = _prev_snapshot(_P1, _P2)
+        pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert api.get_page_calls == []
