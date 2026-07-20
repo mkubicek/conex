@@ -37,6 +37,7 @@ from urllib.parse import parse_qs, quote, urlparse
 import requests
 
 from conex.config import ResolvedConfig
+from conex.errors import ApiError
 from conex.http import Http
 from conex.models import Attachment, Folder, Page, PageVersion, Space
 
@@ -130,6 +131,25 @@ class CookieV1API:
             )
             pages.extend(_page_from_v1(r) for r in rows)
         return pages
+
+    def get_page(self, page_id: str) -> Page | None:
+        """Fetch one page by id; None ONLY on a definitive 404.
+
+        Same expand set as get_pages so the returned Page carries the space,
+        status, ancestors, and inline body needed by pull's page-set
+        completeness floor.  Transient errors propagate (never mistaken for
+        "gone").
+        """
+        try:
+            data = self._http.get_json(
+                self._base + f"/wiki/rest/api/content/{quote(page_id, safe='')}",
+                {"expand": "body.storage,version,ancestors,space,history,extensions"},
+            )
+        except ApiError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        return _page_from_v1(data)
 
     def get_page_body(self, page_id: str) -> str:
         """Fetch the storage-format body for one page via a per-page request."""

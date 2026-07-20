@@ -1245,3 +1245,80 @@ def test_refresh_flow(tmp_path):
     # Snapshot has the page still (body is in blobs).
     assert len(snap.pages) == 1
     assert snap.pages[0].version.number == 2
+
+
+# ---------------------------------------------------------------------------
+# Issue #56: page-set completeness floor
+# ---------------------------------------------------------------------------
+
+
+def test_listing_omission_does_not_prune_live_page(tmp_path, capsys):
+    """Issue #56: a page transiently missing from the space listing survives.
+
+    A live page dropped from one run's cursor-paginated listing must be
+    recovered via direct re-verification — still on disk, still in state,
+    with a warning — not silently pruned.
+    """
+    root = tmp_path / "export"
+    root.mkdir()
+    _init_git_repo(root)
+
+    api = FakeConfluenceAPI(space_key="TS", space_id="SP1", space_name="Test Space")
+    api.add_page("p1", "Stable Page", parent_id="", body="<p>stable</p>", version=1)
+    api.add_page("p2", "Flaky Listed", parent_id="p1", body="<p>flaky</p>", version=1)
+    api.add_attachment(
+        att_id="a1", title="pic.png", page_id="p2",
+        media_type="image/png", version=1, content=b"png-bytes",
+    )
+
+    _run_export(api, "TS", root)
+    state1 = _state(root)
+    flaky_md = root / state1.pages["p2"].file
+    flaky_media = root / state1.pages["p2"].dir / ".media"
+    assert flaky_md.exists()
+
+    # The listing transiently omits p2; the page itself is still resolvable.
+    api.omit_page_from_listing("p2")
+    _run_export(api, "TS", root)
+
+    # Page survives on disk, in state, and in the snapshot.
+    state2 = _state(root)
+    assert "p2" in state2.pages
+    assert flaky_md.exists()
+    assert flaky_media.is_dir() and any(flaky_media.iterdir())
+    snap = _snapshot(root)
+    assert "p2" in {p.id for p in snap.pages}
+    assert any("missing from the space listing" in w for w in snap.warnings)
+    captured = capsys.readouterr()
+    assert "missing from the space listing" in captured.err
+
+    # Once the listing heals, a further run is clean: no verify traffic
+    # is observable here, but the export stays identical and warning-free.
+    api.restore_page_to_listing("p2")
+    _run_export(api, "TS", root)
+    snap3 = _snapshot(root)
+    assert snap3.warnings == []
+    assert "p2" in {p.id for p in snap3.pages}
+
+
+def test_genuine_delete_still_prunes_after_floor(tmp_path):
+    """The floor must not resurrect a genuinely deleted page (regression guard)."""
+    root = tmp_path / "export"
+    root.mkdir()
+    _init_git_repo(root)
+
+    api = FakeConfluenceAPI(space_key="TS", space_id="SP1", space_name="Test Space")
+    api.add_page("p1", "Keep Me", parent_id="", body="<p>keep</p>", version=1)
+    api.add_page("p2", "Delete Me", parent_id="", body="<p>del</p>", version=1)
+
+    _run_export(api, "TS", root)
+    state1 = _state(root)
+    del_md = root / state1.pages["p2"].file
+
+    # Genuine upstream delete: gone from the listing AND get_page 404s (None).
+    api.remove_page("p2")
+    _run_export(api, "TS", root)
+
+    state2 = _state(root)
+    assert "p2" not in state2.pages
+    assert not del_md.exists()

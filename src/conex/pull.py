@@ -9,6 +9,13 @@ Contracts:
   failures.
 - Incremental skip: an (att_id, version) already in prev.attachment_blobs
   AND whose digest is present in blobs is not re-downloaded.
+- Page-set completeness floor: the cursor-paginated space listing can
+  transiently omit a live page.  A page present in prev.pages but absent from
+  the fresh listing is re-verified via api.get_page(): still current in this
+  space -> recovered into the page set (with a warning); definitively gone
+  (404 / moved space / trashed) -> the listing stands and the page prunes;
+  transient verify failure -> the prev page is carried forward (ambiguity
+  never deletes).  Mirrors the attachment-listing and body floors.
 - derived_blobs from prev are carried forward verbatim (content-digest-keyed;
   they cannot go stale because their key encodes the source digest).
 - Author prefetch: page and attachment version author_ids are resolved in
@@ -30,7 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from conex.api import ConfluenceAPI
-from conex.models import Attachment, Page
+from conex.models import Attachment, Page, Space
 from conex.paths import is_noise_attachment_title
 from conex.store.blobs import BlobStore
 from conex.store.state import Snapshot, SnapshotStore
@@ -78,7 +85,8 @@ def pull(
 
     Algorithm:
     1. Resolve the space via api.get_space(space_key).
-    2. List folders and pages in parallel.
+    2. List pages; re-verify and recover any page present in prev but absent
+       from the listing (page-set completeness floor); then discover folders.
     3. Fetch missing page bodies (body_storage == "") in parallel; store each
        body as a blob in body_blobs keyed by page_id.
     4. Fetch attachment lists per page sequentially (network-light; listing
@@ -129,6 +137,13 @@ def pull(
     # Folder discovery is derived from the pages (there is no list-folders
     # endpoint in v2), so pages must come first.
     pages = api.get_pages(space.id, space_key, effective_archived)
+    # Page-set completeness floor (issue #56): recover pages the listing
+    # transiently omitted.  Runs on the UNFILTERED listing so pages that were
+    # listed-but-archived are not treated as missing, and BEFORE get_folders so
+    # a recovered folder-parented page still seeds folder discovery.
+    pages = _recover_missing_pages(
+        api, space, pages, prev, effective_archived, _record_warning
+    )
     if not effective_archived:
         # v2 listings return archived pages regardless of the request, so a
         # plain export would otherwise include them (under _archived/) — a
@@ -370,3 +385,74 @@ def pull(
         store.save(snapshot)
 
     return snapshot
+
+
+def _recover_missing_pages(
+    api: ConfluenceAPI,
+    space: Space,
+    pages: list[Page],
+    prev: Snapshot | None,
+    effective_archived: bool,
+    record_warning,
+) -> list[Page]:
+    """Page-set completeness floor: prev.pages is a floor for the listing.
+
+    The cursor-paginated space listing can transiently omit a page that is
+    still live (observed in the wild: 105 of 106 pages returned, no error —
+    issue #56).  Without a cross-check the omitted page silently prunes from
+    the export.  For each page present in prev.pages but absent from *pages*,
+    re-verify with a direct by-id fetch:
+
+    - fetch returns the page, in THIS space, with an accepted status
+      -> transient listing gap: recover the page into the set + warn;
+    - fetch returns None (404), a page in another space, or an unaccepted
+      status (trashed/draft; archived when not requested)
+      -> definitively out of scope: the listing stands and build prunes it;
+    - fetch fails transiently (retry-exhausted 5xx/429, network error)
+      -> ambiguous: carry the prev page forward + warn.  Ambiguity must never
+      delete; the body/attachment floors compose downstream (the carried page
+      has body_storage == "", so pull re-fetches its body, falling back to the
+      prev body blob on failure).
+
+    Accepted statuses are "current", plus "archived" when effective_archived —
+    matching the post-listing archived filter in pull(), so a recovered page
+    never re-introduces a status that filter would drop.  Prev pages with
+    other statuses are not even candidates (no wasted verify calls).
+
+    Steady-state cost is zero requests; a genuinely deleted page costs one
+    verify fetch on the single run where it leaves the listing (it is gone
+    from the next run's prev).  Candidates are walked in prev order, so the
+    result is deterministic.
+    """
+    if prev is None:
+        return pages
+    # A prev snapshot of a DIFFERENT space cannot floor this listing (build
+    # aborts on the mismatch anyway); don't verify foreign pages.
+    if prev.space.id and prev.space.id != space.id:
+        return pages
+
+    accepted = {"current"} | ({"archived"} if effective_archived else set())
+    listed = {p.id for p in pages}
+    recovered: list[Page] = []
+    for prev_page in prev.pages:
+        if prev_page.id in listed or prev_page.status not in accepted:
+            continue
+        try:
+            page = api.get_page(prev_page.id)
+        except Exception as exc:
+            record_warning(
+                f"conex: warning: page '{prev_page.title}' ({prev_page.id}) is "
+                f"missing from the space listing and could not be re-verified "
+                f"({exc}); carrying it forward from the previous snapshot"
+            )
+            recovered.append(prev_page)
+            continue
+        if page is None or page.space_id != space.id or page.status not in accepted:
+            continue
+        record_warning(
+            f"conex: warning: page '{page.title}' ({page.id}) was missing from "
+            f"the space listing but is still {page.status}; recovered via "
+            f"direct fetch (incomplete listing)"
+        )
+        recovered.append(page)
+    return pages + recovered

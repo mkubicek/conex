@@ -60,6 +60,20 @@ class ConfluenceAPI(Protocol):
         """
         ...
 
+    def get_page(self, page_id: str) -> Page | None:
+        """Fetch one page by id, or None when it does not exist (404).
+
+        Used by pull's page-set completeness floor to re-verify a page that
+        is present in the previous snapshot but absent from the space listing
+        (cursor-paginated listings can transiently omit a live page).
+        body_storage is populated when the dialect supports it.
+
+        Returns None ONLY for a definitive 404; transient errors (retry-
+        exhausted 5xx/429, network failures) propagate so the caller can
+        distinguish "gone" from "unknown".
+        """
+        ...
+
     def get_page_body(self, page_id: str) -> str:
         """Return the storage-format XHTML body for one page.
 

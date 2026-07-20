@@ -302,6 +302,42 @@ def test_paginate_missing_links_key():
 
 
 # ---------------------------------------------------------------------------
+# get_page (single-page re-verification, issue #56)
+# ---------------------------------------------------------------------------
+
+
+def test_get_page_maps_model():
+    data = {
+        "id": 10, "title": "T", "status": "current",
+        "space": {"id": 7},
+        "body": {"storage": {"value": "<p>b</p>"}},
+        "version": {"number": 2},
+    }
+    api = _make_api(FakeHttp({"/wiki/rest/api/content/10": data}))
+    page = api.get_page("10")
+    assert page is not None
+    assert page.id == "10"
+    assert page.space_id == "7"
+    assert page.status == "current"
+    assert page.body_storage == "<p>b</p>"
+
+
+def test_get_page_404_returns_none():
+    api = _make_api(FakeHttp({
+        "/wiki/rest/api/content/10": ApiError("not found", status=404),
+    }))
+    assert api.get_page("10") is None
+
+
+def test_get_page_transient_error_propagates():
+    api = _make_api(FakeHttp({
+        "/wiki/rest/api/content/10": ApiError("server error", status=500),
+    }))
+    with pytest.raises(ApiError):
+        api.get_page("10")
+
+
+# ---------------------------------------------------------------------------
 # get_page_body
 # ---------------------------------------------------------------------------
 
