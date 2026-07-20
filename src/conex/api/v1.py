@@ -42,6 +42,13 @@ from conex.http import Http
 from conex.models import Attachment, Folder, Page, PageVersion, Space
 
 
+# Expand set shared by get_pages and get_page: the two MUST stay identical, or
+# a page recovered by pull's completeness floor comes back missing fields every
+# listed page has (dropping `ancestors` would silently reparent it to the space
+# root; dropping `space` would make the floor's space check mis-classify it).
+_CONTENT_EXPAND = "body.storage,version,ancestors,space,history,extensions"
+
+
 class CookieV1API:
     """Adapter for the COOKIE_V1 dialect (legacy REST + browser session cookies).
 
@@ -125,7 +132,7 @@ class CookieV1API:
                     "spaceKey": space_key,
                     "type": "page",
                     "status": status,
-                    "expand": "body.storage,version,ancestors,space,history,extensions",
+                    "expand": _CONTENT_EXPAND,
                     "limit": "250",
                 },
             )
@@ -135,15 +142,15 @@ class CookieV1API:
     def get_page(self, page_id: str) -> Page | None:
         """Fetch one page by id; None ONLY on a definitive 404.
 
-        Same expand set as get_pages so the returned Page carries the space,
-        status, ancestors, and inline body needed by pull's page-set
-        completeness floor.  Transient errors propagate (never mistaken for
-        "gone").
+        Same expand set as get_pages (_CONTENT_EXPAND) so the returned Page
+        carries the space, status, ancestors, and inline body needed by pull's
+        page-set completeness floor.  Transient errors propagate (never
+        mistaken for "gone").
         """
         try:
             data = self._http.get_json(
                 self._base + f"/wiki/rest/api/content/{quote(page_id, safe='')}",
-                {"expand": "body.storage,version,ancestors,space,history,extensions"},
+                {"expand": _CONTENT_EXPAND},
             )
         except ApiError as exc:
             if exc.status == 404:

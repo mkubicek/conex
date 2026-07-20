@@ -1235,6 +1235,12 @@ def build(
     # guard above does not fire, yet it would prune most of a prior export. Refuse
     # to prune a large fraction of a non-trivial prior export in one run unless
     # explicitly confirmed. (Archived pages preserved by I3 are not "pruned".)
+    # Pull's page-set completeness floor (pull._recover_missing_pages) is the
+    # first line of defense for listing omissions — it re-verifies and recovers
+    # pages before build ever sees the snapshot.  H4 stays as the backstop for
+    # what the floor cannot cover: a missing/corrupt snapshot.json alongside a
+    # surviving state.json, a bug in the recovery path itself, or a genuine
+    # mass deletion (which the floor correctly lets through as 404s).
     if (
         opts.subtree is None
         and not opts.allow_mass_delete

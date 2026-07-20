@@ -1603,6 +1603,70 @@ class TestPageSetCompletenessFloor:
         # The carried page has no inline body -> fetched via get_page_body.
         assert blobs.read_bytes(snap.body_blobs["p2"]) == b"<p>two</p>"
 
+    def test_carried_page_reuses_prev_body_blob(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A carried page keeps its prev body blob: no fetch, no metadata skew."""
+        from conex.errors import ApiError
+        prev_digest = blobs.add_bytes(b"<p>prev body</p>")
+        api = FakeAPI(
+            pages=[_P1],
+            get_page_error={"p2": ApiError("boom", status=500)},
+        )
+        prev = _prev_snapshot(_P1, _P2, body_blobs={"p2": prev_digest})
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert "p2" not in api.get_page_body_calls
+        assert snap.body_blobs["p2"] == prev_digest
+
+    def test_auth_error_during_verify_aborts(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A credential failure must abort loudly, not degrade to carry-forward."""
+        from conex.errors import AuthError
+        api = FakeAPI(
+            pages=[_P1],
+            get_page_error={"p2": AuthError("session expired")},
+        )
+        prev = _prev_snapshot(_P1, _P2)
+        with pytest.raises(AuthError):
+            pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+
+    def test_duplicate_prev_ids_verified_once(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A duplicated prev page id yields one verify call and one entry."""
+        api = FakeAPI(pages=[_P1, _P2], pages_missing_from_listing={"p2"})
+        prev = _prev_snapshot(_P1, _P2, _P2)
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert api.get_page_calls == ["p2"]
+        assert [p.id for p in snap.pages].count("p2") == 1
+
+    def test_foreign_space_prev_page_never_carried(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """A prev page recorded under another space is not verified or carried."""
+        from conex.errors import ApiError
+        foreign = _P2.model_copy(update={"space_id": "S9"})
+        api = FakeAPI(
+            pages=[_P1],
+            get_page_error={"p2": ApiError("boom", status=500)},
+        )
+        prev = _prev_snapshot(_P1, foreign)
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert api.get_page_calls == []
+        assert {p.id for p in snap.pages} == {"p1"}
+
+    def test_prev_space_key_mismatch_skips_floor(
+        self, tmp_root: Path, blobs: BlobStore
+    ) -> None:
+        """Key fallback: a prev snapshot with empty id but another key is foreign."""
+        other = Space(id="", key="OTHER", name="Other")
+        api = FakeAPI(pages=[_P1])
+        prev = _prev_snapshot(_P2, space=other)
+        snap = pull(api, "TEST", tmp_root, blobs, prev, _default_opts())
+        assert api.get_page_calls == []
+        assert {p.id for p in snap.pages} == {"p1"}
+
     def test_archived_prev_page_not_reverified_by_default(
         self, tmp_root: Path, blobs: BlobStore
     ) -> None:
