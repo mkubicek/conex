@@ -23,6 +23,7 @@ Naming: one function per spec scenario.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -1322,3 +1323,148 @@ def test_genuine_delete_still_prunes_after_floor(tmp_path):
     state2 = _state(root)
     assert "p2" not in state2.pages
     assert not del_md.exists()
+
+
+def test_fixture_export_report_and_recovery(tmp_path):
+    """Public demo exercises the CLI including real process exit codes."""
+    root = tmp_path / "export"
+    report = tmp_path / "run.json"
+    issue = {"code": "attachment_download", "page_id": "p1", "attachment_id": "a1"}
+    for fail, strict, expected_exit in [(True, False, 0), (True, True, 3), (False, True, 0)]:
+        cmd = [sys.executable, "-m", "examples.export_fixture"]
+        if fail:
+            cmd.append("--fail-download")
+        cmd.extend(["DEMO", "-o", str(root), "--report", str(report)])
+        if strict:
+            cmd.append("--strict")
+        proc = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True)
+        assert proc.returncode == expected_exit, proc.stderr
+        data = json.loads(report.read_text())
+        assert (data["schema_version"], data["space_key"]) == (1, "DEMO")
+        assert data["status"] == ("partial" if fail else "complete")
+        assert data["issues"] == ([issue] if fail else [])
+        assert data["scope"]["media"] is True
+        assert data["counts"]["files_written"] >= 1
+        assert bool(list(root.rglob("checklist.txt"))) == (not fail)
+    assert next(root.rglob("checklist.txt")).read_bytes() == b"Check the export report.\n"
+
+
+def test_export_report_listing_scope_and_cached(tmp_path):
+    root, report = tmp_path / "out", tmp_path / "reports" / "run.json"
+    api = FakeConfluenceAPI().add_page("p1", "One").add_page("p2", "Two")
+    list_attachments = api.get_attachments
+
+    def partial_listing(pid):
+        if pid == "p2":
+            raise RuntimeError("signed-url-must-not-appear-in-report")
+        return list_attachments(pid)
+
+    flags = ["--strict", "--no-git", "--report", str(report)]
+    with patch.object(api, "get_attachments", side_effect=partial_listing):
+        with pytest.raises(SystemExit) as err:
+            _run_export(api, "TS", root, flags)
+        assert err.value.code == 3
+        data = json.loads(report.read_text())
+        assert data["issues"] == [{"code": "attachment_listing", "page_id": "p2", "attachment_id": None}]
+        assert "signed-url" not in report.read_text()
+
+    with pytest.raises(SystemExit) as err:
+        _run_export(api, "TS", root, flags + ["--cached"])
+    assert err.value.code == 3
+    for scope in [["--path", "One"], ["--no-media"]]:
+        _run_export(api, "TS", root, flags + ["--cached", *scope])
+        assert json.loads(report.read_text())["status"] == "complete"
+
+
+def test_export_strict_keeps_last_good_attachment_and_retries(tmp_path):
+    root = tmp_path / "out"
+    api = FakeConfluenceAPI().add_page("p1", "Page")
+    api.add_attachment("a1", "data.txt", "p1", content=b"old")
+    flags = ["--strict", "--no-git"]
+    _run_export(api, "TS", root, flags)
+    api.update_attachment("a1", b"new", 2)
+    with patch.object(api, "download", side_effect=OSError("connection lost")):
+        with pytest.raises(SystemExit) as err:
+            _run_export(api, "TS", root, flags)
+        assert err.value.code == 3
+        assert next(root.rglob("data.txt")).read_bytes() == b"old"
+    _run_export(api, "TS", root, flags)
+    assert next(root.rglob("data.txt")).read_bytes() == b"new"
+    next(root.rglob("data.txt")).unlink()
+    _run_export(api, "TS", root, flags + ["--cached"])
+    assert next(root.rglob("data.txt")).read_bytes() == b"new"
+
+
+def test_export_report_fatal_or_unwritable(tmp_path):
+    api = FakeConfluenceAPI()
+    report = tmp_path / "report.json"
+    root = tmp_path / "out"
+    with pytest.raises(SystemExit) as err:
+        _run_export(api, "TS", root, ["--cached", "--report", str(report)])
+    assert err.value.code == 1
+    data = json.loads(report.read_text())
+    assert data["status"] == "failed"
+    assert data["counts"] is None
+    assert data["issues"][0]["code"] == "ConexError"
+    with pytest.raises(SystemExit) as err:
+        _run_export(api, "TS", root, ["--no-git", "--report", str(report / "child")])
+    assert err.value.code == 1
+    assert json.loads(report.read_text()) == data
+
+
+def test_export_strict_page_body_failure_even_without_media(tmp_path):
+    root, report = tmp_path / "out", tmp_path / "run.json"
+    api = FakeConfluenceAPI().add_page("p1", "Page", body="<p>Last good</p>")
+    flags = ["--strict", "--no-git", "--no-media", "--report", str(report)]
+    _run_export(api, "TS", root, flags)
+    api.update_page_body("p1", "", version=2)
+    with patch.object(api, "get_page_body", side_effect=OSError("timeout")):
+        with pytest.raises(SystemExit) as err:
+            _run_export(api, "TS", root, flags)
+        assert err.value.code == 3
+    assert "Last good" in next(root.rglob("*.md")).read_text()
+    assert json.loads(report.read_text())["issues"][0]["code"] == "page_body"
+    api.update_page_body("p1", "<p>Recovered</p>", version=2)
+    _run_export(api, "TS", root, flags)
+    assert "Recovered" in next(root.rglob("*.md")).read_text()
+
+
+def test_export_strict_cached_media_after_metadata_only_export(tmp_path):
+    root, report = tmp_path / "out", tmp_path / "run.json"
+    api = FakeConfluenceAPI().add_page("p1", "Page")
+    api.add_attachment("a1", "data.txt", "p1")
+    flags = ["--strict", "--no-git", "--report", str(report)]
+    _run_export(api, "TS", root, flags + ["--no-media"])
+    with pytest.raises(SystemExit) as err:
+        _run_export(api, "TS", root, flags + ["--cached"])
+    assert err.value.code == 3
+    assert json.loads(report.read_text())["issues"] == [
+        {"code": "attachment_blob_missing", "page_id": "p1", "attachment_id": "a1"},
+    ]
+    _run_export(api, "TS", root, flags)
+    assert json.loads(report.read_text())["issues"] == []
+
+
+def test_strict_attachment_write_failure(tmp_path):
+    root, report = tmp_path / "out", tmp_path / "run.json"
+    api = FakeConfluenceAPI().add_page("p1", "Page").add_attachment("a1", "data.txt", "p1")
+    flags = ["--strict", "--no-git", "--report", str(report)]
+    with patch("conex.store.blobs.BlobStore.materialize", side_effect=OSError("disk full")):
+        with pytest.warns(UserWarning, match="disk full"), pytest.raises(SystemExit) as err:
+            _run_export(api, "TS", root, flags)
+    assert err.value.code == 3
+    assert json.loads(report.read_text())["issues"][0]["code"] == "attachment_write"
+    _run_export(api, "TS", root, flags + ["--cached"])
+    assert next(root.rglob("data.txt")).is_file()
+
+
+def test_report_cannot_replace_snapshot(tmp_path):
+    root = tmp_path / "out"
+    api = FakeConfluenceAPI().add_page("p1", "Page")
+    _run_export(api, "TS", root, ["--no-git"])
+    snapshot = root / ".conex" / "snapshot.json"
+    before = snapshot.read_bytes()
+    with pytest.raises(SystemExit) as err:
+        _run_export(api, "TS", root, ["--cached", "--report", str(snapshot)])
+    assert err.value.code == 1
+    assert snapshot.read_bytes() == before
