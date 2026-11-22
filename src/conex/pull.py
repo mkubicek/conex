@@ -44,7 +44,7 @@ from conex.errors import ApiError
 from conex.models import Attachment, Page, Space
 from conex.paths import is_noise_attachment_title
 from conex.store.blobs import BlobStore
-from conex.store.state import Snapshot, SnapshotStore
+from conex.store.state import ExportIssue, Snapshot, SnapshotStore
 
 if TYPE_CHECKING:
     pass
@@ -115,7 +115,11 @@ def pull(
     # loss — a failed body/listing/download — not just exit 0.
     pull_warnings: list[str] = []
 
-    def _record_warning(message: str) -> None:
+    issues: list[ExportIssue] = []
+
+    def _record_warning(message: str, issue: ExportIssue | None = None) -> None:
+        if issue is not None:
+            issues.append(issue)
         print(message, file=sys.stderr)
         pull_warnings.append(message)
 
@@ -149,6 +153,7 @@ def pull(
         api, space, pages, prev, effective_archived, _record_warning,
         opts.workers,
     )
+    issues.extend(ExportIssue(code="page_unverified", page_id=pid) for pid in carried_page_ids)
     if not effective_archived:
         # v2 listings return archived pages regardless of the request, so a
         # plain export would otherwise include them (under _archived/) — a
@@ -202,7 +207,8 @@ def pull(
             except Exception as exc:
                 _record_warning(
                     f"conex: warning: failed to fetch body for page "
-                    f"'{page.title}' ({page.id}): {exc}"
+                    f"'{page.title}' ({page.id}): {exc}",
+                    ExportIssue(code="page_body", page_id=page.id),
                 )
                 prev_digest = prev.body_blobs.get(page.id) if prev is not None else None
                 if prev_digest and blobs.has(prev_digest):
@@ -241,7 +247,8 @@ def pull(
         except Exception as exc:
             _record_warning(
                 f"conex: warning: failed to list attachments for page "
-                f"'{page.title}' ({page.id}): {exc}"
+                f"'{page.title}' ({page.id}): {exc}",
+                ExportIssue(code="attachment_listing", page_id=page.id),
             )
             return page.id, None
 
@@ -277,21 +284,17 @@ def pull(
 
         def _download_one(item: tuple[str, Attachment]) -> tuple[str, str | None]:
             """Return (att_key, digest_or_None).  None means download failed."""
-            _page_id, att = item
+            page_id, att = item
             att_key = f"{att.id}@{att.version.number}"
             # Incremental skip
             existing_digest = prev_att_blobs.get(att_key)
             if existing_digest and blobs.has(existing_digest):
                 return att_key, existing_digest
             # Resolve absolute URL via the adapter (adapter owns URL construction).
-            url = api.attachment_download_url(att)
-            if not url:
-                _record_warning(
-                    f"conex: warning: no download URL for attachment '{att.title}'"
-                )
-                return att_key, None
-            # Download
             try:
+                url = api.attachment_download_url(att)
+                if not url:
+                    raise ValueError(f"no download URL for attachment '{att.title}'")
                 resp = api.download(url)
                 try:
                     # Ensure the urllib3 stream decodes Content-Encoding
@@ -314,7 +317,8 @@ def pull(
             except Exception as exc:
                 _record_warning(
                     f"conex: warning: failed to download attachment "
-                    f"'{att.title}': {exc}"
+                    f"'{att.title}': {exc}",
+                    ExportIssue(code="attachment_download", page_id=page_id, attachment_id=att.id),
                 )
                 return att_key, None
 
@@ -399,6 +403,7 @@ def pull(
         derived_blobs=dict(sorted(derived_blobs.items())),
         users=dict(sorted(users.items())),
         warnings=pull_warnings,
+        issues=sorted(issues, key=lambda i: (i.page_id or "", i.attachment_id or "", i.code)),
     )
 
     # persist=False keeps pull non-mutating (used by `diff`, which is documented

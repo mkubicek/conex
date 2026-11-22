@@ -147,7 +147,7 @@ For classic OAuth 2.0 (3LO) tokens, the equivalent set is `read:confluence-space
 
 Scoped tokens must be addressed via the OAuth gateway URL (`https://api.atlassian.com/ex/confluence/{cloudId}/...`) rather than the site URL. The tool detects this automatically: it keeps the saved `site_url` as the user-facing Atlassian URL, resolves or uses the cached `cloud_id`, and derives the gateway `api_base_url` at runtime. No manual configuration needed in the common case; if cloud ID lookup is blocked, provide `--cloud-id` or `--api-base-url`.
 
-Before export, the tool prints the resolved config source, auth mode, API mode, site URL, output directory, and preflight checks. If auth, gateway routing, space resolution, page listing, attachment listing, or output writability fails, export stops before writing output.
+Before export, the tool prints the resolved config source, auth mode, API mode, site URL, output directory, and preflight checks. If auth, gateway routing, space resolution, space-wide page listing, or output writability fails, export stops before writing output.
 
 In non-interactive runs, commands never prompt for credentials. Run `conex configure` or pass explicit flags/env vars before invoking export from automation.
 
@@ -178,9 +178,46 @@ Archived pages are skipped by default. `--include-archived` (on both `export` an
 
 ### Attachments
 
-Attachment downloads are best-effort: a transient network failure (timeout, dropped connection) or a `404` for an upstream-deleted attachment prints a `Warning:` to stderr and leaves the previously committed copy in place — the export still exits `0`. Check stderr after bulk runs if you need attachment completeness.
+By default, an attachment failure prints a warning, preserves any last-good copy and lets the export finish with exit code `0`. Re-run a live export to retry missing content.
 
-The **first** export of a pre-existing export re-downloads its attachments once, to upgrade the attachment manifest (`.media/.versions.json`) to the current format. Transient warnings during that one-time pass are expected; subsequent exports skip unchanged attachments. (conex re-downloads rather than trusting an older manifest that can't prove a file is still the current attachment.)
+### Strict completeness and JSON reports
+
+```bash
+conex export SPACEKEY -o ./output --strict --report ./runs/export.json
+```
+
+Use either flag independently. `--strict` finishes the build and returns **3** if requested page or attachment content is missing, stale or unverified. `--report PATH` atomically replaces a UTF-8 JSON file on each run and creates its parent directory if needed. A path beside the export works for both local runs and CI.
+
+| Outcome | Default exit | Strict exit | Report status |
+|---|---:|---:|---|
+| Requested content exported | 0 | 0 | `complete` |
+| Build finished with a content failure | 0 | 3 | `partial` |
+| Export aborted, e.g. authentication or lock failure | 1 | 1 | `failed` |
+
+Version 1 reports contain `space_key`, the requested `scope`, build `counts` (files written and pages skipped, moved and pruned), and a sorted `issues` array. A failed export has null counts and an error type. A report destination error exits 1. For concurrent runs, use a separate report path per invocation.
+
+An attachment download failure identifies both the page and attachment. A listing failure identifies the page and leaves `attachment_id` null because the missing attachment count is unknown.
+
+```json
+{"code": "attachment_download", "page_id": "p1", "attachment_id": "a1"}
+```
+
+Completeness follows the selected subtree and `--no-children`. With `--no-media`, attachment failures are outside the requested scope. Page-body fetch failures and pages carried forward after an unsuccessful verification still count. Optional author names, Git commits and availability of the draw.io renderer do not affect content status. File checks verify presence and recorded versions without hashing user-edited output. A cached run assesses the saved snapshot. For an older snapshot with warnings that cannot be attributed to specific content, the report records `legacy_snapshot_unverified`; a live retry refreshes that evidence.
+
+### Credential-free fixture demo
+
+From the repository root, run the real export command against an in-memory space with one runbook and one attachment. The fixture adapter uses local data throughout. Use a fresh directory so an earlier successful download cannot satisfy the simulated outage.
+
+```bash
+demo_dir=$(mktemp -d)
+uv run python -m examples.export_fixture --fail-download DEMO -o "$demo_dir/out" --report "$demo_dir/default.json"
+uv run python -m examples.export_fixture --fail-download DEMO -o "$demo_dir/out" --strict --report "$demo_dir/strict.json"
+echo "$?"     # 3
+uv run python -m examples.export_fixture DEMO -o "$demo_dir/out" --strict --report "$demo_dir/retry.json"
+cat "$demo_dir/retry.json"
+```
+
+The first two reports both identify attachment `a1` on page `p1`. The first command exits 0. The strict retry after recovery exits 0, writes `checklist.txt` into the runbook’s `.media/` folder, and reports `complete` with an empty issue list.
 
 ## Git Versioning
 

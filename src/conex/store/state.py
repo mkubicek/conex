@@ -24,7 +24,7 @@ import warnings
 from pathlib import Path
 from typing import Any
 
-from conex.models import Attachment, Folder, NullTolerantModel, Page, Space
+from conex.models import ApiModel, Attachment, Folder, NullTolerantModel, Page, Space
 from conex.paths import durable_replace
 
 
@@ -96,6 +96,14 @@ class ExportState(NullTolerantModel):
     folders: dict[str, str] = {}
 
 
+class ExportIssue(ApiModel):
+    """A machine-readable reason requested content could not be confirmed."""
+
+    code: str = ""
+    page_id: str | None = None
+    attachment_id: str | None = None
+
+
 class Snapshot(NullTolerantModel):
     """The .conex/snapshot.json content: a point-in-time fetch from Confluence.
 
@@ -129,6 +137,8 @@ class Snapshot(NullTolerantModel):
     derived_blobs: dict[str, str] = {}
     users: dict[str, str] = {}
     warnings: list[str] = []
+    # None distinguishes older snapshots that only recorded warning text.
+    issues: list[ExportIssue] | None = None
 
 
 # ---------------------------------------------------------------------------

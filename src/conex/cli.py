@@ -50,6 +50,8 @@ from conex.config import (
 from conex import __version__
 from conex.errors import ConexError, GitError, LockHeldError, StateError
 from conex.store.lock import ExportLock
+from conex.store.state import ExportIssue
+from conex.report import ExportReport, ReportScope, report_destination, write_report
 
 
 # ---------------------------------------------------------------------------
@@ -354,31 +356,36 @@ def _cmd_find(args: argparse.Namespace) -> None:
 def _cmd_export(args: argparse.Namespace) -> None:
     """Export a Confluence space as LLM-ready markdown."""
     output_dir = Path(args.output).expanduser().resolve()
-    overrides = _overrides_from_args(args)
-
+    destination = report_destination(args.report, output_dir) if args.report else None
+    report = ExportReport(space_key=args.space_key, scope=ReportScope(
+        path=args.path, no_children=args.no_children, media=not args.no_media,
+        include_archived=args.include_archived, include_html=args.include_html, cached=args.cached,
+    ))
     try:
-        cfg = resolve_config(output_dir, overrides)
-    except ConexError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    _print_preflight_banner(cfg, output_dir)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
+        cfg = resolve_config(output_dir, _overrides_from_args(args))
+        _print_preflight_banner(cfg, output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
         with ExportLock(output_dir):
             _clear_tmp(output_dir)
-            _run_export(args, cfg, output_dir)
-    except LockHeldError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
-    except ConexError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+            report.counts, issues = _run_export(args, cfg, output_dir)
+            report.issues = sorted(set(issues), key=lambda i: (i.page_id or "", i.attachment_id or "", i.code))
+            report.status = "partial" if issues else "complete"
+            if destination:
+                write_report(destination, report)
+    except Exception as exc:
+        if destination and report.status == "failed":
+            report.issues = [ExportIssue(code=type(exc).__name__)]
+            write_report(destination, report)
+        raise
+
+    if args.strict and issues:
+        print("Strict export incomplete: " + ", ".join(sorted({i.code for i in issues})), file=sys.stderr)
+        sys.exit(3)
 
 
-def _run_export(args: argparse.Namespace, cfg: ResolvedConfig, output_dir: Path) -> None:
+def _run_export(
+    args: argparse.Namespace, cfg: ResolvedConfig, output_dir: Path,
+) -> tuple[dict[str, int], list[ExportIssue]]:
     """Inner export logic; called with lock held."""
     from conex.api import make_api
     from conex.build import build, BuildOptions
@@ -440,6 +447,7 @@ def _run_export(args: argparse.Namespace, cfg: ResolvedConfig, output_dir: Path)
         subtree=getattr(args, "path", None),
         no_children=getattr(args, "no_children", False),
         site_url=cfg.site_url,
+        verify_files=bool(args.strict or args.report),
     )
 
     # A typo'd --path must fail loudly, not silently export zero pages.
@@ -485,8 +493,11 @@ def _run_export(args: argparse.Namespace, cfg: ResolvedConfig, output_dir: Path)
     # partial-fetch loss instead of a misleading clean "exit 0".
     all_warnings = list(snapshot.warnings) + list(result.warnings)
 
+    if include_archived and not snapshot.include_archived:
+        result.issues.append(ExportIssue(code="archived_pages_unavailable"))
+    label = "Export partial" if build_opts.verify_files and result.issues else "Export complete"
     summary = (
-        f"Export complete: "
+        f"{label}: "
         f"{len(result.written)} written, "
         f"{result.skipped} skipped, "
         f"{len(result.moved)} moved, "
@@ -500,6 +511,10 @@ def _run_export(args: argparse.Namespace, cfg: ResolvedConfig, output_dir: Path)
         print(f"Warnings ({len(all_warnings)}):", file=sys.stderr)
         for w in all_warnings:
             print(f"  {w}", file=sys.stderr)
+
+    counts = {"files_written": len(result.written), "pages_skipped": result.skipped,
+              "pages_moved": len(result.moved), "pages_pruned": pruned}
+    return counts, result.issues
 
 
 def _cmd_refresh(args: argparse.Namespace) -> None:
@@ -750,6 +765,8 @@ def _build_parser() -> argparse.ArgumentParser:
     export_p.add_argument("--include-archived", action="store_true", help="Include archived pages")
     export_p.add_argument("--cached", action="store_true", help="Use cached snapshot; skip pull")
     export_p.add_argument("--include-html", action="store_true", help="Write raw HTML alongside markdown")
+    export_p.add_argument("--strict", action="store_true", help="Exit 3 if requested content is incomplete")
+    export_p.add_argument("--report", type=Path, metavar="PATH", help="Write a versioned JSON export report")
     export_p.add_argument("--no-media", action="store_true", help="Skip attachment download")
     export_p.add_argument("--no-drawio-render", action="store_true", help="Skip draw.io PNG rendering")
     export_p.add_argument("--no-git", action="store_true", help="Skip git versioning")

@@ -130,6 +130,7 @@ from conex.errors import StateError
 from conex.layout import plan_layout
 from conex.models import Attachment, Page
 from conex.paths import (
+    AttachmentNamePlan,
     assert_within,
     durable_replace,
     plan_attachment_names,
@@ -138,6 +139,7 @@ from conex.paths import (
 from conex.store.blobs import BlobStore
 from conex.store.state import (
     AttachmentState,
+    ExportIssue,
     ExportState,
     PageState,
     Snapshot,
@@ -172,6 +174,7 @@ class BuildOptions:
     no_children: bool = False
     site_url: str = ""
     allow_mass_delete: bool = False  # bypass the H4 large-deletion safety valve
+    verify_files: bool = False  # recheck skipped artifacts for --report / --strict
 
 
 # Large-deletion safety valve (H4): on a full export, refuse to prune more than
@@ -198,6 +201,7 @@ class BuildResult:
     skipped: int = 0
     moved: list[tuple[str, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    issues: list[ExportIssue] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -724,6 +728,16 @@ def build(
     # Collect pages in plan order.
     plan_pages = [p for p in snapshot.pages if p.id in plan.dirs]
 
+    if opts.verify_files:
+        # Pull covers the entire space, even when build only exports a subtree.
+        result.issues.extend(
+            issue for issue in (snapshot.issues or [])
+            if (issue.page_id is None or issue.page_id in plan.dirs)
+            and (opts.media or issue.code not in {"attachment_listing", "attachment_download"})
+        )
+        if snapshot.issues is None and (snapshot.warnings or not snapshot.attachments_complete):
+            result.issues.append(ExportIssue(code="legacy_snapshot_unverified"))
+
     # Run drawio render once for all pages.  _run_drawio_render only renders
     # diagrams whose PNG is not already cached in snapshot.derived_blobs, so a
     # warm re-export shells out to the drawio CLI zero times.
@@ -748,7 +762,7 @@ def build(
     freshly_rendered_digests: set[str] = set(drawio_results.values())
 
     # Compute per-page name plans and fingerprints.
-    name_plans: dict[str, object] = {}  # page_id -> AttachmentNamePlan
+    name_plans: dict[str, AttachmentNamePlan] = {}
     fingerprints: dict[str, str] = {}   # page_id -> digest
 
     for page in plan_pages:
@@ -798,10 +812,34 @@ def build(
     skip_ids: set[str] = set()
     write_ids: set[str] = set()
 
+    download_failures = {
+        (i.page_id, i.attachment_id) for i in result.issues if i.code == "attachment_download"
+    }
     for page in plan_pages:
         pid = page.id
         planned_dir = str(plan.dirs[pid])
         planned_file = str(plan.files[pid])
+
+        files_present = True
+        if opts.verify_files:
+            body_digest = snapshot.body_blobs.get(pid)
+            if not body_digest or not blobs.has(body_digest):
+                result.issues.append(ExportIssue(code="body_blob_missing", page_id=pid))
+            if opts.include_html:
+                files_present = (root / planned_file).with_suffix(".html").is_file()
+            if opts.media:
+                for att in snapshot.attachments.get(pid, []):
+                    digest = snapshot.attachment_blobs.get(f"{att.id}@{att.version.number}")
+                    if not digest or not blobs.has(digest):
+                        if (pid, att.id) not in download_failures:
+                            result.issues.append(ExportIssue(
+                                code="attachment_blob_missing", page_id=pid, attachment_id=att.id,
+                            ))
+                    elif prev and pid in prev.pages:
+                        old = prev.pages[pid].attachments.get(att.id)
+                        dest = root / planned_dir / ".media" / name_plans[pid].for_reference(att.title, att.id)
+                        if not old or old.blob != digest or not dest.is_file():
+                            files_present = False
 
         if prev is not None and pid in prev.pages:
             ps = prev.pages[pid]
@@ -809,7 +847,8 @@ def build(
                 ps.dir == planned_dir
                 and ps.file == planned_file
                 and ps.fingerprint == fingerprints[pid]
-                and (root / ps.file).exists()
+                and files_present
+                and (root / ps.file).is_file()
             ):
                 skip_ids.add(pid)
                 result.skipped += 1
@@ -933,48 +972,33 @@ def build(
             for att in atts:
                 att_key = f"{att.id}@{att.version.number}"
                 att_digest = snapshot.attachment_blobs.get(att_key, "")
-                planned_name = np.by_id.get(att.id, "")
-                if not planned_name:
-                    planned_name = att.title
+                planned_name = np.for_reference(att.title, att.id)
 
-                if att_digest and planned_name:
-                    dest = media_dir / planned_name
-                    mtime = _parse_mtime(att.version.created_at)
-                    media_dir.mkdir(parents=True, exist_ok=True)
-                    try:
-                        blobs.materialize(att_digest, dest, mtime=mtime)
-                        media_available.add(planned_name)
-                        result.written.append(dest)
-                    except Exception as exc:
-                        msg = f"failed to materialise attachment {att.title!r}: {exc}"
-                        result.warnings.append(msg)
-                        warnings.warn(msg, stacklevel=2)
-                        # Disk write failed (e.g. ENOSPC): the file is NOT on
-                        # disk, so force a re-attempt next run rather than let
-                        # the page skip with a complete-looking state.
-                        page_media_incomplete = True
-                        att_states[att.id] = AttachmentState(
-                            version=att.version.number,
-                            file=planned_name,
-                            blob=att_digest,
-                            size=att.file_size,
-                        )
-                        continue
-
-                    att_states[att.id] = AttachmentState(
-                        version=att.version.number,
-                        file=planned_name,
-                        blob=att_digest,
-                        size=att.file_size,
-                    )
-                else:
-                    # Download failed or no blob.
-                    att_states[att.id] = AttachmentState(
-                        version=att.version.number,
-                        file=planned_name,
-                        blob=att_digest,
-                        size=att.file_size,
-                    )
+                att_states[att.id] = AttachmentState(
+                    version=att.version.number,
+                    file=planned_name,
+                    blob=att_digest,
+                    size=att.file_size,
+                )
+                if not att_digest:
+                    # A successful retry can have the very same attachment version.
+                    page_media_incomplete = True
+                    continue
+                dest = media_dir / planned_name
+                mtime = _parse_mtime(att.version.created_at)
+                media_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    blobs.materialize(att_digest, dest, mtime=mtime)
+                    media_available.add(planned_name)
+                    result.written.append(dest)
+                except Exception as exc:
+                    msg = f"failed to materialise attachment {att.title!r}: {exc}"
+                    result.warnings.append(msg)
+                    result.issues.append(ExportIssue(
+                        code="attachment_write", page_id=pid, attachment_id=att.id,
+                    ))
+                    warnings.warn(msg, stacklevel=2)
+                    page_media_incomplete = True
 
             # Materialise batch-rendered drawio PNGs that are not regular
             # attachments.  The rendered blob must reach disk and enter
@@ -991,8 +1015,17 @@ def build(
                     msg = f"failed to materialise rendered drawio PNG {png_filename!r}: {exc}"
                     result.warnings.append(msg)
                     warnings.warn(msg, stacklevel=2)
+                    result.issues.append(ExportIssue(code="preview_write", page_id=pid))
                     # PNG never reached disk → force a re-attempt next run.
                     page_media_incomplete = True
+
+            # Keep the last-good version owned (and its blob alive for a later
+            # move) when the replacement could not be downloaded or written.
+            if prev and pid in prev.pages and page_media_incomplete:
+                for aid, old in prev.pages[pid].attachments.items():
+                    current = att_states.get(aid)
+                    if current and old.file not in media_available and current.file not in media_available:
+                        att_states[aid] = old
 
             # Handle attachments_complete=False: carry prev media, never delete.
             if not snapshot.attachments_complete and prev is not None and pid in prev.pages:
@@ -1228,6 +1261,7 @@ def build(
         )
         result.warnings.append(msg)
         warnings.warn(msg, stacklevel=2)
+        result.issues.append(ExportIssue(code="reconciliation_skipped"))
         return result, prev
 
     # H4 large-deletion safety valve — FULL-SPACE only. A truncated-but-200 page
@@ -1262,6 +1296,7 @@ def build(
             )
             result.warnings.append(msg)
             warnings.warn(msg, stacklevel=2)
+            result.issues.append(ExportIssue(code="reconciliation_skipped"))
             return result, prev
 
     # Defense-in-depth: a subtree was requested but its planned dir could not be
@@ -1276,6 +1311,7 @@ def build(
         )
         result.warnings.append(msg)
         warnings.warn(msg, stacklevel=2)
+        result.issues.append(ExportIssue(code="reconciliation_skipped"))
         return result, prev
 
     snapshot_page_ids = {p.id for p in snapshot.pages}
